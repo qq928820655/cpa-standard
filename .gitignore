@@ -1,0 +1,62 @@
+# Runtime data and secrets
+backend/data/*
+!backend/data/.gitkeep
+data/
+.env
+*.env
+*.db
+*.sqlite
+*.sqlite3
+master_key.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+backend/.wheels*/
+backend/=*
+
+# Frontend
+frontend/node_modules/
+node_modules/
+frontend/dist/
+frontend/release-cpa/
+
+# Test and generated artifacts
+test-results/
+playwright-report/
+*.log
+*.rar
+*.zip
+*.7z
+
+# Local Claude / screenshots / temp files
+.claude/
+.claude-*.png
+.claude-*.cjs
+.graphify_*
+frontend/.claude*/
+frontend/.claude*
+
+# Excluded sibling projects and deliverables
+image-world-light/
+portable-green/
+artifact/
+cpa-image-enhancement/
+test-enhancement-verify/
+
+# Exports that may contain sensitive provider data
+cpa-api-keys-all-*.jsonl
+cpa-models-all-*.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
