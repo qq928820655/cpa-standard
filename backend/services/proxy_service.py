@@ -3464,6 +3464,42 @@ class ProxyService:
 
     # ============ Claude Messages <-> OpenAI Chat 兼容层 ============
 
+    def _adapt_claude_content_to_chat_content(self, content: Any) -> Any:
+        """Claude content blocks → OpenAI Chat content，保留图片输入"""
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return "" if content is None else str(content)
+
+        chat_parts = []
+        for item in content:
+            if isinstance(item, str):
+                chat_parts.append({"type": "text", "text": item})
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "text" and item.get("text"):
+                chat_parts.append({"type": "text", "text": str(item["text"])})
+            elif item_type == "image":
+                source = item.get("source") if isinstance(item.get("source"), dict) else {}
+                media_type = source.get("media_type") or "image/png"
+                if source.get("type") == "base64" and source.get("data"):
+                    chat_parts.append({"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{source['data']}"}})
+                elif source.get("type") == "url" and source.get("url"):
+                    chat_parts.append({"type": "image_url", "image_url": {"url": source["url"]}})
+            elif item_type == "image_url":
+                image_url = item.get("image_url")
+                if isinstance(image_url, dict) and image_url.get("url"):
+                    chat_parts.append({"type": "image_url", "image_url": {"url": image_url["url"]}})
+                elif isinstance(image_url, str):
+                    chat_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+        if not chat_parts:
+            return ""
+        if all(part.get("type") == "text" for part in chat_parts):
+            return "\n".join(str(part.get("text") or "") for part in chat_parts)
+        return chat_parts
+
     def _adapt_claude_content_to_chat_text(self, content: Any) -> str:
         """提取 Claude content block 中的纯文本"""
         if isinstance(content, str):
@@ -3580,6 +3616,7 @@ class ProxyService:
                 # user: text + tool_result（拆分为独立消息）
                 if isinstance(content, list):
                     text_parts_u: list[str] = []
+                    image_parts_u: list[dict] = []
                     tool_results: list[dict] = []
                     for block in content:
                         if isinstance(block, str):
@@ -3590,6 +3627,10 @@ class ProxyService:
                         block_type = block.get("type")
                         if block_type == "text" and block.get("text"):
                             text_parts_u.append(str(block["text"]))
+                        elif block_type in ("image", "image_url"):
+                            adapted_image = self._adapt_claude_content_to_chat_content([block])
+                            if isinstance(adapted_image, list):
+                                image_parts_u.extend(adapted_image)
                         elif block_type == "tool_result":
                             tool_use_id = block.get("tool_use_id") or block.get("id")
                             if tool_use_id:
@@ -3601,12 +3642,19 @@ class ProxyService:
                                 })
                     # tool results 必须紧跟 assistant tool_calls
                     messages.extend(tool_results)
+                    user_parts = []
                     if text_parts_u:
-                        messages.append({"role": "user", "content": "\n".join(text_parts_u)})
+                        user_parts.append({"type": "text", "text": "\n".join(text_parts_u)})
+                    user_parts.extend(image_parts_u)
+                    if user_parts:
+                        if all(part.get("type") == "text" for part in user_parts):
+                            messages.append({"role": "user", "content": "\n".join(str(part.get("text") or "") for part in user_parts)})
+                        else:
+                            messages.append({"role": "user", "content": user_parts})
                     elif not tool_results:
                         messages.append({"role": "user", "content": ""})
                 else:
-                    messages.append({"role": "user", "content": self._adapt_claude_content_to_chat_text(content)})
+                    messages.append({"role": "user", "content": self._adapt_claude_content_to_chat_content(content)})
 
         chat_body["messages"] = messages or [{"role": "user", "content": ""}]
 
@@ -3636,8 +3684,9 @@ class ProxyService:
             cache_tokens = int(details.get("cached_tokens") or 0)
         if not cache_tokens:
             cache_tokens = int(usage.get("cache_read_input_tokens") or usage.get("cached_tokens") or 0)
+        uncached_input_tokens = max(prompt_tokens - cache_tokens, 0) if cache_tokens else prompt_tokens
         return {
-            "input_tokens": prompt_tokens,
+            "input_tokens": uncached_input_tokens,
             "output_tokens": completion_tokens,
             "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
             "cache_read_input_tokens": cache_tokens,

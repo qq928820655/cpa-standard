@@ -150,22 +150,27 @@
             <span v-else>-</span>
           </template>
         </el-table-column>
-        <el-table-column prop="prompt_tokens" label="输入 Token" width="88" align="right">
+        <el-table-column prop="prompt_tokens" label="输入 Token" width="80" align="right">
           <template #default="{ row }">
             {{ formatCompactTokenValue(row.prompt_tokens) }}
           </template>
         </el-table-column>
-        <el-table-column prop="completion_tokens" label="输出 Token" width="88" align="right">
+        <el-table-column label="实际 Token" width="75" align="right">
+          <template #default="{ row }">
+            {{ formatCompactTokenValue(getActualInputTokens(row)) }}
+          </template>
+        </el-table-column>
+        <el-table-column prop="completion_tokens" label="输出 Token" width="75" align="right">
           <template #default="{ row }">
             {{ formatCompactTokenValue(row.completion_tokens) }}
           </template>
         </el-table-column>
-        <el-table-column prop="cache_tokens" label="缓存 Token" width="88" align="right">
+        <el-table-column prop="cache_tokens" label="缓存 Token" width="80" align="right">
           <template #default="{ row }">
             {{ row.cache_tokens ? formatCompactTokenValue(row.cache_tokens) : '-' }}
           </template>
         </el-table-column>
-        <el-table-column prop="total_tokens" label="总 Token" width="88" align="right">
+        <el-table-column prop="total_tokens" label="总 Token" width="67" align="right">
           <template #default="{ row }">
             {{ formatCompactTokenValue(row.total_tokens) }}
           </template>
@@ -180,7 +185,7 @@
             {{ formatCompactLatency(row.upstream_latency_ms) }}
           </template>
         </el-table-column>
-        <el-table-column prop="cpa_overhead_ms" label="CPA 耗时" width="88" align="right">
+        <el-table-column prop="cpa_overhead_ms" label="CPA 耗时" width="75" align="right">
           <template #default="{ row }">
             {{ formatCompactLatency(row.cpa_overhead_ms) }}
           </template>
@@ -197,7 +202,7 @@
             {{ formatTableTime(row.request_time) }}
           </template>
         </el-table-column>
-        <el-table-column prop="error_message" label="错误信息" min-width="120">
+        <el-table-column prop="error_message" label="错误信息" width="120">
           <template #default="{ row }">
             <el-tooltip
               v-if="row.error_message"
@@ -308,6 +313,11 @@
             <el-table-column prop="prompt_tokens" label="输入 Token" width="90" align="right">
               <template #default="{ row }">
                 {{ formatCompactTokenValue(row.prompt_tokens) }}
+              </template>
+            </el-table-column>
+            <el-table-column label="实际 Token" width="75" align="right">
+              <template #default="{ row }">
+                {{ formatCompactTokenValue(getActualInputTokens(row)) }}
               </template>
             </el-table-column>
             <el-table-column prop="completion_tokens" label="输出 Token" width="90" align="right">
@@ -490,6 +500,12 @@ const buildStatsParams = () => {
 const formatTokenValue = (value) => formatToken.value(value)
 
 const formatCompactTokenValue = (value) => formatTokenCompact.value(value)
+
+const getActualInputTokens = (row) => {
+  const promptTokens = Number(row?.prompt_tokens || 0)
+  const cacheTokens = Number(row?.cache_tokens || 0)
+  return Math.max(promptTokens - cacheTokens, 0)
+}
 
 const formatLatencyValue = (value) => {
   const ms = Number(value || 0)
