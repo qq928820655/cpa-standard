@@ -6,7 +6,7 @@ import random
 import threading
 from datetime import datetime, timedelta
 from typing import Optional, List, Any
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -40,6 +40,7 @@ class PoolManager:
             "rate_limit_cooldown_seconds": self.DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
             "auth_failure_cooldown_seconds": self.DEFAULT_AUTH_FAILURE_COOLDOWN_SECONDS,
             "upstream_error_cooldown_seconds": self.DEFAULT_UPSTREAM_ERROR_COOLDOWN_SECONDS,
+            "cloudflare_524_auto_continue_providers": [],
         }
         self._initialized = True
 
@@ -99,11 +100,22 @@ class PoolManager:
         rate_limit_cooldown_seconds: int,
         auth_failure_cooldown_seconds: int,
         upstream_error_cooldown_seconds: int,
+        cloudflare_524_auto_continue_providers: Optional[list[str]] = None,
     ):
+        providers = []
+        if isinstance(cloudflare_524_auto_continue_providers, list):
+            seen = set()
+            for provider in cloudflare_524_auto_continue_providers:
+                provider_value = str(provider or "").strip()
+                if provider_value and provider_value not in seen:
+                    seen.add(provider_value)
+                    providers.append(provider_value)
+
         self._cooldown_config = {
             "rate_limit_cooldown_seconds": max(int(rate_limit_cooldown_seconds), 0),
             "auth_failure_cooldown_seconds": max(int(auth_failure_cooldown_seconds), 0),
             "upstream_error_cooldown_seconds": max(int(upstream_error_cooldown_seconds), 0),
+            "cloudflare_524_auto_continue_providers": providers,
         }
 
     def get_cooldown_seconds_for_status(self, status_code: Optional[int]) -> int:
@@ -116,6 +128,12 @@ class PoolManager:
         if status_code >= 500:
             return self._cooldown_config["upstream_error_cooldown_seconds"]
         return 0
+
+    def is_cloudflare_524_auto_continue_enabled(self, provider: Optional[str]) -> bool:
+        provider_value = str(provider or "").strip()
+        if not provider_value:
+            return False
+        return provider_value in set(self._cooldown_config.get("cloudflare_524_auto_continue_providers") or [])
 
     def clear_key_cooldown(self, key_id: int):
         self._cooldowns.pop(key_id, None)
@@ -155,6 +173,7 @@ class PoolManager:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         exclude_key_ids: Optional[List[int]] = None,
+        providers: Optional[List[str]] = None,
     ) -> Optional[Any]:
         if not session_key:
             return None
@@ -170,7 +189,14 @@ class PoolManager:
             return None
 
         key = await self.get_key_by_id(db, key_id)
-        if not self.is_key_available_for_model(key, model, exclude_key_ids, provider=provider):
+        plan = await self.build_model_match_plan(db, model, providers=providers or ([provider] if provider else None))
+        if not self.is_key_available_for_model_plan(
+            key,
+            model,
+            plan,
+            exclude_key_ids,
+            provider=provider or (providers[0] if providers and len(providers) == 1 else None),
+        ):
             self.clear_session_binding(session_key)
             return None
 
@@ -242,6 +268,129 @@ class PoolManager:
             return False
         return self.key_supports_model(key, model)
 
+    async def build_model_match_plan(
+        self,
+        db: AsyncSession,
+        model: Optional[str],
+        providers: Optional[List[str]] = None,
+    ) -> dict[str, Any]:
+        """构建系统模型映射匹配计划"""
+        normalized_models = self._normalize_model_names([model] if model else [])
+        request_model = normalized_models[0] if normalized_models else None
+        request_normalized = request_model.lower() if request_model else ""
+        provider_values = self._normalize_model_names(providers)
+
+        plan = {
+            "request_model": request_model,
+            "request_normalized": request_normalized,
+            "mode": "plain",
+            "direct_model": request_model,
+            "provider_models": {},
+        }
+        if not request_normalized:
+            return plan
+
+        from models import ProviderModelMapping
+
+        query = select(ProviderModelMapping).where(
+            ProviderModelMapping.enabled == True,
+            or_(
+                ProviderModelMapping.provider_model_normalized == request_normalized,
+                ProviderModelMapping.real_model_normalized == request_normalized,
+            ),
+        )
+        if provider_values:
+            query = query.where(ProviderModelMapping.provider.in_(provider_values))
+
+        result = await db.execute(query)
+        mappings = list(result.scalars().all())
+        provider_hits = [
+            item for item in mappings
+            if (item.provider_model_normalized or "").lower() == request_normalized
+        ]
+        if provider_hits:
+            plan["mode"] = "provider_model"
+            plan["direct_model"] = None
+            for item in provider_hits:
+                plan["provider_models"].setdefault(item.provider, set()).add(item.provider_model)
+            return plan
+
+        real_hits = [
+            item for item in mappings
+            if (item.real_model_normalized or "").lower() == request_normalized
+        ]
+        if real_hits:
+            plan["mode"] = "real_model"
+            for item in real_hits:
+                plan["provider_models"].setdefault(item.provider, set()).add(item.provider_model)
+        return plan
+
+    def key_matches_model_plan(self, key: Any, model: Optional[str], plan: Optional[dict[str, Any]]) -> bool:
+        """判断 Key 是否匹配系统模型映射计划"""
+        if not plan:
+            return self.key_supports_model(key, model)
+        provider = getattr(key, "provider", None)
+        provider_models = plan.get("provider_models") or {}
+        for provider_model in provider_models.get(provider, set()):
+            if self.key_supports_model(key, provider_model):
+                return True
+        direct_model = plan.get("direct_model")
+        if direct_model:
+            return self.key_supports_model(key, direct_model)
+        return False
+
+    def resolve_upstream_model_for_key(self, key: Any, model: Optional[str], plan: Optional[dict[str, Any]]) -> Optional[str]:
+        """根据匹配计划解析选中 Key 的上游模型"""
+        if not plan:
+            return model
+        provider = getattr(key, "provider", None)
+        provider_models = plan.get("provider_models") or {}
+        for provider_model in provider_models.get(provider, set()):
+            if self.key_supports_model(key, provider_model):
+                return provider_model
+        return plan.get("direct_model") or model
+
+    def is_key_available_for_model_plan(
+        self,
+        key: Any,
+        model: Optional[str],
+        plan: Optional[dict[str, Any]],
+        exclude_key_ids: Optional[List[int]] = None,
+        *,
+        provider: Optional[str] = None,
+    ) -> bool:
+        excluded_ids = set(exclude_key_ids or [])
+        if not key:
+            return False
+        if not getattr(key, "is_active", False):
+            return False
+        if provider and getattr(key, "provider", None) != provider:
+            return False
+        if key.id in excluded_ids:
+            return False
+        if self.is_key_cooled_down(key.id):
+            return False
+        if self._get_key_weight(key) <= 0:
+            return False
+        return self.key_matches_model_plan(key, model, plan)
+
+    def build_model_plan_cache_key(
+        self,
+        provider: Optional[str],
+        providers: Optional[List[str]],
+        model: Optional[str],
+        plan: Optional[dict[str, Any]],
+    ) -> str:
+        """构建模型映射轮询缓存键"""
+        provider_part = provider or ",".join(self._normalize_model_names(providers)) or "__all__"
+        model_part = self._normalize_model_names([model])[0].lower() if self._normalize_model_names([model]) else "__all__"
+        plan_mode = (plan or {}).get("mode", "plain")
+        mapped = []
+        for item_provider, item_models in sorted(((plan or {}).get("provider_models") or {}).items()):
+            mapped.append(f"{item_provider}:{','.join(sorted(m.lower() for m in item_models))}")
+        mapped_part = "|".join(mapped)
+        return f"{provider_part}::{model_part}::{plan_mode}::{mapped_part}"
+
     async def get_priority_binding(self, db: AsyncSession, provider: Optional[str], model: Optional[str]) -> Optional[Any]:
         normalized_models = self._normalize_model_names([model] if model else [])
         if not provider or not normalized_models:
@@ -271,12 +420,17 @@ class PoolManager:
             return None
 
         key = await self.get_key_by_id(db, getattr(binding, "key_id", 0))
-        if not self.is_key_available_for_model(key, model, exclude_key_ids, provider=provider):
+        plan = await self.build_model_match_plan(db, model, providers=[provider] if provider else None)
+        if not self.is_key_available_for_model_plan(key, model, plan, exclude_key_ids, provider=provider):
             return None
         return key
 
     def key_supports_model(self, key: Any, model: Optional[str]) -> bool:
-        """判断 Key 是否支持指定模型"""
+        """判断 Key 是否支持指定模型。
+        匹配时会去掉模型名中的 [...] 后缀（如 [1m]、[128k]），
+        使 Key 只需配置基础模型名即可匹配带后缀的请求。
+        """
+        import re as _re
         normalized_models = self._normalize_model_names([model] if model else [])
         if not normalized_models:
             return True
@@ -285,8 +439,13 @@ class PoolManager:
         if not supported_models:
             return True
 
+        # 去掉请求模型名中的 [...] 后缀后再匹配
+        request_model = normalized_models[0].lower()
+        request_model_base = _re.sub(r'\[.*?\]', '', request_model).strip()
+
         supported_lookup = {item.lower() for item in supported_models}
-        return normalized_models[0].lower() in supported_lookup
+        # 先精确匹配，再匹配去掉后缀的基础名
+        return request_model in supported_lookup or request_model_base in supported_lookup
 
     def _select_weighted_key(self, cache_key: str, keys: List[Any], *, randomize_start: bool = False) -> Optional[Any]:
         weighted_keys = []
@@ -326,6 +485,8 @@ class PoolManager:
         sticky_ttl_seconds: int = 0,
         prefer_bound_key: bool = True,
         randomize_start: bool = False,
+        providers: Optional[List[str]] = None,
+        key_name: Optional[str] = None,
     ) -> Optional[Any]:
         """
         获取下一个可用的 API Key（轮询策略）
@@ -356,6 +517,7 @@ class PoolManager:
                 provider=provider,
                 model=model,
                 exclude_key_ids=list(excluded_ids),
+                providers=providers,
             )
             if bound_key:
                 return bound_key
@@ -363,18 +525,29 @@ class PoolManager:
         query = select(ApiKey).where(ApiKey.is_active == True)
         if provider:
             query = query.where(ApiKey.provider == provider)
+        elif providers:
+            query = query.where(ApiKey.provider.in_(providers))
+        if key_name:
+            query = query.where(ApiKey.name == key_name)
         query = query.order_by(ApiKey.id)
 
+        plan = await self.build_model_match_plan(db, model, providers=providers or ([provider] if provider else None))
         result = await db.execute(query)
         keys: List[Any] = [
             key for key in result.scalars().all()
-            if self.is_key_available_for_model(key, model, list(excluded_ids), provider=provider)
+            if self.is_key_available_for_model_plan(
+                key,
+                model,
+                plan,
+                list(excluded_ids),
+                provider=provider or (providers[0] if providers and len(providers) == 1 else None),
+            )
         ]
 
         if not keys:
             return None
 
-        cache_key = f"{provider or '__all__'}::{self._normalize_model_names([model])[0].lower() if self._normalize_model_names([model]) else '__all__'}"
+        cache_key = self.build_model_plan_cache_key(provider, providers, model, plan)
         selected_key = self._select_weighted_key(cache_key, keys, randomize_start=randomize_start)
         if not selected_key:
             return None

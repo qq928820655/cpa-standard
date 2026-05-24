@@ -56,10 +56,12 @@ async def init_db():
         ImageKeyModelStats,
         ModelCatalog,
         ProviderModelPriority,
+        ProviderModelMapping,
         UsageDailySummary,
         UsageLog,
         AdminUser,
         AdminSession,
+        ContentGuardEvent,
     )
 
     async with engine.begin() as conn:
@@ -92,6 +94,10 @@ async def init_db():
         def has_fake_ip(sync_conn):
             columns = inspect(sync_conn).get_columns("api_keys")
             return any(column["name"] == "fake_ip" for column in columns)
+
+        def has_api_key_api_type(sync_conn):
+            columns = inspect(sync_conn).get_columns("api_keys")
+            return any(column["name"] == "api_type" for column in columns)
 
         def has_provider_model_priority_model_normalized(sync_conn):
             columns = inspect(sync_conn).get_columns("provider_model_priorities")
@@ -182,6 +188,9 @@ async def init_db():
         if not await conn.run_sync(has_fake_ip):
             await conn.exec_driver_sql("ALTER TABLE api_keys ADD COLUMN fake_ip VARCHAR(64)")
 
+        if not await conn.run_sync(has_api_key_api_type):
+            await conn.exec_driver_sql("ALTER TABLE api_keys ADD COLUMN api_type VARCHAR(30) DEFAULT 'other'")
+
         if not await conn.run_sync(has_provider_model_priority_model_normalized):
             await conn.exec_driver_sql(
                 "ALTER TABLE provider_model_priorities ADD COLUMN model_normalized VARCHAR(200) DEFAULT ''"
@@ -198,6 +207,55 @@ async def init_db():
 
         if not await conn.run_sync(has_cpa_overhead_ms):
             await conn.exec_driver_sql("ALTER TABLE usage_logs ADD COLUMN cpa_overhead_ms INTEGER DEFAULT 0")
+
+        def has_cache_tokens_log(sync_conn):
+            columns = inspect(sync_conn).get_columns("usage_logs")
+            return any(column["name"] == "cache_tokens" for column in columns)
+
+        def has_cache_tokens_summary(sync_conn):
+            columns = inspect(sync_conn).get_columns("usage_daily_summaries")
+            return any(column["name"] == "cache_tokens" for column in columns)
+
+        if not await conn.run_sync(has_cache_tokens_log):
+            await conn.exec_driver_sql("ALTER TABLE usage_logs ADD COLUMN cache_tokens INTEGER DEFAULT 0")
+
+        def has_api_key_password(sync_conn):
+            columns = inspect(sync_conn).get_columns("api_keys")
+            return any(column["name"] == "password" for column in columns)
+
+        if not await conn.run_sync(has_api_key_password):
+            await conn.exec_driver_sql("ALTER TABLE api_keys ADD COLUMN password TEXT")
+
+        def has_api_key_wz_url(sync_conn):
+            columns = inspect(sync_conn).get_columns("api_keys")
+            return any(column["name"] == "wz_url" for column in columns)
+
+        if not await conn.run_sync(has_api_key_wz_url):
+            await conn.exec_driver_sql("ALTER TABLE api_keys ADD COLUMN wz_url VARCHAR(500)")
+
+        def has_api_key_security_violation_count(sync_conn):
+            columns = inspect(sync_conn).get_columns("api_keys")
+            return any(column["name"] == "security_violation_count" for column in columns)
+
+        if not await conn.run_sync(has_api_key_security_violation_count):
+            await conn.exec_driver_sql("ALTER TABLE api_keys ADD COLUMN security_violation_count INTEGER DEFAULT 0")
+
+        def has_api_key_last_security_violation(sync_conn):
+            columns = inspect(sync_conn).get_columns("api_keys")
+            return any(column["name"] == "last_security_violation" for column in columns)
+
+        if not await conn.run_sync(has_api_key_last_security_violation):
+            await conn.exec_driver_sql("ALTER TABLE api_keys ADD COLUMN last_security_violation TEXT")
+
+        def has_actual_model(sync_conn):
+            columns = inspect(sync_conn).get_columns("usage_logs")
+            return any(column["name"] == "actual_model" for column in columns)
+
+        if not await conn.run_sync(has_actual_model):
+            await conn.exec_driver_sql("ALTER TABLE usage_logs ADD COLUMN actual_model VARCHAR(100)")
+
+        if not await conn.run_sync(has_cache_tokens_summary):
+            await conn.exec_driver_sql("ALTER TABLE usage_daily_summaries ADD COLUMN cache_tokens INTEGER DEFAULT 0")
 
         if not await conn.run_sync(has_image_generation_task_is_deleted):
             await conn.exec_driver_sql("ALTER TABLE image_generation_tasks ADD COLUMN is_deleted BOOLEAN DEFAULT 0")
@@ -245,6 +303,62 @@ async def init_db():
 
         if not await conn.run_sync(has_admin_user_supported_models):
             await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN supported_models TEXT")
+
+        def has_admin_user_daily_token_limit(sync_conn):
+            columns = inspect(sync_conn).get_columns("admin_users")
+            return any(column["name"] == "daily_token_limit" for column in columns)
+
+        def has_admin_user_weekly_token_limit(sync_conn):
+            columns = inspect(sync_conn).get_columns("admin_users")
+            return any(column["name"] == "weekly_token_limit" for column in columns)
+
+        def has_admin_user_monthly_token_limit(sync_conn):
+            columns = inspect(sync_conn).get_columns("admin_users")
+            return any(column["name"] == "monthly_token_limit" for column in columns)
+
+        if not await conn.run_sync(has_admin_user_daily_token_limit):
+            await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN daily_token_limit INTEGER")
+
+        if not await conn.run_sync(has_admin_user_weekly_token_limit):
+            await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN weekly_token_limit INTEGER")
+
+        if not await conn.run_sync(has_admin_user_monthly_token_limit):
+            await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN monthly_token_limit INTEGER")
+
+        def has_admin_user_quota_exceeded_mode(sync_conn):
+            columns = inspect(sync_conn).get_columns("admin_users")
+            return any(column["name"] == "quota_exceeded_mode" for column in columns)
+
+        def has_admin_user_quota_exceeded_message(sync_conn):
+            columns = inspect(sync_conn).get_columns("admin_users")
+            return any(column["name"] == "quota_exceeded_message" for column in columns)
+
+        if not await conn.run_sync(has_admin_user_quota_exceeded_mode):
+            await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN quota_exceeded_mode VARCHAR(20) DEFAULT 'normal'")
+
+        if not await conn.run_sync(has_admin_user_quota_exceeded_message):
+            await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN quota_exceeded_message TEXT")
+
+        def has_admin_user_model_mapping(sync_conn):
+            columns = inspect(sync_conn).get_columns("admin_users")
+            return any(column["name"] == "model_mapping" for column in columns)
+
+        if not await conn.run_sync(has_admin_user_model_mapping):
+            await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN model_mapping TEXT")
+
+        def has_admin_user_show_quota(sync_conn):
+            columns = inspect(sync_conn).get_columns("admin_users")
+            return any(column["name"] == "show_quota_to_user" for column in columns)
+
+        def has_admin_user_quota_reset_at(sync_conn):
+            columns = inspect(sync_conn).get_columns("admin_users")
+            return any(column["name"] == "quota_reset_at" for column in columns)
+
+        if not await conn.run_sync(has_admin_user_show_quota):
+            await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN show_quota_to_user INTEGER DEFAULT 0")
+
+        if not await conn.run_sync(has_admin_user_quota_reset_at):
+            await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN quota_reset_at DATETIME")
 
         # 为已有 admin 用户生成 api_key（如果还没有）
         await conn.exec_driver_sql(

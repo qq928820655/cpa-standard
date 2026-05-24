@@ -147,7 +147,14 @@ api.interceptors.response.use(
       clearMasterKey()
     }
 
-    const message = error.response?.data?.detail || error.message || '请求失败'
+    const rawDetail = error.response?.data?.detail
+    let message
+    if (Array.isArray(rawDetail)) {
+      // FastAPI 422 validation error：detail 是数组
+      message = rawDetail.map((e) => e.msg || JSON.stringify(e)).join('; ')
+    } else {
+      message = rawDetail || error.message || '请求失败'
+    }
     return Promise.reject(new Error(message))
   }
 )
@@ -182,6 +189,9 @@ export const adminApi = {
   updateKeyCooldownConfig: (data) => api.put('/admin/key-cooldown-config', data),
   getProxyTimeoutConfig: () => api.get('/admin/proxy-timeout-config'),
   updateProxyTimeoutConfig: (data) => api.put('/admin/proxy-timeout-config', data),
+  getContentGuardConfig: () => api.get('/admin/content-guard-config'),
+  updateContentGuardConfig: (data) => api.put('/admin/content-guard-config', data),
+  listContentGuardEvents: (params) => api.get('/admin/content-guard-events', { params }),
   getKeyCheckDefaultConfig: () => api.get('/admin/key-check-default-config'),
   updateKeyCheckDefaultConfig: (data) => api.put('/admin/key-check-default-config', data),
   getKeyCheckShortcutModels: () => api.get('/admin/key-check-shortcut-models'),
@@ -195,6 +205,12 @@ export const adminApi = {
   listProviderModelPriorityKeyOptions: (provider) => api.get('/admin/provider-model-priority-key-options', { params: { provider } }),
   saveProviderModelPriority: (data) => api.put('/admin/provider-model-priorities', data),
   clearProviderModelPriority: (data) => api.delete('/admin/provider-model-priorities', { data }),
+  listProviderModelMappings: (params) => api.get('/admin/provider-model-mappings', { params }),
+  exportProviderModelMappings: () => api.get('/admin/provider-model-mappings/export'),
+  importProviderModelMappings: (items) => api.post('/admin/provider-model-mappings/import', { items }),
+  createProviderModelMapping: (data) => api.post('/admin/provider-model-mappings', data),
+  updateProviderModelMapping: (id, data) => api.put(`/admin/provider-model-mappings/${id}`, data),
+  deleteProviderModelMapping: (id) => api.delete(`/admin/provider-model-mappings/${id}`),
 
   listModels: (provider, params) => api.get('/admin/models', { params: { provider, ...(params || {}) } }),
   exportModels: () => api.get('/admin/models/export'),
@@ -229,6 +245,26 @@ export const adminApi = {
   revealImageResultFile: (id) => api.post(`/admin/image/results/${id}/reveal-file`),
 
   exportConfig: (model) => api.get('/admin/export-config', { params: { model } }),
+
+  getProviderExtConfig: () => api.get('/admin/provider-ext-config'),
+  updateProviderExtConfig: (data) => api.put('/admin/provider-ext-config', data),
+  getProviderBalance: (keyId) =>
+    api.get('/admin/provider-balance', { params: { key_id: keyId } }),
+
+  getBalanceDowngradeRules: () => api.get('/admin/balance-downgrade-rules'),
+  updateBalanceDowngradeRules: (data) => api.put('/admin/balance-downgrade-rules', data),
+
+  getStreamBufferRules: () => api.get('/admin/stream-buffer-rules'),
+  updateStreamBufferRules: (data) => api.put('/admin/stream-buffer-rules', data),
+
+  getShowActualModel: () => api.get('/admin/show-actual-model'),
+  updateShowActualModel: (data) => api.put('/admin/show-actual-model', data),
+
+  getUserQuotaUsage: (userId) => api.get(`/admin/users/${userId}/quota-usage`),
+  resetUserQuota: (userId) => api.post(`/admin/users/${userId}/quota-reset`),
+
+  getProviderMigrationRules: () => api.get('/admin/provider-migration-rules'),
+  updateProviderMigrationRules: (data) => api.put('/admin/provider-migration-rules', data),
 }
 
 export const authApi = {

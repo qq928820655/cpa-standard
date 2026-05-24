@@ -19,10 +19,11 @@ import urllib.request
 from pathlib import Path
 from typing import Optional, List, Any, TypedDict
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
-from sqlalchemy import select, func, or_
+from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import select, func, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings, export_config, DATA_DIR
@@ -66,6 +67,7 @@ class ApiKeyCreate(BaseModel):
     name: str
     provider: str
     api_key: str
+    api_type: Optional[str] = "other"
     base_url: str
     is_active: bool = True
     weight: int = Field(default=1, ge=0)
@@ -77,6 +79,8 @@ class ApiKeyCreate(BaseModel):
     fake_ip: Optional[str] = None
     supported_models: Optional[List[str]] = None
     remark: Optional[str] = None
+    password: Optional[str] = None
+    wz_url: Optional[str] = None
 
 
 class ApiKeyUpdate(BaseModel):
@@ -84,6 +88,7 @@ class ApiKeyUpdate(BaseModel):
     name: Optional[str] = None
     provider: Optional[str] = None
     api_key: Optional[str] = None
+    api_type: Optional[str] = None
     base_url: Optional[str] = None
     is_active: Optional[bool] = None
     weight: Optional[int] = Field(default=None, ge=0)
@@ -95,6 +100,8 @@ class ApiKeyUpdate(BaseModel):
     fake_ip: Optional[str] = None
     supported_models: Optional[List[str]] = None
     remark: Optional[str] = None
+    password: Optional[str] = None
+    wz_url: Optional[str] = None
 
 
 class ApiKeyResponse(BaseModel):
@@ -104,6 +111,7 @@ class ApiKeyResponse(BaseModel):
     provider: str
     api_key: str
     api_key_masked: str
+    api_type: str = "other"
     base_url: str
     is_active: bool
     is_cooled_down: bool
@@ -116,8 +124,12 @@ class ApiKeyResponse(BaseModel):
     proxy_password: Optional[str] = None
     enable_fake_ip: bool = False
     fake_ip: Optional[str] = None
+    security_violation_count: int = 0
+    last_security_violation: Optional[str] = None
     supported_models: List[str] = Field(default_factory=list)
     remark: Optional[str]
+    password: Optional[str] = None
+    wz_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -129,6 +141,7 @@ class ApiKeyBatchImportItem(BaseModel):
     name: str
     provider: str
     api_key: str
+    api_type: Optional[str] = "other"
     base_url: str
     is_active: bool = True
     weight: Optional[int] = Field(default=None, ge=0)
@@ -140,6 +153,19 @@ class ApiKeyBatchImportItem(BaseModel):
     fake_ip: Optional[str] = None
     supported_models: Optional[List[str]] = None
     remark: Optional[str] = None
+    password: Optional[str] = None
+    wz_url: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_wz_url_alias(cls, data: Any):
+        if isinstance(data, dict) and data.get("wz_url") is None:
+            for alias in ("wzurl", "wzUrl", "web_url", "webUrl"):
+                if data.get(alias) is not None:
+                    data = dict(data)
+                    data["wz_url"] = data.get(alias)
+                    break
+        return data
 
 
 class ApiKeyBatchImportRequest(BaseModel):
@@ -192,6 +218,8 @@ class ApiKeyBatchUpdateModelsRequest(BaseModel):
     base_url: Optional[str] = None
     weight: Optional[int] = Field(default=None, ge=0)
     supported_models: Optional[List[str]] = None
+    new_provider: Optional[str] = None  # 批量变更提供商
+    api_type: Optional[str] = None
 
 
 class ApiKeyBatchUpdateModelsResponse(BaseModel):
@@ -637,12 +665,14 @@ class KeyCooldownConfigResponse(BaseModel):
     rate_limit_cooldown_seconds: int
     auth_failure_cooldown_seconds: int
     upstream_error_cooldown_seconds: int
+    cloudflare_524_auto_continue_providers: List[str] = []
 
 
 class KeyCooldownConfigUpdate(BaseModel):
     rate_limit_cooldown_seconds: int = Field(ge=0)
     auth_failure_cooldown_seconds: int = Field(ge=0)
     upstream_error_cooldown_seconds: int = Field(ge=0)
+    cloudflare_524_auto_continue_providers: List[str] = []
 
 
 class ProxyTimeoutConfigResponse(BaseModel):
@@ -657,6 +687,50 @@ class ProxyTimeoutConfigUpdate(BaseModel):
     proxy_stream_connect_timeout_seconds: int = Field(ge=1)
     proxy_stream_first_byte_timeout_seconds: int = Field(ge=1)
     proxy_stream_read_timeout_seconds: int = Field(ge=1)
+
+
+class ContentGuardConfigResponse(BaseModel):
+    enabled: bool = False
+    check_ads: bool = True
+    check_dangerous_code: bool = True
+    block_on_violation: bool = True
+    ad_action: str = "record"
+    auto_disable_key: bool = False
+    disable_threshold: int = Field(default=3, ge=1, le=100)
+    downgrade_weight: int = Field(default=1, ge=0, le=100)
+    ad_patterns: List[str] = Field(default_factory=list)
+    ad_regex_patterns: List[str] = Field(default_factory=list)
+    dangerous_patterns: List[str] = Field(default_factory=list)
+
+
+class ContentGuardConfigUpdate(ContentGuardConfigResponse):
+    pass
+
+
+class ContentGuardEventResponse(BaseModel):
+    id: int
+    api_key_id: int
+    key_name: Optional[str] = None
+    provider: Optional[str] = None
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    path: Optional[str] = None
+    category: str
+    rule: Optional[str] = None
+    snippet: Optional[str] = None
+    explanation: Optional[str] = None
+    action: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ContentGuardEventListResponse(BaseModel):
+    items: List[ContentGuardEventResponse]
+    total: int
+    page: int
+    limit: int
 
 
 class KeyCheckDefaultConfigResponse(BaseModel):
@@ -734,6 +808,58 @@ class ProviderModelPriorityMutationResponse(BaseModel):
     provider: str
     model: str
     priority_key_id: Optional[int] = None
+
+
+class ProviderModelMappingItem(BaseModel):
+    id: int
+    provider: str
+    provider_model: str
+    real_model: str
+    enabled: bool = True
+    remark: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class ProviderModelMappingListResponse(BaseModel):
+    items: List[ProviderModelMappingItem]
+    total: int
+
+
+class ProviderModelMappingCreate(BaseModel):
+    provider: str
+    provider_model: str
+    real_model: str
+    enabled: bool = True
+    remark: Optional[str] = None
+
+
+class ProviderModelMappingImportRequest(BaseModel):
+    items: List[ProviderModelMappingCreate]
+
+
+class ProviderModelMappingImportResponse(BaseModel):
+    count: int
+    created_count: int = 0
+    updated_count: int = 0
+    items: List[ProviderModelMappingItem]
+
+
+class ProviderModelMappingExportResponse(BaseModel):
+    count: int
+    items: List[ProviderModelMappingCreate]
+
+
+class ProviderModelMappingUpdate(BaseModel):
+    provider: str
+    provider_model: str
+    real_model: str
+    enabled: bool = True
+    remark: Optional[str] = None
+
+
+class ProviderModelMappingMutationResponse(BaseModel):
+    item: ProviderModelMappingItem
 
 
 # ============ 认证依赖 ============
@@ -814,6 +940,95 @@ def normalize_optional_text(value: Optional[str]) -> Optional[str]:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def normalize_api_type(value: Any) -> str:
+    """规范化 API 类型"""
+    if not isinstance(value, str):
+        return "other"
+    normalized = value.strip().lower()
+    if normalized in {"newapi", "sub2api", "other"}:
+        return normalized
+    return "other"
+
+
+def is_newapi_key(api_key: Any) -> bool:
+    """判断 Key 是否为 New API 类型"""
+    return normalize_api_type(getattr(api_key, "api_type", None)) == "newapi"
+
+
+def is_sub2api_key(api_key: Any) -> bool:
+    """判断 Key 是否为 sub2api 类型"""
+    return normalize_api_type(getattr(api_key, "api_type", None)) == "sub2api"
+
+
+def resolve_web_origin(web_url: str) -> str:
+    """解析网页访问 origin"""
+    normalized = (web_url or "").strip().rstrip("/")
+    if not normalized:
+        return ""
+    parsed = urlsplit(normalized)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    parsed = urlsplit(f"https://{normalized}")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def get_nested_value(data: Any, paths: list[list[str]]) -> Any:
+    """按多个候选路径读取嵌套字段"""
+    for path in paths:
+        current = data
+        for key in path:
+            if not isinstance(current, dict):
+                current = None
+                break
+            current = current.get(key)
+        if current not in (None, ""):
+            return current
+    return None
+
+
+def parse_sub2api_token(data: Any) -> Optional[str]:
+    """解析 sub2api 登录 token"""
+    value = get_nested_value(
+        data,
+        [
+            ["data", "access_token"],
+            ["data", "accessToken"],
+            ["data", "token"],
+            ["data", "jwt"],
+            ["access_token"],
+            ["accessToken"],
+            ["token"],
+            ["jwt"],
+        ],
+    )
+    return str(value).strip() if value not in (None, "") else None
+
+
+def parse_sub2api_user(data: Any) -> dict:
+    """解析 sub2api 用户信息"""
+    for path in (["data", "user"], ["data"], ["user"]):
+        value = get_nested_value(data, [path])
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def parse_sub2api_balance(user: dict, fallback_user: dict) -> tuple[float, float]:
+    """解析 sub2api 余额"""
+    balance_value = get_nested_value(user, [["balance"], ["quota"], ["remaining_quota"], ["credit"], ["credits"]])
+    if balance_value in (None, ""):
+        balance_value = get_nested_value(fallback_user, [["balance"], ["quota"], ["remaining_quota"], ["credit"], ["credits"]])
+    used_value = get_nested_value(user, [["used_quota"], ["used"], ["used_balance"], ["used_credit"], ["used_credits"]]) or 0
+
+    balance = float(balance_value)
+    used = float(used_value or 0)
+    if "quota" in user or "remaining_quota" in user:
+        balance = balance / 500000
+    if "used_quota" in user:
+        used = used / 500000
+    return round(balance, 6), round(used, 6)
 
 
 def build_proxy_fields(data: Any) -> dict:
@@ -944,6 +1159,7 @@ def to_response(key: Any) -> ApiKeyResponse:
         provider=key.provider,
         api_key=key.api_key,
         api_key_masked=mask_api_key(key.api_key),
+        api_type=normalize_api_type(getattr(key, "api_type", None)),
         base_url=key.base_url,
         is_active=key.is_active,
         is_cooled_down=cooldown_remaining_seconds > 0,
@@ -956,8 +1172,12 @@ def to_response(key: Any) -> ApiKeyResponse:
         proxy_password=getattr(key, "proxy_password", None),
         enable_fake_ip=bool(getattr(key, "enable_fake_ip", False)),
         fake_ip=getattr(key, "fake_ip", None),
+        security_violation_count=int(getattr(key, "security_violation_count", 0) or 0),
+        last_security_violation=getattr(key, "last_security_violation", None),
         supported_models=loads_json_list(getattr(key, "supported_models", None)),
         remark=key.remark,
+        password=getattr(key, "password", None),
+        wz_url=getattr(key, "wz_url", None),
         created_at=key.created_at,
         updated_at=key.updated_at,
     )
@@ -969,6 +1189,7 @@ def build_key_import_item(key: Any) -> ApiKeyBatchImportItem:
         name=key.name,
         provider=key.provider,
         api_key=key.api_key,
+        api_type=normalize_api_type(getattr(key, "api_type", None)),
         base_url=key.base_url,
         is_active=key.is_active,
         weight=key.weight,
@@ -980,6 +1201,8 @@ def build_key_import_item(key: Any) -> ApiKeyBatchImportItem:
         fake_ip=getattr(key, "fake_ip", None),
         supported_models=loads_json_list(getattr(key, "supported_models", None)) or None,
         remark=key.remark,
+        password=getattr(key, "password", None),
+        wz_url=getattr(key, "wz_url", None),
     )
 
 
@@ -1080,6 +1303,93 @@ def normalize_model_name(value: Optional[str]) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip().lower()
+
+
+def split_model_mapping_values(value: Optional[str]) -> list[str]:
+    """按中英文逗号拆分模型映射字段"""
+    if not isinstance(value, str):
+        return []
+    return [item.strip() for item in value.replace("，", ",").split(",") if item.strip()]
+
+
+def build_provider_model_mapping_fields(data: Any) -> dict:
+    """构建提供商模型映射字段"""
+    provider = normalize_optional_text(getattr(data, "provider", None))
+    provider_model = normalize_optional_text(getattr(data, "provider_model", None))
+    real_model = normalize_optional_text(getattr(data, "real_model", None))
+    if not provider:
+        raise HTTPException(status_code=400, detail="provider 不能为空")
+    if not provider_model:
+        raise HTTPException(status_code=400, detail="原始模型不能为空")
+    if not real_model:
+        raise HTTPException(status_code=400, detail="映射模型不能为空")
+
+    provider_model_normalized = normalize_model_name(provider_model)
+    real_model_normalized = normalize_model_name(real_model)
+    if not provider_model_normalized or not real_model_normalized:
+        raise HTTPException(status_code=400, detail="模型名称不能为空")
+
+    return {
+        "provider": provider,
+        "provider_model": provider_model,
+        "provider_model_normalized": provider_model_normalized,
+        "real_model": real_model,
+        "real_model_normalized": real_model_normalized,
+        "enabled": bool(getattr(data, "enabled", True)),
+        "remark": normalize_optional_text(getattr(data, "remark", None)),
+    }
+
+
+def to_provider_model_mapping_item(mapping: Any) -> ProviderModelMappingItem:
+    """转换提供商模型映射响应"""
+    return ProviderModelMappingItem(
+        id=mapping.id,
+        provider=mapping.provider,
+        provider_model=mapping.provider_model,
+        real_model=mapping.real_model,
+        enabled=bool(mapping.enabled),
+        remark=mapping.remark,
+        created_at=mapping.created_at,
+        updated_at=mapping.updated_at,
+    )
+
+
+def build_provider_model_mapping_import_item(mapping: Any) -> ProviderModelMappingCreate:
+    """构建提供商模型映射导入导出项"""
+    return ProviderModelMappingCreate(
+        provider=mapping.provider,
+        provider_model=mapping.provider_model,
+        real_model=mapping.real_model,
+        enabled=bool(mapping.enabled),
+        remark=mapping.remark,
+    )
+
+
+def expand_provider_model_mapping_import_item(data: Any) -> list[dict]:
+    """展开一行多模型映射导入项"""
+    provider = normalize_optional_text(getattr(data, "provider", None))
+    if not provider:
+        raise HTTPException(status_code=400, detail="provider 不能为空")
+    provider_models = split_model_mapping_values(getattr(data, "provider_model", None))
+    real_models = split_model_mapping_values(getattr(data, "real_model", None))
+    if not provider_models:
+        raise HTTPException(status_code=400, detail="原始模型不能为空")
+    if not real_models:
+        raise HTTPException(status_code=400, detail="映射模型不能为空")
+    if len(provider_models) != len(real_models):
+        raise HTTPException(status_code=400, detail=f"provider={provider} 的原始模型数量与映射模型数量不一致")
+
+    items = []
+    for provider_model, real_model in zip(provider_models, real_models):
+        item = ProviderModelMappingCreate(
+            provider=provider,
+            provider_model=provider_model,
+            real_model=real_model,
+            enabled=bool(getattr(data, "enabled", True)),
+            remark=normalize_optional_text(getattr(data, "remark", None)),
+        )
+        items.append(build_provider_model_mapping_fields(item))
+    return items
 
 
 def persist_export_config() -> None:
@@ -1793,6 +2103,7 @@ def build_api_key_snapshot(api_key: Any) -> ImageApiKeySnapshot:
         "id": get_snapshot_value(api_key, "id"),
         "provider": get_snapshot_value(api_key, "provider"),
         "name": get_snapshot_value(api_key, "name"),
+        "api_type": normalize_api_type(get_snapshot_value(api_key, "api_type")),
         "base_url": get_snapshot_value(api_key, "base_url"),
     }
 
@@ -2184,6 +2495,8 @@ async def refresh_image_task_from_task_log(db: AsyncSession, task: Any, upstream
     api_key = await db.get(ApiKey, int(task.api_key_id or 0)) if task.api_key_id else None
     if not api_key:
         return task, rows, False, "原始 Key 不存在，无法查询上游任务日志"
+    if not is_newapi_key(api_key):
+        return task, rows, False, "当前 Key 类型不支持图片回填查询"
 
     task_started_at = getattr(task, "started_at", None) or getattr(task, "created_at", None)
     if not task_started_at:
@@ -2352,6 +2665,8 @@ async def refresh_image_task_from_upstream(db: AsyncSession, task: Any, upstream
     api_key = await db.get(ApiKey, int(task.api_key_id or 0)) if task.api_key_id else None
     if not api_key:
         return task, rows, False, "原始 Key 不存在，无法重抓取"
+    if not is_newapi_key(api_key):
+        return task, rows, False, "当前 Key 类型不支持图片回填查询"
 
     refresh_result = await proxy_service.fetch_image_task_result(api_key, upstream_task)
     images = refresh_result.get("images") or []
@@ -2753,40 +3068,40 @@ IMAGE_MODEL_OPTIONS = [
         "model": "gpt-image-2",
         "display_name": "GPT Image 2",
         "provider": "openai",
-        "request_formats": ["chat", "images"],
-        "candidate_request_formats": ["chat", "images", "responses"],
+        "request_formats": ["images", "chat"],
+        "candidate_request_formats": ["images", "chat", "responses"],
         "max_count": 4,
     },
     {
         "model": "gpt-image-1-vip",
         "display_name": "GPT Image 1 VIP",
         "provider": "openai",
-        "request_formats": ["chat", "images"],
-        "candidate_request_formats": ["chat", "images", "responses"],
+        "request_formats": ["images", "chat"],
+        "candidate_request_formats": ["images", "chat", "responses"],
         "max_count": 4,
     },
     {
         "model": "gpt-image-1",
         "display_name": "GPT Image 1",
         "provider": "openai",
-        "request_formats": ["chat", "images"],
-        "candidate_request_formats": ["chat", "images", "responses"],
+        "request_formats": ["images", "chat"],
+        "candidate_request_formats": ["images", "chat", "responses"],
         "max_count": 4,
     },
     {
         "model": "nano-banana-pro",
         "display_name": "Nano Banana Pro",
         "provider": "openai",
-        "request_formats": ["chat", "images"],
-        "candidate_request_formats": ["chat", "images", "responses"],
+        "request_formats": ["images", "chat"],
+        "candidate_request_formats": ["images", "chat", "responses"],
         "max_count": 4,
     },
     {
         "model": "nano-banana-pro-4k",
         "display_name": "Nano Banana Pro 4K",
         "provider": "openai",
-        "request_formats": ["chat", "images"],
-        "candidate_request_formats": ["chat", "images", "responses"],
+        "request_formats": ["images", "chat"],
+        "candidate_request_formats": ["images", "chat", "responses"],
         "max_count": 4,
     },
 ]
@@ -3958,7 +4273,11 @@ async def run_image_generation_task(
                     generation_result.get("response_data"),
                     status_code,
                 )
-                row_status = "pending" if cloudflare_timeout else "error"
+                should_auto_refresh = cloudflare_timeout and is_newapi_key(api_key)
+                if cloudflare_timeout and not should_auto_refresh:
+                    error_message = f"{error_message}；当前 Key 类型不支持图片回填查询，已跳过自动回填"
+                    category = "image_refresh_not_supported"
+                row_status = "pending" if should_auto_refresh else "error"
                 row = ImageGenerationTaskResult(
                     task_id=task_id,
                     image_index=1,
@@ -3967,8 +4286,8 @@ async def run_image_generation_task(
                     api_key_name=api_key_snapshot["name"],
                     model=model,
                     status=row_status,
-                    error_category=category if not cloudflare_timeout else None,
-                    error_detail=None if cloudflare_timeout else error_message,
+                    error_category=category if not should_auto_refresh else None,
+                    error_detail=None if should_auto_refresh else error_message,
                     result_meta_json=json.dumps(
                         {
                             "upstream_task": generation_result.get("upstream_task") or {},
@@ -3982,7 +4301,7 @@ async def run_image_generation_task(
                     ),
                     created_at=started_at,
                     started_at=started_at,
-                    finished_at=None if cloudflare_timeout else finished_at,
+                    finished_at=None if should_auto_refresh else finished_at,
                     duration_ms=duration_ms,
                     updated_at=finished_at,
                 )
@@ -3992,12 +4311,8 @@ async def run_image_generation_task(
                 task.api_key_id = api_key_snapshot["id"]
                 task.api_key_name = api_key_snapshot["name"]
                 task.base_url = api_key_snapshot["base_url"]
-                cloudflare_timeout = is_cloudflare_image_timeout(
-                    error_message,
-                    generation_result.get("response_data"),
-                    status_code,
-                )
-                if cloudflare_timeout:
+                cloudflare_timeout = should_auto_refresh
+                if should_auto_refresh:
                     task.status = "running"
                     task.pending_refresh = True
                     task.completed_count = 0
@@ -4837,6 +5152,86 @@ async def update_proxy_timeout_config(
     return ProxyTimeoutConfigResponse(**payload)
 
 
+@router.get("/content-guard-config", response_model=ContentGuardConfigResponse)
+async def get_content_guard_config(
+    _: bool = Depends(verify_admin_key),
+):
+    """获取上游内容安全防护配置"""
+    from services.content_guard_service import content_guard_service
+
+    return ContentGuardConfigResponse(**content_guard_service.get_config())
+
+
+@router.put("/content-guard-config", response_model=ContentGuardConfigResponse)
+async def update_content_guard_config(
+    data: ContentGuardConfigUpdate,
+    _: bool = Depends(verify_admin_key),
+):
+    """更新上游内容安全防护配置"""
+    payload = data.model_dump()
+    if payload.get("ad_action") not in {"record", "sanitize", "block"}:
+        payload["ad_action"] = "record"
+    payload["ad_patterns"] = [item.strip() for item in payload.get("ad_patterns") or [] if item.strip()]
+    payload["ad_regex_patterns"] = [item.strip() for item in payload.get("ad_regex_patterns") or [] if item.strip()]
+    payload["dangerous_patterns"] = [item.strip() for item in payload.get("dangerous_patterns") or [] if item.strip()]
+    export_config["content_guard"] = payload
+    persist_export_config()
+    return ContentGuardConfigResponse(**payload)
+
+
+@router.get("/content-guard-events", response_model=ContentGuardEventListResponse)
+async def list_content_guard_events(
+    provider: Optional[str] = None,
+    category: Optional[str] = None,
+    action: Optional[str] = None,
+    key_id: Optional[int] = None,
+    keyword: Optional[str] = None,
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """获取上游内容安全事件列表"""
+    from models import ContentGuardEvent
+
+    conditions = []
+    if provider:
+        conditions.append(ContentGuardEvent.provider == provider)
+    if category:
+        conditions.append(ContentGuardEvent.category == category)
+    if action:
+        conditions.append(ContentGuardEvent.action == action)
+    if key_id:
+        conditions.append(ContentGuardEvent.api_key_id == key_id)
+    if keyword and keyword.strip():
+        text = f"%{keyword.strip()}%"
+        conditions.append(or_(
+            ContentGuardEvent.key_name.like(text),
+            ContentGuardEvent.base_url.like(text),
+            ContentGuardEvent.model.like(text),
+            ContentGuardEvent.path.like(text),
+            ContentGuardEvent.rule.like(text),
+            ContentGuardEvent.snippet.like(text),
+            ContentGuardEvent.explanation.like(text),
+        ))
+
+    offset_value = (page - 1) * limit
+    count_query = select(func.count(ContentGuardEvent.id))
+    data_query = select(ContentGuardEvent).order_by(ContentGuardEvent.created_at.desc(), ContentGuardEvent.id.desc())
+    if conditions:
+        count_query = count_query.where(*conditions)
+        data_query = data_query.where(*conditions)
+
+    total = int((await db.execute(count_query)).scalar() or 0)
+    rows = (await db.execute(data_query.offset(offset_value).limit(limit))).scalars().all()
+    return ContentGuardEventListResponse(
+        items=[ContentGuardEventResponse.model_validate(row) for row in rows],
+        total=total,
+        page=page,
+        limit=limit,
+    )
+
+
 @router.get("/key-check-default-config", response_model=KeyCheckDefaultConfigResponse)
 async def get_key_check_default_config(
     _: bool = Depends(verify_admin_key),
@@ -4908,6 +5303,8 @@ async def list_keys(
     key_ids: Optional[List[int]] = Query(default=None),
     key_names: Optional[List[str]] = Query(default=None),
     is_active: Optional[bool] = Query(default=None),
+    sort_by: Optional[str] = Query(default="id"),
+    sort_order: Optional[str] = Query(default="ascending"),
     page: Optional[int] = None,
     limit: int = 50,
     offset: Optional[int] = None,
@@ -4920,30 +5317,72 @@ async def list_keys(
     page_value, limit_value, offset_value = parse_pagination(page, limit, offset)
 
     from models import ApiKey
+    from sqlalchemy import func
 
-    query = select(ApiKey).order_by(ApiKey.id)
-    if provider_values:
-        query = query.where(ApiKey.provider.in_(provider_values))
-    identity_filters = build_key_identity_filters(ApiKey, key_ids, key_names)
-    if identity_filters:
-        query = query.where(or_(*identity_filters))
-    if is_active is not None:
-        query = query.where(ApiKey.is_active == is_active)
+    # 允许排序的字段白名单，防止 SQL 注入
+    _SORTABLE_COLUMNS = {
+        "id": ApiKey.id,
+        "name": ApiKey.name,
+        "provider": ApiKey.provider,
+        "weight": ApiKey.weight,
+        "is_active": ApiKey.is_active,
+        "created_at": ApiKey.created_at,
+    }
+    sort_col = _SORTABLE_COLUMNS.get(sort_by or "id", ApiKey.id)
+    sort_expr = sort_col.asc() if (sort_order or "ascending") == "ascending" else sort_col.desc()
 
-    data_result = await db.execute(query)
-    keys = list(data_result.scalars().all())
+    def _build_base_conditions():
+        conditions = []
+        if provider_values:
+            conditions.append(ApiKey.provider.in_(provider_values))
+        identity_filters = build_key_identity_filters(ApiKey, key_ids, key_names)
+        if identity_filters:
+            conditions.append(or_(*identity_filters))
+        if is_active is not None:
+            conditions.append(ApiKey.is_active == is_active)
+        return conditions
+
+    base_conditions = _build_base_conditions()
 
     if model_values:
-        keys = [
-            key for key in keys
-            if any(pool_manager.key_supports_model(key, model) for model in model_values)
-        ]
+        # 有模型筛选：两阶段查询
+        # 第一阶段：只加载 id + supported_models，在 Python 层过滤
+        light_query = select(ApiKey.id, ApiKey.supported_models)
+        if base_conditions:
+            light_query = light_query.where(*base_conditions)
+        light_rows = (await db.execute(light_query)).all()
 
-    total = len(keys)
-    paged_keys = keys[offset_value:offset_value + limit_value]
+        matched_ids = [
+            row.id for row in light_rows
+            if any(pool_manager.key_supports_model(row, model) for model in model_values)
+        ]
+        total = len(matched_ids)
+        page_ids = matched_ids[offset_value:offset_value + limit_value]
+
+        if not page_ids:
+            return {"items": [], "total": total, "page": page_value, "limit": limit_value}
+
+        # 第二阶段：按命中 ID 加载完整数据，保持排序
+        data_query = select(ApiKey).where(ApiKey.id.in_(page_ids)).order_by(sort_expr)
+        keys = (await db.execute(data_query)).scalars().all()
+        # 按 matched_ids 顺序重排（保证分页顺序稳定）
+        id_order = {key_id: idx for idx, key_id in enumerate(page_ids)}
+        keys = sorted(keys, key=lambda k: id_order.get(k.id, 0))
+    else:
+        # 无模型筛选：直接 SQL COUNT + LIMIT/OFFSET
+        count_query = select(func.count(ApiKey.id))
+        if base_conditions:
+            count_query = count_query.where(*base_conditions)
+        total = int((await db.execute(count_query)).scalar() or 0)
+
+        data_query = select(ApiKey).order_by(sort_expr)
+        if base_conditions:
+            data_query = data_query.where(*base_conditions)
+        data_query = data_query.offset(offset_value).limit(limit_value)
+        keys = (await db.execute(data_query)).scalars().all()
 
     return {
-        "items": [to_response(key) for key in paged_keys],
+        "items": [to_response(key) for key in keys],
         "total": total,
         "page": page_value,
         "limit": limit_value,
@@ -4980,11 +5419,14 @@ async def create_key(
         name=data.name,
         provider=data.provider,
         api_key=data.api_key,
+        api_type=normalize_api_type(data.api_type),
         base_url=data.base_url,
         is_active=data.is_active,
         weight=data.weight,
         supported_models=dumps_json_list(supported_models),
         remark=data.remark,
+        password=data.password,
+        wz_url=data.wz_url,
         **proxy_fields,
         **fake_ip_fields,
     )
@@ -5048,6 +5490,7 @@ async def import_keys(
 
         if matched_key:
             matched_key.api_key = normalized_api_key
+            matched_key.api_type = normalize_api_type(item.api_type)
             matched_key.base_url = normalized_base_url
             matched_key.supported_models = serialized_models
             matched_key.enable_proxy = proxy_fields["enable_proxy"]
@@ -5058,6 +5501,10 @@ async def import_keys(
             matched_key.fake_ip = fake_ip_fields["fake_ip"]
             if should_update_weight:
                 matched_key.weight = item.weight
+            if item.password is not None:
+                matched_key.password = item.password
+            if item.wz_url is not None:
+                matched_key.wz_url = item.wz_url
             matched_key.updated_at = datetime.utcnow()
             processed_items.append(matched_key)
             touched_providers.add(matched_key.provider)
@@ -5068,11 +5515,14 @@ async def import_keys(
             name=normalized_name,
             provider=normalized_provider,
             api_key=normalized_api_key,
+            api_type=normalize_api_type(item.api_type),
             base_url=normalized_base_url,
             is_active=item.is_active,
             weight=item.weight if should_update_weight and item.weight is not None else 1,
             supported_models=serialized_models,
             remark=item.remark,
+            password=item.password,
+            wz_url=item.wz_url,
             **proxy_fields,
             **fake_ip_fields,
         )
@@ -5145,11 +5595,14 @@ async def batch_update_key_models(
     should_update_base_url = "base_url" in provided_fields
     should_update_weight = "weight" in provided_fields
     should_update_supported_models = "supported_models" in provided_fields
+    should_update_provider = bool(data.new_provider and data.new_provider.strip())
+    should_update_api_type = "api_type" in provided_fields
 
     normalized_base_url = data.base_url.strip() if isinstance(data.base_url, str) else None
-    if not should_update_base_url and not should_update_weight and not should_update_supported_models:
+    normalized_api_type = normalize_api_type(data.api_type) if should_update_api_type else None
+    if not should_update_base_url and not should_update_weight and not should_update_supported_models and not should_update_provider and not should_update_api_type:
         raise HTTPException(status_code=400, detail="请至少选择一项要调整的内容")
-    if should_update_base_url and not normalized_base_url and not should_update_weight and not should_update_supported_models:
+    if should_update_base_url and not normalized_base_url and not should_update_weight and not should_update_supported_models and not should_update_provider and not should_update_api_type:
         raise HTTPException(status_code=400, detail="请求地址不能为空")
 
     supported_models = []
@@ -5160,6 +5613,7 @@ async def batch_update_key_models(
         serialized_models = dumps_json_list(supported_models)
 
     touched_providers = set()
+    new_provider_value = data.new_provider.strip() if should_update_provider else None
     for key in keys:
         if should_update_base_url and normalized_base_url:
             key.base_url = normalized_base_url
@@ -5167,6 +5621,11 @@ async def batch_update_key_models(
             key.weight = data.weight
         if should_update_supported_models:
             key.supported_models = serialized_models
+        if should_update_provider:
+            touched_providers.add(key.provider)  # 旧 provider 也要重置
+            key.provider = new_provider_value
+        if should_update_api_type:
+            key.api_type = normalized_api_type
         key.updated_at = datetime.utcnow()
         touched_providers.add(key.provider)
 
@@ -5317,7 +5776,11 @@ async def batch_check_key_endpoints(
     async def run_single_check(key: Any) -> tuple[Any, dict]:
         async with semaphore:
             try:
-                result = await proxy_service.check_key_connectivity_and_model(key, target_model)
+                model_plan = await pool_manager.build_model_match_plan(db, target_model, providers=[key.provider])
+                upstream_model = pool_manager.resolve_upstream_model_for_key(key, target_model, model_plan)
+                result = await proxy_service.check_key_connectivity_and_model(key, upstream_model or target_model)
+                result["target_model"] = target_model
+                result["upstream_model"] = upstream_model or target_model
             except Exception as exc:
                 result = {
                     "status": "error",
@@ -5375,7 +5838,11 @@ async def check_single_key(
     if not key:
         raise HTTPException(status_code=404, detail="API Key 不存在")
 
-    result = await proxy_service.check_key_connectivity_and_model(key, target_model)
+    model_plan = await pool_manager.build_model_match_plan(db, target_model, providers=[key.provider])
+    upstream_model = pool_manager.resolve_upstream_model_for_key(key, target_model, model_plan)
+    result = await proxy_service.check_key_connectivity_and_model(key, upstream_model or target_model)
+    result["target_model"] = target_model
+    result["upstream_model"] = upstream_model or target_model
     return build_api_key_check_item(key, result)
 
 
@@ -5504,6 +5971,9 @@ async def update_key(
         if field == "supported_models":
             normalized_models, _ = await ensure_models_exist(db, value)
             setattr(key, field, dumps_json_list(normalized_models))
+            continue
+        if field == "api_type":
+            setattr(key, field, normalize_api_type(value))
             continue
         setattr(key, field, value)
 
@@ -5642,6 +6112,186 @@ async def list_key_providers(
     result = await db.execute(select(ApiKey.provider).distinct().order_by(ApiKey.provider.asc()))
     items = normalize_string_list(list(result.scalars().all()))
     return ProviderListResponse(items=items)
+
+
+@router.get("/provider-model-mappings", response_model=ProviderModelMappingListResponse)
+async def list_provider_model_mappings(
+    provider: Optional[str] = Query(default=None),
+    provider_model: Optional[str] = Query(default=None),
+    real_model: Optional[str] = Query(default=None),
+    enabled: Optional[bool] = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """查询提供商模型映射"""
+    from models import ProviderModelMapping
+
+    conditions = []
+    provider_value = normalize_optional_text(provider)
+    provider_model_value = normalize_optional_text(provider_model)
+    real_model_value = normalize_optional_text(real_model)
+    if provider_value:
+        conditions.append(ProviderModelMapping.provider == provider_value)
+    if provider_model_value:
+        conditions.append(ProviderModelMapping.provider_model.ilike(f"%{provider_model_value}%"))
+    if real_model_value:
+        conditions.append(ProviderModelMapping.real_model.ilike(f"%{real_model_value}%"))
+    if enabled is not None:
+        conditions.append(ProviderModelMapping.enabled == enabled)
+
+    query = select(ProviderModelMapping)
+    count_query = select(func.count()).select_from(ProviderModelMapping)
+    if conditions:
+        query = query.where(and_(*conditions))
+        count_query = count_query.where(and_(*conditions))
+    query = query.order_by(ProviderModelMapping.provider.asc(), ProviderModelMapping.provider_model_normalized.asc())
+
+    result = await db.execute(query)
+    total_result = await db.execute(count_query)
+    return ProviderModelMappingListResponse(
+        items=[to_provider_model_mapping_item(item) for item in result.scalars().all()],
+        total=int(total_result.scalar() or 0),
+    )
+
+
+@router.get("/provider-model-mappings/export", response_model=ProviderModelMappingExportResponse)
+async def export_provider_model_mappings(
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """导出全部提供商模型映射"""
+    from models import ProviderModelMapping
+
+    result = await db.execute(
+        select(ProviderModelMapping).order_by(
+            ProviderModelMapping.provider.asc(),
+            ProviderModelMapping.provider_model_normalized.asc(),
+        )
+    )
+    items = [build_provider_model_mapping_import_item(item) for item in result.scalars().all()]
+    return ProviderModelMappingExportResponse(count=len(items), items=items)
+
+
+@router.post("/provider-model-mappings/import", response_model=ProviderModelMappingImportResponse)
+async def import_provider_model_mappings(
+    data: ProviderModelMappingImportRequest,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """批量导入提供商模型映射"""
+    from models import ProviderModelMapping
+
+    created_count = 0
+    updated_count = 0
+    processed_items = []
+    fields_list = []
+    for item in data.items:
+        fields_list.extend(expand_provider_model_mapping_import_item(item))
+    provider_values = normalize_string_list([item["provider"] for item in fields_list])
+    existing_map: dict[tuple[str, str], Any] = {}
+    if provider_values:
+        result = await db.execute(select(ProviderModelMapping).where(ProviderModelMapping.provider.in_(provider_values)))
+        for item in result.scalars().all():
+            existing_map[(item.provider.lower(), item.provider_model_normalized.lower())] = item
+
+    for fields in fields_list:
+        key = (fields["provider"].lower(), fields["provider_model_normalized"].lower())
+        mapping = existing_map.get(key)
+        if mapping is None:
+            mapping = ProviderModelMapping(**fields)
+            db.add(mapping)
+            existing_map[key] = mapping
+            created_count += 1
+        else:
+            for field_name, field_value in fields.items():
+                setattr(mapping, field_name, field_value)
+            updated_count += 1
+        processed_items.append(mapping)
+
+    await db.commit()
+    for item in processed_items:
+        await db.refresh(item)
+    return ProviderModelMappingImportResponse(
+        count=len(processed_items),
+        created_count=created_count,
+        updated_count=updated_count,
+        items=[to_provider_model_mapping_item(item) for item in processed_items],
+    )
+
+
+@router.post("/provider-model-mappings", response_model=ProviderModelMappingMutationResponse)
+async def create_provider_model_mapping(
+    data: ProviderModelMappingCreate,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """新增或更新提供商模型映射"""
+    from models import ProviderModelMapping
+
+    fields = build_provider_model_mapping_fields(data)
+    result = await db.execute(
+        select(ProviderModelMapping).where(
+            ProviderModelMapping.provider == fields["provider"],
+            ProviderModelMapping.provider_model_normalized == fields["provider_model_normalized"],
+        )
+    )
+    mapping = result.scalar_one_or_none()
+    if mapping is None:
+        mapping = ProviderModelMapping(**fields)
+        db.add(mapping)
+    else:
+        for key, value in fields.items():
+            setattr(mapping, key, value)
+    await db.commit()
+    await db.refresh(mapping)
+    return ProviderModelMappingMutationResponse(item=to_provider_model_mapping_item(mapping))
+
+
+@router.put("/provider-model-mappings/{mapping_id}", response_model=ProviderModelMappingMutationResponse)
+async def update_provider_model_mapping(
+    mapping_id: int,
+    data: ProviderModelMappingUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """更新提供商模型映射"""
+    from models import ProviderModelMapping
+
+    mapping = await db.get(ProviderModelMapping, mapping_id)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="模型映射不存在")
+    fields = build_provider_model_mapping_fields(data)
+    duplicate_result = await db.execute(
+        select(ProviderModelMapping).where(
+            ProviderModelMapping.provider == fields["provider"],
+            ProviderModelMapping.provider_model_normalized == fields["provider_model_normalized"],
+            ProviderModelMapping.id != mapping_id,
+        )
+    )
+    if duplicate_result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="同一提供商下原始模型映射已存在")
+    for key, value in fields.items():
+        setattr(mapping, key, value)
+    await db.commit()
+    await db.refresh(mapping)
+    return ProviderModelMappingMutationResponse(item=to_provider_model_mapping_item(mapping))
+
+
+@router.delete("/provider-model-mappings/{mapping_id}", response_model=dict)
+async def delete_provider_model_mapping(
+    mapping_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """删除提供商模型映射"""
+    from models import ProviderModelMapping
+
+    mapping = await db.get(ProviderModelMapping, mapping_id)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="模型映射不存在")
+    await db.delete(mapping)
+    await db.commit()
+    return {"success": True}
 
 
 @router.get("/provider-model-priorities", response_model=ProviderModelPriorityListResponse)
@@ -5999,3 +6649,496 @@ async def get_export_config(
         },
         usage_guide_default_content=export_config["usage_guide_default_content"],
     )
+
+
+# ============ Provider 扩展配置 ============
+
+class ProviderExtConfig(BaseModel):
+    """单个 provider 的扩展配置"""
+    password: Optional[str] = None
+
+
+class ProviderExtConfigMap(BaseModel):
+    """所有 provider 扩展配置"""
+    providers: dict[str, ProviderExtConfig] = Field(default_factory=dict)
+
+
+@router.get("/provider-ext-config", response_model=ProviderExtConfigMap)
+async def get_provider_ext_config(
+    _: bool = Depends(verify_admin_key),
+):
+    """获取 provider 扩展配置（密码脱敏返回）"""
+    raw: dict = export_config.get("provider_ext") or {}
+    result = {}
+    for provider, cfg in raw.items():
+        if not isinstance(cfg, dict):
+            continue
+        pwd = cfg.get("password") or ""
+        result[provider] = ProviderExtConfig(
+            password="*" * min(len(pwd), 8) if pwd else "",
+        )
+    return ProviderExtConfigMap(providers=result)
+
+
+@router.put("/provider-ext-config", response_model=ProviderExtConfigMap)
+async def update_provider_ext_config(
+    data: ProviderExtConfigMap,
+    _: bool = Depends(verify_admin_key),
+):
+    """更新 provider 扩展配置"""
+    current: dict = export_config.get("provider_ext") or {}
+    for provider, cfg in data.providers.items():
+        provider_key = provider.strip().lower()
+        if not provider_key:
+            continue
+        existing = current.get(provider_key) or {}
+        if not isinstance(existing, dict):
+            existing = {}
+        # 密码全是 * 表示未修改，保留原值
+        new_pwd = cfg.password or ""
+        if new_pwd and not all(c == "*" for c in new_pwd):
+            existing["password"] = new_pwd
+        elif not new_pwd:
+            existing.pop("password", None)
+        current[provider_key] = existing
+
+    export_config["provider_ext"] = current
+    persist_export_config()
+
+    result = {}
+    for provider, cfg in current.items():
+        pwd = cfg.get("password") or ""
+        result[provider] = ProviderExtConfig(
+            password="*" * min(len(pwd), 8) if pwd else "",
+        )
+    return ProviderExtConfigMap(providers=result)
+
+
+@router.get("/provider-balance")
+async def get_provider_balance(
+    key_id: int = Query(...),
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """查询指定 Key 的余额（通过 New API 登录接口，复用 Key 的代理和 fake IP 配置）"""
+    import httpx as _httpx
+    from models import ApiKey
+
+    key = await db.get(ApiKey, key_id)
+    if not key:
+        raise HTTPException(status_code=404, detail="API Key 不存在")
+
+    provider_key = (getattr(key, "provider", "") or "").strip().lower()
+    provider_ext: dict = export_config.get("provider_ext") or {}
+    cfg = provider_ext.get(provider_key) or {}
+
+    # 优先用 Key 自身的密码，为空则取供应商默认密码
+    password = (getattr(key, "password", None) or "").strip()
+    if not password:
+        password = (cfg.get("password") or "").strip()
+
+    if not password:
+        raise HTTPException(status_code=400, detail=f"未配置 {provider_key} 的登录密码，请在 Key 详情或系统设置中配置")
+
+    key_name = (getattr(key, "name", "") or "").strip()
+    base_url = (getattr(key, "base_url", "") or "").strip().rstrip("/")
+    # 余额查询优先用网页网址 wz_url，为空则取 base_url
+    web_url = (getattr(key, "wz_url", None) or "").strip().rstrip("/") or base_url
+    if not web_url:
+        raise HTTPException(status_code=400, detail="Key 未配置请求地址")
+
+    origin = resolve_web_origin(web_url)
+    if not origin:
+        raise HTTPException(status_code=400, detail="Key 未配置有效的网页网址或请求地址")
+
+    api_type = normalize_api_type(getattr(key, "api_type", None))
+    if api_type == "other":
+        raise HTTPException(status_code=400, detail="其他类型 Key 不支持余额查询")
+
+    client_kwargs = proxy_service._build_client_kwargs(key, proxy_service._build_image_generation_timeout())
+
+    try:
+        async with _httpx.AsyncClient(**client_kwargs) as client:
+            if api_type == "sub2api":
+                login_url = f"{origin}/api/v1/auth/login"
+                self_url = f"{origin}/api/v1/auth/me?timezone=Etc%2FGMT-8"
+                login_headers = {"accept": "application/json, text/plain, */*", "content-type": "application/json"}
+                proxy_service._apply_fake_ip_headers(key, login_headers)
+                login_resp = await client.post(
+                    login_url,
+                    headers=login_headers,
+                    json={"email": key_name, "password": password},
+                )
+                if login_resp.status_code >= 400:
+                    raise HTTPException(status_code=502, detail=f"登录失败: HTTP {login_resp.status_code}")
+
+                login_data = proxy_service._parse_response_body(login_resp)
+                if not isinstance(login_data, dict) or login_data.get("code") not in (0, "0", None):
+                    msg = proxy_service._extract_error_message(login_data, "登录失败")
+                    raise HTTPException(status_code=502, detail=msg)
+
+                access_token = parse_sub2api_token(login_data)
+                if not access_token:
+                    raise HTTPException(status_code=502, detail=f"登录成功但未返回 token，返回字段: {list(login_data.keys())}")
+                login_user = parse_sub2api_user(login_data)
+
+                self_headers = {"accept": "application/json, text/plain, */*", "authorization": f"Bearer {access_token}"}
+                proxy_service._apply_fake_ip_headers(key, self_headers)
+                self_resp = await client.get(self_url, headers=self_headers)
+                if self_resp.status_code >= 400:
+                    raise HTTPException(status_code=502, detail=f"查询余额失败: HTTP {self_resp.status_code}")
+                self_data = proxy_service._parse_response_body(self_resp)
+                if not isinstance(self_data, dict) or self_data.get("code") not in (0, "0", None):
+                    msg = proxy_service._extract_error_message(self_data, "查询余额接口返回失败")
+                    raise HTTPException(status_code=502, detail=msg)
+                user = parse_sub2api_user(self_data)
+                try:
+                    balance_usd, used_usd = parse_sub2api_balance(user, login_user)
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=502, detail=f"查询余额接口未返回有效余额，返回字段: {list(user.keys())}")
+                return {
+                    "balance_usd": balance_usd,
+                    "used_usd": used_usd,
+                    "display_name": user.get("username") or user.get("email") or login_user.get("username") or login_user.get("email") or key_name,
+                    "api_type": "sub2api",
+                }
+
+            # 登录
+            login_url = f"{origin}/api/user/login?turnstile="
+            self_url = f"{origin}/api/user/self"
+            login_headers = proxy_service._build_magic666_headers(api_key=key)
+            login_headers["content-type"] = "application/json"
+            login_resp = await client.post(
+                login_url,
+                headers=login_headers,
+                json={"username": key_name, "password": password},
+            )
+            if login_resp.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"登录失败: HTTP {login_resp.status_code}")
+
+            login_data = proxy_service._parse_response_body(login_resp)
+            if not isinstance(login_data, dict) or not login_data.get("success"):
+                msg = proxy_service._extract_error_message(login_data, "登录失败")
+                raise HTTPException(status_code=502, detail=msg)
+
+            user_data = login_data.get("data") or {}
+            user_id = user_data.get("id")
+
+            # 查询用户信息
+            self_headers = proxy_service._build_magic666_headers(user_id=user_id, api_key=key)
+            self_resp = await client.get(self_url, headers=self_headers)
+            if self_resp.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"查询余额失败: HTTP {self_resp.status_code}")
+
+            self_data = proxy_service._parse_response_body(self_resp)
+            if not isinstance(self_data, dict) or not self_data.get("success"):
+                raise HTTPException(status_code=502, detail="查询余额接口返回失败")
+
+            user = self_data.get("data") or {}
+            quota = int(user.get("quota") or 0)
+            used_quota = int(user.get("used_quota") or 0)
+            # 1 美元 = 500,000 quota
+            balance_usd = round(quota / 500000, 6)
+            used_usd = round(used_quota / 500000, 6)
+
+            return {
+                "quota": quota,
+                "used_quota": used_quota,
+                "balance_usd": balance_usd,
+                "used_usd": used_usd,
+                "display_name": user.get("display_name") or user.get("username") or key_name,
+                "api_type": "newapi",
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"查询余额失败: {e}")
+
+
+# ============ 余额降权规则配置 ============
+
+class BalanceDowngradeRule(BaseModel):
+    min: Optional[float] = None
+    max: Optional[float] = None
+    action: str = "disable"   # none | weight | disable
+    weight: Optional[int] = None
+    providers: Optional[List[str]] = None  # 留空匹配所有提供商，填写后只对指定提供商生效
+
+
+class BalanceDowngradeRulesResponse(BaseModel):
+    rules: List[BalanceDowngradeRule]
+
+
+class BalanceDowngradeRulesUpdate(BaseModel):
+    rules: List[BalanceDowngradeRule]
+
+
+@router.get("/balance-downgrade-rules", response_model=BalanceDowngradeRulesResponse)
+async def get_balance_downgrade_rules(
+    _: bool = Depends(verify_admin_key),
+):
+    """获取余额不足降权规则"""
+    raw = export_config.get("balance_downgrade_rules") or []
+    rules = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        rules.append(BalanceDowngradeRule(
+            min=item.get("min"),
+            max=item.get("max"),
+            action=item.get("action", "disable"),
+            weight=item.get("weight"),
+            providers=item.get("providers") or None,
+        ))
+    return BalanceDowngradeRulesResponse(rules=rules)
+
+
+@router.put("/balance-downgrade-rules", response_model=BalanceDowngradeRulesResponse)
+async def update_balance_downgrade_rules(
+    data: BalanceDowngradeRulesUpdate,
+    _: bool = Depends(verify_admin_key),
+):
+    """更新余额不足降权规则"""
+    rules = []
+    for rule in data.rules:
+        item: dict = {"action": rule.action}
+        if rule.min is not None:
+            item["min"] = rule.min
+        if rule.max is not None:
+            item["max"] = rule.max
+        if rule.action == "weight" and rule.weight is not None:
+            item["weight"] = max(1, int(rule.weight))
+        if rule.providers:
+            item["providers"] = [p.strip().lower() for p in rule.providers if p.strip()]
+        rules.append(item)
+
+    export_config["balance_downgrade_rules"] = rules
+    persist_export_config()
+
+    return BalanceDowngradeRulesResponse(rules=[
+        BalanceDowngradeRule(
+            min=r.get("min"), max=r.get("max"),
+            action=r.get("action", "disable"), weight=r.get("weight"),
+            providers=r.get("providers") or None,
+        ) for r in rules
+    ])
+
+
+# ============ 流式缓冲规则配置 ============
+
+class StreamBufferRule(BaseModel):
+    provider: Optional[str] = None
+    model: Optional[str] = None
+
+
+class StreamBufferRulesResponse(BaseModel):
+    rules: List[StreamBufferRule]
+
+
+class StreamBufferRulesUpdate(BaseModel):
+    rules: List[StreamBufferRule]
+
+
+@router.get("/stream-buffer-rules", response_model=StreamBufferRulesResponse)
+async def get_stream_buffer_rules(
+    _: bool = Depends(verify_admin_key),
+):
+    """获取流式缓冲规则"""
+    raw = export_config.get("stream_buffer_rules") or []
+    rules = [StreamBufferRule(provider=r.get("provider"), model=r.get("model")) for r in raw if isinstance(r, dict)]
+    return StreamBufferRulesResponse(rules=rules)
+
+
+@router.put("/stream-buffer-rules", response_model=StreamBufferRulesResponse)
+async def update_stream_buffer_rules(
+    data: StreamBufferRulesUpdate,
+    _: bool = Depends(verify_admin_key),
+):
+    """更新流式缓冲规则"""
+    rules = []
+    for item in data.rules:
+        entry: dict = {}
+        if item.provider and item.provider.strip():
+            entry["provider"] = item.provider.strip()
+        if item.model and item.model.strip():
+            entry["model"] = item.model.strip()
+        rules.append(entry)
+
+    export_config["stream_buffer_rules"] = rules
+    persist_export_config()
+    return StreamBufferRulesResponse(rules=[StreamBufferRule(provider=r.get("provider"), model=r.get("model")) for r in rules])
+
+
+# ============ 显示设置配置 ============
+
+class ShowActualModelResponse(BaseModel):
+    show_actual_model: bool
+
+
+@router.get("/show-actual-model", response_model=ShowActualModelResponse)
+async def get_show_actual_model(
+    _: bool = Depends(verify_admin_key),
+):
+    """获取是否向管理员显示实际模型的配置"""
+    return ShowActualModelResponse(show_actual_model=bool(export_config.get("show_actual_model", False)))
+
+
+@router.put("/show-actual-model", response_model=ShowActualModelResponse)
+async def update_show_actual_model(
+    data: ShowActualModelResponse,
+    _: bool = Depends(verify_admin_key),
+):
+    """更新是否向管理员显示实际模型的配置"""
+    export_config["show_actual_model"] = bool(data.show_actual_model)
+    persist_export_config()
+    return ShowActualModelResponse(show_actual_model=bool(data.show_actual_model))
+
+
+# ============ 用户额度用量查询与重置 ============
+
+class UserQuotaUsageResponse(BaseModel):
+    user_id: int
+    daily_used: int
+    weekly_used: int
+    monthly_used: int
+    daily_limit: Optional[int]
+    weekly_limit: Optional[int]
+    monthly_limit: Optional[int]
+    quota_reset_at: Optional[datetime]
+
+
+@router.get("/users/{user_id}/quota-usage", response_model=UserQuotaUsageResponse)
+async def get_user_quota_usage(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """查询指定用户当前周期的 token 用量"""
+    from models.admin_user import AdminUser
+    from models import UsageLog
+    from sqlalchemy import func
+    from datetime import datetime, timedelta
+
+    user = await db.get(AdminUser, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    now = datetime.utcnow()
+    quota_reset_at = getattr(user, "quota_reset_at", None)
+
+    async def get_used(start: datetime) -> int:
+        effective_start = start
+        if quota_reset_at and quota_reset_at > start:
+            effective_start = quota_reset_at
+        result = await db.execute(
+            select(func.coalesce(func.sum(UsageLog.total_tokens), 0)).where(
+                UsageLog.user_id == user_id,
+                UsageLog.request_time >= effective_start,
+                UsageLog.status == "success",
+            )
+        )
+        return int(result.scalar() or 0)
+
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    daily_used, weekly_used, monthly_used = 0, 0, 0
+    if getattr(user, "daily_token_limit", None):
+        daily_used = await get_used(day_start)
+    if getattr(user, "weekly_token_limit", None):
+        weekly_used = await get_used(week_start)
+    if getattr(user, "monthly_token_limit", None):
+        monthly_used = await get_used(month_start)
+
+    return UserQuotaUsageResponse(
+        user_id=user_id,
+        daily_used=daily_used,
+        weekly_used=weekly_used,
+        monthly_used=monthly_used,
+        daily_limit=getattr(user, "daily_token_limit", None),
+        weekly_limit=getattr(user, "weekly_token_limit", None),
+        monthly_limit=getattr(user, "monthly_token_limit", None),
+        quota_reset_at=quota_reset_at,
+    )
+
+
+@router.post("/users/{user_id}/quota-reset")
+async def reset_user_quota(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """重置用户额度（将 quota_reset_at 设为当前时间，之后的请求才计入用量）"""
+    from models.admin_user import AdminUser
+    from datetime import datetime
+
+    user = await db.get(AdminUser, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    user.quota_reset_at = datetime.utcnow()
+    await db.commit()
+    return {"success": True, "quota_reset_at": user.quota_reset_at.isoformat()}
+
+
+# ============ 供应商迁移规则配置 ============
+
+class ProviderMigrationRule(BaseModel):
+    from_provider: str
+    to_provider: str
+    min_balance: float = 0.0
+    max_balance: Optional[float] = None
+    supported_models: List[str] = Field(default_factory=list)
+
+
+class ProviderMigrationRulesResponse(BaseModel):
+    rules: List[ProviderMigrationRule]
+
+
+class ProviderMigrationRulesUpdate(BaseModel):
+    rules: List[ProviderMigrationRule]
+
+
+@router.get("/provider-migration-rules", response_model=ProviderMigrationRulesResponse)
+async def get_provider_migration_rules(
+    _: bool = Depends(verify_admin_key),
+):
+    """获取供应商迁移规则"""
+    raw = export_config.get("provider_migration_rules") or []
+    rules = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        rules.append(ProviderMigrationRule(
+            from_provider=item.get("from_provider", ""),
+            to_provider=item.get("to_provider", ""),
+            min_balance=float(item.get("min_balance") or 0),
+            max_balance=item.get("max_balance"),
+            supported_models=item.get("supported_models") or [],
+        ))
+    return ProviderMigrationRulesResponse(rules=rules)
+
+
+@router.put("/provider-migration-rules", response_model=ProviderMigrationRulesResponse)
+async def update_provider_migration_rules(
+    data: ProviderMigrationRulesUpdate,
+    _: bool = Depends(verify_admin_key),
+):
+    """更新供应商迁移规则"""
+    rules = []
+    for rule in data.rules:
+        item = {
+            "from_provider": rule.from_provider.strip(),
+            "to_provider": rule.to_provider.strip(),
+            "min_balance": rule.min_balance,
+            "supported_models": rule.supported_models,
+        }
+        if rule.max_balance is not None:
+            item["max_balance"] = rule.max_balance
+        rules.append(item)
+
+    export_config["provider_migration_rules"] = rules
+    persist_export_config()
+    return ProviderMigrationRulesResponse(rules=data.rules)

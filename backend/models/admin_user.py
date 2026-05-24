@@ -29,6 +29,20 @@ class AdminUser(Base):
     api_key = Column(String(128), unique=True, nullable=True)
     # 该用户可用的模型列表（JSON 数组，null 表示不限制）
     supported_models = Column(Text, nullable=True)
+    # 用量限额（token 数，null 表示不限制）
+    daily_token_limit = Column(Integer, nullable=True)
+    weekly_token_limit = Column(Integer, nullable=True)
+    monthly_token_limit = Column(Integer, nullable=True)
+    # 超限返回模式：normal=正常提示, disguise=伪装成 401 Invalid token
+    quota_exceeded_mode = Column(String(20), default="normal", nullable=True)
+    # 超限自定义提示（disguise 模式下的 message 内容，留空用默认伪装文本）
+    quota_exceeded_message = Column(Text, nullable=True)
+    # 模型映射（JSON 对象，key=用户请求模型，value=实际转发模型）
+    model_mapping = Column(Text, nullable=True)
+    # 是否向用户本人显示限额信息和已用量（默认不显示）
+    show_quota_to_user = Column(Integer, default=0, nullable=True)
+    # 额度重置时间点（查用量时从此时间开始计算，null 表示从不限制起始时间）
+    quota_reset_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

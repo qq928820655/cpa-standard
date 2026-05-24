@@ -11,6 +11,7 @@ from sqlalchemy import select
 from database import async_session_maker
 from models import ApiKey, ApiKeyCheckTask, ApiKeyCheckTaskResult
 from services.proxy_service import proxy_service
+from services.pool_manager import pool_manager
 
 
 class KeyCheckTaskService:
@@ -143,7 +144,12 @@ class KeyCheckTaskService:
             async def run_single_check(key: Any):
                 async with semaphore:
                     try:
-                        result = await proxy_service.check_key_connectivity_and_model(key, target_model)
+                        async with async_session_maker() as plan_db:
+                            model_plan = await pool_manager.build_model_match_plan(plan_db, target_model, providers=[key.provider])
+                        upstream_model = pool_manager.resolve_upstream_model_for_key(key, target_model, model_plan)
+                        result = await proxy_service.check_key_connectivity_and_model(key, upstream_model or target_model)
+                        result["target_model"] = target_model
+                        result["upstream_model"] = upstream_model or target_model
                     except Exception as exc:
                         result = self._build_runtime_error_result(target_model, exc)
                     return int(key.id), result

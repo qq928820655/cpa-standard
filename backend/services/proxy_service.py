@@ -1,4 +1,4 @@
-"""
+﻿"""
 代理转发服务
 """
 import asyncio
@@ -1243,11 +1243,20 @@ class ProxyService:
         return headers
 
     def _is_magic666_key(self, api_key: Any) -> bool:
-        base_url = str(getattr(api_key, "base_url", "") or "").strip().lower()
-        if not base_url:
+        """判断 Key 是否支持 New API 任务日志回填（有密码配置即可，不限制域名）"""
+        api_type = (getattr(api_key, "api_type", None) or "newapi").strip().lower()
+        if api_type and api_type != "newapi":
             return False
-        host = urlsplit(base_url).netloc.lower()
-        return host == "magic666.top" or host.endswith(".magic666.top")
+        # 优先检查 Key 自身密码
+        key_password = (getattr(api_key, "password", None) or "").strip()
+        if key_password:
+            return True
+        # 再检查供应商默认密码
+        from config import export_config as _ec
+        provider = (getattr(api_key, "provider", "") or "").strip().lower()
+        provider_ext = _ec.get("provider_ext") or {}
+        cfg = provider_ext.get(provider) or {}
+        return bool((cfg.get("password") or "").strip())
 
     def _normalize_match_text(self, value: Any) -> str:
         if value is None:
@@ -1303,7 +1312,7 @@ class ProxyService:
     ) -> dict:
         started_at = time.perf_counter()
         if not self._is_magic666_key(api_key):
-            message = "当前 Key 不是 magic666 请求地址，不能使用任务日志回填"
+            message = "当前 Key 未配置登录密码，无法使用任务日志回填"
             return {
                 "status": "error",
                 "status_code": None,
@@ -1330,9 +1339,32 @@ class ProxyService:
             }
 
         base_url = str(getattr(api_key, "base_url", "") or "").strip().rstrip("/")
-        origin = f"{urlsplit(base_url).scheme or 'https'}://{urlsplit(base_url).netloc}"
+        # 图片回填优先用网页网址 wz_url，为空则取 base_url
+        web_url = str(getattr(api_key, "wz_url", None) or "").strip().rstrip("/") or base_url
+        origin = f"{urlsplit(web_url).scheme or 'https'}://{urlsplit(web_url).netloc}"
         login_url = f"{origin}/api/user/login?turnstile="
         task_url = f"{origin}/api/task/self"
+
+        # 取密码：优先 Key 自身，其次供应商默认
+        key_password = (getattr(api_key, "password", None) or "").strip()
+        if not key_password:
+            from config import export_config as _ec
+            provider = (getattr(api_key, "provider", "") or "").strip().lower()
+            provider_ext = _ec.get("provider_ext") or {}
+            cfg = provider_ext.get(provider) or {}
+            key_password = (cfg.get("password") or "").strip()
+        if not key_password:
+            message = "未配置登录密码，请在 Key 详情或系统设置中配置"
+            return {
+                "status": "error",
+                "status_code": None,
+                "response_time_ms": 0,
+                "response_data": {"error": {"message": message}},
+                "images": [],
+                "upstream_task": {},
+                "error_message": message,
+                "failure_category": "unknown",
+            }
         response_data: Any = {}
         status_code: Optional[int] = None
         try:
@@ -1340,7 +1372,7 @@ class ProxyService:
                 login_response = await client.post(
                     login_url,
                     headers={**self._build_magic666_headers(api_key=api_key), "content-type": "application/json"},
-                    json={"username": username, "password": "928820655"},
+                    json={"username": username, "password": key_password},
                 )
                 status_code = login_response.status_code
                 login_data = self._parse_response_body(login_response)
@@ -1477,6 +1509,19 @@ class ProxyService:
 
     async def fetch_image_task_result(self, api_key: Any, upstream_task: dict) -> dict:
         started_at = time.perf_counter()
+        api_type = (getattr(api_key, "api_type", None) or "newapi").strip().lower()
+        if api_type and api_type != "newapi":
+            message = "当前 Key 类型不支持图片回填查询"
+            return {
+                "status": "error",
+                "status_code": None,
+                "response_time_ms": 0,
+                "response_data": {"error": {"message": message}},
+                "images": [],
+                "upstream_task": upstream_task,
+                "error_message": message,
+                "failure_category": "unknown",
+            }
         target_urls = self._build_image_task_probe_urls(api_key, upstream_task)
         if not target_urls:
             message = "上游未提供可重抓取的任务 ID 或查询地址"
@@ -1659,6 +1704,14 @@ class ProxyService:
             return True
         if status_code in {502, 503, 504}:
             return True
+
+        # nginx/代理层返回的 HTML 错误页，换 Key 可能恢复
+        if 400 <= status_code < 500 and isinstance(error_body, dict):
+            error = error_body.get("error") or {}
+            msg = str(error.get("message") or "") if isinstance(error, dict) else ""
+            if "<html" in msg.lower() or "<body" in msg.lower():
+                return True
+
         if not isinstance(error_body, dict):
             return False
 
@@ -1685,10 +1738,10 @@ class ProxyService:
         error_payload = json.dumps({"message": message, "type": "stream_error"}, ensure_ascii=False)
         return f"event: error\ndata: {error_payload}\n\n".encode("utf-8")
 
-    def _extract_usage_tokens(self, response_data: Any) -> tuple[int, int, int]:
-        """提取真实 token 用量"""
+    def _extract_usage_tokens(self, response_data: Any) -> tuple[int, int, int, int]:
+        """提取真实 token 用量，返回 (prompt, completion, total, cache)"""
         if not isinstance(response_data, dict):
-            return 0, 0, 0
+            return 0, 0, 0, 0
 
         usage = response_data.get("usage") or {}
         if not isinstance(usage, dict):
@@ -1700,7 +1753,7 @@ class ProxyService:
                 usage = nested_usage
 
         if not isinstance(usage, dict) or not usage:
-            return 0, 0, 0
+            return 0, 0, 0, 0
 
         prompt_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
         completion_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
@@ -1713,10 +1766,25 @@ class ProxyService:
             )
 
         total_tokens = usage.get("total_tokens") or (prompt_tokens + completion_tokens)
-        return int(prompt_tokens), int(completion_tokens), int(total_tokens)
 
-    def _extract_stream_usage_from_sse(self, event_text: str) -> tuple[int, int, int]:
-        """从流式 SSE 事件中提取真实 token 用量"""
+        # 缓存 token：OpenAI 格式在 prompt_tokens_details.cached_tokens
+        # Claude 格式在 cache_read_input_tokens
+        cache_tokens = 0
+        prompt_tokens_details = usage.get("prompt_tokens_details") or {}
+        if isinstance(prompt_tokens_details, dict):
+            cache_tokens = int(prompt_tokens_details.get("cached_tokens") or 0)
+        if not cache_tokens:
+            cache_tokens = int(
+                usage.get("cache_read_input_tokens")
+                or usage.get("cached_tokens")
+                or usage.get("cache_tokens")
+                or 0
+            )
+
+        return int(prompt_tokens), int(completion_tokens), int(total_tokens), int(cache_tokens)
+
+    def _extract_stream_usage_from_sse(self, event_text: str) -> tuple[int, int, int, int]:
+        """从流式 SSE 事件中提取真实 token 用量，返回 (prompt, completion, total, cache)"""
         event_name = None
         data_lines = []
         for line in event_text.splitlines():
@@ -1726,19 +1794,23 @@ class ProxyService:
                 data_lines.append(line[5:].strip())
 
         if not data_lines:
-            return 0, 0, 0
+            return 0, 0, 0, 0
 
         data_text = "\n".join(data_lines)
         if data_text == "[DONE]":
-            return 0, 0, 0
+            return 0, 0, 0, 0
 
         try:
             payload = json.loads(data_text)
         except json.JSONDecodeError:
-            return 0, 0, 0
+            return 0, 0, 0, 0
 
         if event_name == "response.completed" and isinstance(payload.get("response"), dict):
             return self._extract_usage_tokens(payload["response"])
+
+        # Claude 原生格式：message_start 事件的 usage 在 payload["message"]["usage"]
+        if event_name == "message_start" and isinstance(payload.get("message"), dict):
+            return self._extract_usage_tokens(payload["message"])
 
         return self._extract_usage_tokens(payload)
 
@@ -2398,6 +2470,7 @@ class ProxyService:
         headers: dict,
         body: Optional[dict] = None,
         user_id: Optional[int] = None,
+        original_model: Optional[str] = None,
     ) -> tuple[int, dict, Any]:
         """
         转发请求到目标 API
@@ -2483,19 +2556,29 @@ class ProxyService:
         prompt_tokens = 0
         completion_tokens = 0
         total_tokens = 0
+        cache_tokens = 0
         model = body.get("model") if body else None
+        # actual_model 是实际转发的模型（body 里的），original_model 是用户请求的原始模型
+        actual_model_value = model
+        # display_model 用基础名（去掉 {provider} 前缀和 [...] 后缀），用于用量统计
+        from routers.proxy import _strip_model_suffix as _strip_sfx
+        _om_base, _ = _strip_sfx(original_model or model or "")
+        _am_base, _ = _strip_sfx(actual_model_value or "")
+        display_model = _om_base or model
 
         if response_data and status == "success":
-            prompt_tokens, completion_tokens, total_tokens = self._extract_usage_tokens(response_data)
+            prompt_tokens, completion_tokens, total_tokens, cache_tokens = self._extract_usage_tokens(response_data)
 
-        # 记录用量
+        # 记录用量：model=原始请求模型基础名，actual_model=实际转发模型基础名
         await usage_tracker.record(
             db=db,
             api_key_id=api_key.id,
-            model=model,
+            model=display_model,
+            actual_model=_am_base or actual_model_value,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
+            cache_tokens=cache_tokens,
             latency_ms=latency_ms,
             upstream_latency_ms=upstream_latency_ms,
             cpa_overhead_ms=cpa_overhead_ms,
@@ -2505,6 +2588,494 @@ class ProxyService:
         )
 
         return status_code, {}, response_data
+
+    async def forward_image_request(
+        self,
+        db: AsyncSession,
+        api_key: Any,
+        method: str,
+        path: str,
+        headers: dict,
+        body: Optional[dict] = None,
+        data: Optional[dict] = None,
+        files: Optional[list[tuple[str, tuple[str, bytes, str]]]] = None,
+        user_id: Optional[int] = None,
+    ) -> tuple[int, dict, Any]:
+        """转发公开图片请求，支持 JSON 文生图和 multipart 图生图"""
+        from .usage_tracker import usage_tracker
+
+        url = self._build_url(api_key, path)
+        forward_headers = self._build_headers(api_key, headers)
+        if files:
+            forward_headers.pop("content-type", None)
+
+        total_start = time.perf_counter()
+        upstream_wait_seconds = 0.0
+        status = "success"
+        error_message = None
+        response_data = None
+        status_code = 500
+        model = body.get("model") if body else None
+        if model is None and data:
+            model_value = data.get("model")
+            if isinstance(model_value, list):
+                model = model_value[0] if model_value else None
+            else:
+                model = model_value
+
+        upstream_wait_start = None
+        try:
+            async with httpx.AsyncClient(**self._build_client_kwargs(api_key, self._build_image_generation_timeout())) as client:
+                upstream_wait_start = time.perf_counter()
+                if files:
+                    response = await client.request(
+                        method=method,
+                        url=url,
+                        headers=forward_headers,
+                        data=data,
+                        files=files,
+                    )
+                else:
+                    response = await client.request(
+                        method=method,
+                        url=url,
+                        headers=forward_headers,
+                        json=body if body else None,
+                    )
+                upstream_wait_seconds += time.perf_counter() - upstream_wait_start
+                upstream_wait_start = None
+
+                status_code = response.status_code
+                response_data = self._parse_response_body(response)
+
+                if status_code >= 400:
+                    status = "error"
+                    error_message = self._extract_error_message(response_data, str(response_data))
+
+        except httpx.TimeoutException as e:
+            if upstream_wait_start is not None:
+                upstream_wait_seconds += time.perf_counter() - upstream_wait_start
+            status_code = 504
+            status = "error"
+            error_message = self._safe_error_message("请求超时: ", e)
+            response_data = {"error": {"message": error_message}}
+        except httpx.RemoteProtocolError as e:
+            if upstream_wait_start is not None:
+                upstream_wait_seconds += time.perf_counter() - upstream_wait_start
+            status_code = 502
+            status = "error"
+            error_text = str(e).lower()
+            if "server disconnected" in error_text:
+                error_message = self._safe_error_message("上游服务断开连接: ", e)
+            else:
+                error_message = self._safe_error_message("上游协议错误: ", e)
+            response_data = {"error": {"message": error_message}}
+        except httpx.RequestError as e:
+            if upstream_wait_start is not None:
+                upstream_wait_seconds += time.perf_counter() - upstream_wait_start
+            status_code = 502
+            status = "error"
+            error_message = self._safe_error_message("请求错误: ", e)
+            response_data = {"error": {"message": error_message}}
+        except Exception as e:
+            if upstream_wait_start is not None:
+                upstream_wait_seconds += time.perf_counter() - upstream_wait_start
+            status_code = 500
+            status = "error"
+            error_message = self._safe_error_message("未知错误: ", e)
+            response_data = {"error": {"message": error_message}}
+
+        latency_ms = int((time.perf_counter() - total_start) * 1000)
+        upstream_latency_ms = int(upstream_wait_seconds * 1000)
+        cpa_overhead_ms = max(latency_ms - upstream_latency_ms, 0)
+
+        await usage_tracker.record(
+            db=db,
+            api_key_id=api_key.id,
+            model=model,
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            latency_ms=latency_ms,
+            upstream_latency_ms=upstream_latency_ms,
+            cpa_overhead_ms=cpa_overhead_ms,
+            status=status,
+            error_message=error_message,
+            user_id=user_id,
+        )
+
+        return status_code, {}, response_data
+
+    # ── 流式缓冲规则匹配 ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _match_stream_buffer_rule(api_key: Any, model: Optional[str]) -> bool:
+        """
+        判断当前请求是否命中流式缓冲规则。
+        规则来自 export_config.stream_buffer_rules，支持 provider / model 通配（* 匹配任意）。
+        只要命中任意一条规则就返回 True，不影响未命中的请求。
+        """
+        import fnmatch
+        from config import export_config as _ec
+        rules = _ec.get("stream_buffer_rules") or []
+        if not rules:
+            return False
+
+        provider = (getattr(api_key, "provider", "") or "").strip().lower()
+        model_str = (model or "").strip().lower()
+
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            rule_provider = (rule.get("provider") or "").strip().lower()
+            rule_model = (rule.get("model") or "").strip().lower()
+
+            # provider 匹配：空或 * 表示匹配所有
+            if rule_provider and rule_provider != "*":
+                if not fnmatch.fnmatch(provider, rule_provider):
+                    continue
+
+            # model 匹配：空或 * 表示匹配所有
+            if rule_model and rule_model != "*":
+                if not fnmatch.fnmatch(model_str, rule_model):
+                    continue
+
+            return True
+
+        return False
+
+    async def forward_stream_buffered(
+        self,
+        db: AsyncSession,
+        api_key: Any,
+        method: str,
+        path: str,
+        headers: dict,
+        body: Optional[dict] = None,
+        client_request: Optional[Request] = None,
+        user_id: Optional[int] = None,
+        original_model: Optional[str] = None,
+    ) -> tuple[int, dict, Any, bool]:
+        """
+        完整缓冲模式的流式转发：先把上游 SSE 流完整收到内存，
+        确认收到终止事件（[DONE] / finish_reason）后再以生成器形式输出给客户端。
+        中途断流（未收到终止事件）返回 retryable=True，由调用方换 Key 重试。
+        命中规则时替代 forward_stream 使用，不影响其他请求。
+        """
+        from .usage_tracker import usage_tracker
+
+        url = self._build_url(api_key, path)
+        forward_headers = self._build_headers(api_key, headers)
+        model = body.get("model") if body else None
+
+        request_meta = {
+            "api_key_id": getattr(api_key, "id", None),
+            "provider": getattr(api_key, "provider", None),
+            "base_url": getattr(api_key, "base_url", None),
+            "path": path,
+            "model": model,
+        }
+        self._log_stream_event("buffered_start", **request_meta)
+
+        total_start = time.perf_counter()
+        upstream_wait_seconds = 0.0
+
+        # 缓冲模式用更长的 read timeout，避免大请求在稳定窗口期内超时
+        buffered_timeout = httpx.Timeout(
+            connect=settings.proxy_stream_connect_timeout_seconds,
+            read=max(int(settings.proxy_timeout or 300), 300),
+            write=settings.proxy_stream_connect_timeout_seconds,
+            pool=settings.proxy_stream_connect_timeout_seconds,
+        )
+        client = httpx.AsyncClient(**self._build_client_kwargs(api_key, buffered_timeout))
+        request_obj = client.build_request(
+            method=method,
+            url=url,
+            headers=forward_headers,
+            json=body if body else None,
+        )
+
+        upstream_wait_start = None
+        try:
+            upstream_wait_start = time.perf_counter()
+            response = await client.send(request_obj, stream=True)
+            upstream_wait_seconds += time.perf_counter() - upstream_wait_start
+            upstream_wait_start = None
+        except httpx.TimeoutException as e:
+            if upstream_wait_start is not None:
+                upstream_wait_seconds += time.perf_counter() - upstream_wait_start
+            await client.aclose()
+            error_message = self._safe_error_message("请求超时: ", e)
+            latency_ms = int((time.perf_counter() - total_start) * 1000)
+            await usage_tracker.record(
+                db=db, api_key_id=api_key.id, model=original_model or model,
+                latency_ms=latency_ms, upstream_latency_ms=int(upstream_wait_seconds * 1000),
+                status="error", error_message=error_message, user_id=user_id,
+            )
+            return 504, {}, {"error": {"message": error_message}}, True
+        except (httpx.RemoteProtocolError, httpx.RequestError) as e:
+            if upstream_wait_start is not None:
+                upstream_wait_seconds += time.perf_counter() - upstream_wait_start
+            await client.aclose()
+            error_message = self._safe_error_message("连接失败: ", e)
+            latency_ms = int((time.perf_counter() - total_start) * 1000)
+            await usage_tracker.record(
+                db=db, api_key_id=api_key.id, model=original_model or model,
+                latency_ms=latency_ms, upstream_latency_ms=int(upstream_wait_seconds * 1000),
+                status="error", error_message=error_message, user_id=user_id,
+            )
+            return 502, {}, {"error": {"message": error_message}}, True
+        except Exception as e:
+            if upstream_wait_start is not None:
+                upstream_wait_seconds += time.perf_counter() - upstream_wait_start
+            await client.aclose()
+            error_message = self._safe_error_message("未知错误: ", e)
+            latency_ms = int((time.perf_counter() - total_start) * 1000)
+            await usage_tracker.record(
+                db=db, api_key_id=api_key.id, model=original_model or model,
+                latency_ms=latency_ms, upstream_latency_ms=int(upstream_wait_seconds * 1000),
+                status="error", error_message=error_message, user_id=user_id,
+            )
+            return 500, {}, {"error": {"message": error_message}}, True
+
+        content_type = response.headers.get("content-type", "")
+
+        # 非流式响应或错误响应，直接走原有逻辑
+        if response.status_code >= 400 or "text/event-stream" not in content_type.lower():
+            try:
+                upstream_wait_start = time.perf_counter()
+                raw_body = await response.aread()
+                upstream_wait_seconds += time.perf_counter() - upstream_wait_start
+                body_text = raw_body.decode("utf-8", "ignore")
+                try:
+                    error_body = json.loads(body_text)
+                except json.JSONDecodeError:
+                    error_body = {"error": {"message": body_text or response.reason_phrase}}
+            finally:
+                await response.aclose()
+                await client.aclose()
+            latency_ms = int((time.perf_counter() - total_start) * 1000)
+            await usage_tracker.record(
+                db=db, api_key_id=api_key.id, model=original_model or model,
+                latency_ms=latency_ms, upstream_latency_ms=int(upstream_wait_seconds * 1000),
+                status="error", error_message=str(error_body), user_id=user_id,
+            )
+            status_code = response.status_code if response.status_code >= 400 else 502
+            retryable = self._is_retryable_stream_failure(status_code, error_body)
+            return status_code, self._filter_stream_response_headers(response.headers), error_body, retryable
+
+        # ── 稳定窗口缓冲 + 透传 ──────────────────────────────────────────────
+        # 前 STABLE_WINDOW_SECONDS 秒内完整缓冲，期间断流视为截流可重试换 Key。
+        # 窗口结束后确认上游稳定，切换为直接透传（行为与普通 forward_stream 一致）。
+        STABLE_WINDOW_SECONDS = 10.0
+
+        response_headers = self._filter_stream_response_headers(response.headers)
+        from routers.proxy import _strip_model_suffix as _strip_sfx_buf
+        _om_base_buf, _ = _strip_sfx_buf(original_model or model or "")
+        _am_base_buf, _ = _strip_sfx_buf(model or "")
+        pending_log = await usage_tracker.create_pending_record(
+            db=db,
+            api_key_id=api_key.id,
+            model=_om_base_buf or model,
+            actual_model=_am_base_buf or model,
+            user_id=user_id,
+        )
+
+        # 阶段一：缓冲窗口内收集事件，同时检测截流
+        window_events: list[bytes] = []
+        window_done = False        # 窗口内已收到终止事件（短响应直接结束）
+        window_cut = False         # 窗口内发生截流
+        window_error: Optional[str] = None
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        cache_tokens = 0
+        buffer = ""
+        window_start = time.perf_counter()
+
+        def _update_tokens_from_event(ep, ec, et, eca):
+            nonlocal prompt_tokens, completion_tokens, total_tokens, cache_tokens
+            if ep: prompt_tokens = ep
+            if ec: completion_tokens = ec
+            if et: total_tokens = et
+            if eca: cache_tokens = eca
+            if not total_tokens and (prompt_tokens or completion_tokens):
+                total_tokens = prompt_tokens + completion_tokens
+
+        stream_iter = response.aiter_text()
+        window_exited = False
+
+        try:
+            upstream_wait_start = time.perf_counter()
+            async for chunk in stream_iter:
+                upstream_wait_seconds += time.perf_counter() - upstream_wait_start
+                upstream_wait_start = time.perf_counter()
+                buffer += chunk
+                while "\n\n" in buffer:
+                    event_block, buffer = buffer.split("\n\n", 1)
+                    if not event_block:
+                        continue
+                    event_text = f"{event_block}\n\n"
+                    ep, ec, et, eca = self._extract_stream_usage_from_sse(event_text)
+                    if ep or ec or et or eca:
+                        _update_tokens_from_event(ep, ec, et, eca)
+                    if self._has_terminal_event(event_text):
+                        window_done = True
+                    window_events.append(event_text.encode("utf-8"))
+
+                # 窗口时间到，切换为透传阶段
+                if not window_done and time.perf_counter() - window_start >= STABLE_WINDOW_SECONDS:
+                    window_exited = True
+                    break
+
+                if window_done:
+                    break
+
+            upstream_wait_seconds += time.perf_counter() - upstream_wait_start
+
+            # 处理窗口内残留 buffer
+            if buffer and not window_exited:
+                ep, ec, et, eca = self._extract_stream_usage_from_sse(buffer)
+                if ep or ec or et or eca:
+                    _update_tokens_from_event(ep, ec, et, eca)
+                if self._has_terminal_event(buffer):
+                    window_done = True
+                window_events.append(buffer.encode("utf-8"))
+                buffer = ""
+
+        except Exception as e:
+            window_error = self._safe_error_message("缓冲窗口读取失败: ", e)
+            window_cut = True
+
+        # 窗口内断流（未到时间就结束且没有终止事件）
+        if not window_exited and not window_done and not window_error:
+            window_cut = True
+            window_error = "stream closed in stability window (buffered mode)"
+
+        if window_cut:
+            latency_ms = int((time.perf_counter() - total_start) * 1000)
+            self._log_stream_event("buffered_window_cut", **request_meta, error=window_error)
+            await response.aclose()
+            await client.aclose()
+            await usage_tracker.record(
+                db=db, api_key_id=api_key.id, model=original_model or model,
+                latency_ms=latency_ms, upstream_latency_ms=int(upstream_wait_seconds * 1000),
+                status="error", error_message=window_error, user_id=user_id,
+            )
+            return 502, {}, {"error": {"message": window_error}}, True
+
+        # 窗口内已完成（短响应）→ 直接重放，不需要透传
+        if window_done:
+            latency_ms = int((time.perf_counter() - total_start) * 1000)
+            upstream_latency_ms = int(upstream_wait_seconds * 1000)
+            self._log_stream_event("buffered_window_complete", **request_meta,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                total_tokens=total_tokens, latency_ms=latency_ms)
+            await response.aclose()
+            await client.aclose()
+            await usage_tracker.update_record(
+                db=db, log=pending_log,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                total_tokens=total_tokens, cache_tokens=cache_tokens,
+                latency_ms=latency_ms, upstream_latency_ms=upstream_latency_ms,
+                cpa_overhead_ms=max(latency_ms - upstream_latency_ms, 0),
+                status="success",
+            )
+
+            async def replay_short() -> AsyncGenerator[bytes, None]:
+                for ev in window_events:
+                    yield ev
+
+            return 200, response_headers, replay_short(), False
+
+        # 窗口结束，上游稳定 → 先重放窗口内容，再透传剩余流
+        self._log_stream_event("buffered_window_passed", **request_meta)
+
+        async def passthrough_generator() -> AsyncGenerator[bytes, None]:
+            nonlocal upstream_wait_seconds, prompt_tokens, completion_tokens, total_tokens, cache_tokens, buffer
+
+            # 先输出窗口内已缓冲的事件
+            for ev in window_events:
+                yield ev
+
+            # 继续透传剩余流
+            terminal_seen = window_done
+            client_disconnected = False
+            error_message_pt: Optional[str] = None
+            last_synced_tokens = (prompt_tokens, completion_tokens, total_tokens, cache_tokens)
+
+            try:
+                upstream_wait_start_pt = time.perf_counter()
+                async for chunk in stream_iter:
+                    upstream_wait_seconds += time.perf_counter() - upstream_wait_start_pt
+                    upstream_wait_start_pt = time.perf_counter()
+
+                    if client_request and await client_request.is_disconnected():
+                        client_disconnected = True
+                        break
+
+                    buffer += chunk
+                    while "\n\n" in buffer:
+                        event_block, buffer = buffer.split("\n\n", 1)
+                        if not event_block:
+                            continue
+                        event_text = f"{event_block}\n\n"
+                        ep, ec, et, eca = self._extract_stream_usage_from_sse(event_text)
+                        if ep or ec or et or eca:
+                            _update_tokens_from_event(ep, ec, et, eca)
+                            current_tokens = (prompt_tokens, completion_tokens, total_tokens, cache_tokens)
+                            if current_tokens != last_synced_tokens:
+                                cur_lat = int((time.perf_counter() - total_start) * 1000)
+                                cur_up = int(upstream_wait_seconds * 1000)
+                                await usage_tracker.update_tokens(
+                                    db=db, log=pending_log,
+                                    prompt_tokens=prompt_tokens,
+                                    completion_tokens=completion_tokens,
+                                    total_tokens=total_tokens,
+                                    latency_ms=cur_lat,
+                                    upstream_latency_ms=cur_up,
+                                    cpa_overhead_ms=max(cur_lat - cur_up, 0),
+                                )
+                                last_synced_tokens = current_tokens
+                        if self._has_terminal_event(event_text):
+                            terminal_seen = True
+                        yield event_text.encode("utf-8")
+
+                upstream_wait_seconds += time.perf_counter() - upstream_wait_start_pt
+
+                if buffer and not client_disconnected:
+                    ep, ec, et, eca = self._extract_stream_usage_from_sse(buffer)
+                    if ep or ec or et or eca:
+                        _update_tokens_from_event(ep, ec, et, eca)
+                    if self._has_terminal_event(buffer):
+                        terminal_seen = True
+                    yield buffer.encode("utf-8")
+
+            except Exception as e:
+                error_message_pt = self._safe_error_message("透传阶段异常: ", e)
+                if not terminal_seen and not client_disconnected:
+                    yield self._build_stream_error_event(error_message_pt)
+            finally:
+                latency_ms_f = int((time.perf_counter() - total_start) * 1000)
+                upstream_latency_ms_f = int(upstream_wait_seconds * 1000)
+                final_status = "success" if terminal_seen or (prompt_tokens or completion_tokens) else "error"
+                if client_disconnected and not terminal_seen:
+                    final_status = "error"
+                    error_message_pt = error_message_pt or "client disconnected"
+                await usage_tracker.update_record(
+                    db=db, log=pending_log,
+                    prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                    total_tokens=total_tokens, cache_tokens=cache_tokens,
+                    latency_ms=latency_ms_f, upstream_latency_ms=upstream_latency_ms_f,
+                    cpa_overhead_ms=max(latency_ms_f - upstream_latency_ms_f, 0),
+                    status=final_status, error_message=error_message_pt,
+                )
+                await response.aclose()
+                await client.aclose()
+
+        return 200, response_headers, passthrough_generator(), False
+
+    # ── 原始流式转发 ──────────────────────────────────────────────────────────
 
     async def forward_stream(
         self,
@@ -2516,6 +3087,7 @@ class ProxyService:
         body: Optional[dict] = None,
         client_request: Optional[Request] = None,
         user_id: Optional[int] = None,
+        original_model: Optional[str] = None,
     ) -> tuple[int, dict, Any, bool]:
         """
         流式转发请求
@@ -2580,7 +3152,7 @@ class ProxyService:
             await usage_tracker.record(
                 db=db,
                 api_key_id=api_key.id,
-                model=model,
+                model=original_model or model,
                 latency_ms=latency_ms,
                 upstream_latency_ms=int(upstream_wait_seconds * 1000),
                 status="error",
@@ -2602,7 +3174,7 @@ class ProxyService:
             await usage_tracker.record(
                 db=db,
                 api_key_id=api_key.id,
-                model=model,
+                model=original_model or model,
                 latency_ms=latency_ms,
                 upstream_latency_ms=int(upstream_wait_seconds * 1000),
                 status="error",
@@ -2620,7 +3192,7 @@ class ProxyService:
             await usage_tracker.record(
                 db=db,
                 api_key_id=api_key.id,
-                model=model,
+                model=original_model or model,
                 latency_ms=latency_ms,
                 upstream_latency_ms=int(upstream_wait_seconds * 1000),
                 status="error",
@@ -2638,7 +3210,7 @@ class ProxyService:
             await usage_tracker.record(
                 db=db,
                 api_key_id=api_key.id,
-                model=model,
+                model=original_model or model,
                 latency_ms=latency_ms,
                 upstream_latency_ms=int(upstream_wait_seconds * 1000),
                 status="error",
@@ -2686,7 +3258,7 @@ class ProxyService:
             await usage_tracker.record(
                 db=db,
                 api_key_id=api_key.id,
-                model=model,
+                model=original_model or model,
                 latency_ms=latency_ms,
                 upstream_latency_ms=int(upstream_wait_seconds * 1000),
                 status="error",
@@ -2698,10 +3270,14 @@ class ProxyService:
             return status_code, self._filter_stream_response_headers(response.headers), error_body, retryable
 
         response_headers = self._filter_stream_response_headers(response.headers)
+        from routers.proxy import _strip_model_suffix as _strip_sfx2
+        _om_base2, _ = _strip_sfx2(original_model or model or "")
+        _am_base2, _ = _strip_sfx2(model or "")
         pending_log = await usage_tracker.create_pending_record(
             db=db,
             api_key_id=api_key.id,
-            model=model,
+            model=_om_base2 or model,
+            actual_model=_am_base2 or model,
             user_id=user_id,
         )
 
@@ -2716,7 +3292,8 @@ class ProxyService:
             prompt_tokens = 0
             completion_tokens = 0
             total_tokens = 0
-            last_synced_tokens = (0, 0, 0)
+            cache_tokens = 0
+            last_synced_tokens = (0, 0, 0, 0)
 
             try:
                 stream_iterator = response.aiter_text()
@@ -2762,12 +3339,20 @@ class ProxyService:
                             continue
                         event_text = f"{event_block}\n\n"
                         saw_stream_payload = True
-                        event_prompt_tokens, event_completion_tokens, event_total_tokens = self._extract_stream_usage_from_sse(event_text)
-                        if event_prompt_tokens or event_completion_tokens or event_total_tokens:
-                            prompt_tokens = event_prompt_tokens
-                            completion_tokens = event_completion_tokens
-                            total_tokens = event_total_tokens
-                            current_tokens = (prompt_tokens, completion_tokens, total_tokens)
+                        event_prompt_tokens, event_completion_tokens, event_total_tokens, event_cache_tokens = self._extract_stream_usage_from_sse(event_text)
+                        if event_prompt_tokens or event_completion_tokens or event_total_tokens or event_cache_tokens:
+                            # 按字段覆盖：避免 Claude 原生格式 message_start/message_delta 分散导致互相清零
+                            if event_prompt_tokens:
+                                prompt_tokens = event_prompt_tokens
+                            if event_completion_tokens:
+                                completion_tokens = event_completion_tokens
+                            if event_total_tokens:
+                                total_tokens = event_total_tokens
+                            if event_cache_tokens:
+                                cache_tokens = event_cache_tokens
+                            if not total_tokens and (prompt_tokens or completion_tokens):
+                                total_tokens = prompt_tokens + completion_tokens
+                            current_tokens = (prompt_tokens, completion_tokens, total_tokens, cache_tokens)
                             if current_tokens != last_synced_tokens:
                                 current_latency_ms = int((time.perf_counter() - total_start) * 1000)
                                 current_upstream_latency_ms = int(upstream_wait_seconds * 1000)
@@ -2788,12 +3373,19 @@ class ProxyService:
 
                 if buffer and not client_disconnected:
                     saw_stream_payload = True
-                    event_prompt_tokens, event_completion_tokens, event_total_tokens = self._extract_stream_usage_from_sse(buffer)
-                    if event_prompt_tokens or event_completion_tokens or event_total_tokens:
-                        prompt_tokens = event_prompt_tokens
-                        completion_tokens = event_completion_tokens
-                        total_tokens = event_total_tokens
-                        current_tokens = (prompt_tokens, completion_tokens, total_tokens)
+                    event_prompt_tokens, event_completion_tokens, event_total_tokens, event_cache_tokens = self._extract_stream_usage_from_sse(buffer)
+                    if event_prompt_tokens or event_completion_tokens or event_total_tokens or event_cache_tokens:
+                        if event_prompt_tokens:
+                            prompt_tokens = event_prompt_tokens
+                        if event_completion_tokens:
+                            completion_tokens = event_completion_tokens
+                        if event_total_tokens:
+                            total_tokens = event_total_tokens
+                        if event_cache_tokens:
+                            cache_tokens = event_cache_tokens
+                        if not total_tokens and (prompt_tokens or completion_tokens):
+                            total_tokens = prompt_tokens + completion_tokens
+                        current_tokens = (prompt_tokens, completion_tokens, total_tokens, cache_tokens)
                         if current_tokens != last_synced_tokens:
                             current_latency_ms = int((time.perf_counter() - total_start) * 1000)
                             current_upstream_latency_ms = int(upstream_wait_seconds * 1000)
@@ -2858,6 +3450,7 @@ class ProxyService:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=total_tokens,
+                    cache_tokens=cache_tokens,
                     latency_ms=latency_ms,
                     upstream_latency_ms=upstream_latency_ms,
                     cpa_overhead_ms=cpa_overhead_ms,
@@ -2868,6 +3461,430 @@ class ProxyService:
                 await client.aclose()
 
         return response.status_code, response_headers, stream_generator(), False
+
+    # ============ Claude Messages <-> OpenAI Chat 兼容层 ============
+
+    def _adapt_claude_content_to_chat_text(self, content: Any) -> str:
+        """提取 Claude content block 中的纯文本"""
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return "" if content is None else str(content)
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") == "text" and item.get("text"):
+                    parts.append(str(item["text"]))
+        return "\n".join(parts)
+
+    def _adapt_claude_tools_for_chat(self, tools: Any) -> list[dict]:
+        """Claude 工具定义 → OpenAI function tools"""
+        if not isinstance(tools, list):
+            return []
+        adapted = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_type = tool.get("type")
+            if tool_type not in (None, "custom", "tool"):
+                continue
+            name = tool.get("name")
+            if not name:
+                continue
+            adapted.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description") or "",
+                    "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+                },
+            })
+        return adapted
+
+    def _adapt_claude_tool_choice_for_chat(self, tool_choice: Any) -> Any:
+        """Claude tool_choice → OpenAI tool_choice"""
+        if isinstance(tool_choice, str):
+            if tool_choice == "any":
+                return "required"
+            return tool_choice
+        if not isinstance(tool_choice, dict):
+            return None
+        choice_type = tool_choice.get("type")
+        if choice_type == "any":
+            return "required"
+        if choice_type in ("auto", "none", "required"):
+            return choice_type
+        if choice_type == "tool" and tool_choice.get("name"):
+            return {"type": "function", "function": {"name": tool_choice["name"]}}
+        return None
+
+    def adapt_claude_messages_request_to_chat(self, body: dict) -> dict:
+        """Claude Messages 请求 → OpenAI Chat Completions 请求"""
+        chat_body: dict[str, Any] = {}
+
+        # 通用字段
+        for src, dst in [("model", "model"), ("stream", "stream"), ("temperature", "temperature"), ("top_p", "top_p")]:
+            if src in body:
+                chat_body[dst] = body[src]
+        if "max_tokens" in body:
+            chat_body["max_tokens"] = body["max_tokens"]
+        if "stop_sequences" in body:
+            chat_body["stop"] = body["stop_sequences"]
+
+        # 消息转换
+        messages: list[dict] = []
+
+        # system
+        system_content = body.get("system")
+        if system_content:
+            messages.append({"role": "system", "content": self._adapt_claude_content_to_chat_text(system_content)})
+
+        # messages
+        for msg in body.get("messages") or []:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role") or "user"
+            content = msg.get("content")
+
+            if role == "assistant":
+                # assistant: text + tool_use
+                text_parts: list[str] = []
+                tool_calls: list[dict] = []
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        block_type = block.get("type")
+                        if block_type == "text" and block.get("text"):
+                            text_parts.append(str(block["text"]))
+                        elif block_type == "tool_use":
+                            tool_calls.append({
+                                "id": block.get("id") or f"call_{int(time.time() * 1000)}",
+                                "type": "function",
+                                "function": {
+                                    "name": block.get("name") or "tool",
+                                    "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                                },
+                            })
+                elif isinstance(content, str):
+                    text_parts.append(content)
+
+                chat_msg: dict[str, Any] = {"role": "assistant", "content": "\n".join(text_parts)}
+                if tool_calls:
+                    chat_msg["tool_calls"] = tool_calls
+                messages.append(chat_msg)
+
+            else:
+                # user: text + tool_result（拆分为独立消息）
+                if isinstance(content, list):
+                    text_parts_u: list[str] = []
+                    tool_results: list[dict] = []
+                    for block in content:
+                        if isinstance(block, str):
+                            text_parts_u.append(block)
+                            continue
+                        if not isinstance(block, dict):
+                            continue
+                        block_type = block.get("type")
+                        if block_type == "text" and block.get("text"):
+                            text_parts_u.append(str(block["text"]))
+                        elif block_type == "tool_result":
+                            tool_use_id = block.get("tool_use_id") or block.get("id")
+                            if tool_use_id:
+                                result_text = self._adapt_claude_content_to_chat_text(block.get("content"))
+                                tool_results.append({
+                                    "role": "tool",
+                                    "tool_call_id": str(tool_use_id),
+                                    "content": result_text,
+                                })
+                    # tool results 必须紧跟 assistant tool_calls
+                    messages.extend(tool_results)
+                    if text_parts_u:
+                        messages.append({"role": "user", "content": "\n".join(text_parts_u)})
+                    elif not tool_results:
+                        messages.append({"role": "user", "content": ""})
+                else:
+                    messages.append({"role": "user", "content": self._adapt_claude_content_to_chat_text(content)})
+
+        chat_body["messages"] = messages or [{"role": "user", "content": ""}]
+
+        # 工具
+        tools = self._adapt_claude_tools_for_chat(body.get("tools"))
+        if tools:
+            chat_body["tools"] = tools
+        tool_choice = self._adapt_claude_tool_choice_for_chat(body.get("tool_choice"))
+        if tool_choice is not None:
+            chat_body["tool_choice"] = tool_choice
+
+        # 流式请求注入 stream_options 确保上游返回 usage
+        if body.get("stream") is True:
+            chat_body["stream_options"] = {"include_usage": True}
+
+        return chat_body
+
+    def _normalize_claude_usage_from_chat_usage(self, usage: Any) -> dict:
+        """OpenAI usage → Claude usage 字段"""
+        if not isinstance(usage, dict):
+            usage = {}
+        prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+        completion_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+        cache_tokens = 0
+        details = usage.get("prompt_tokens_details") or {}
+        if isinstance(details, dict):
+            cache_tokens = int(details.get("cached_tokens") or 0)
+        if not cache_tokens:
+            cache_tokens = int(usage.get("cache_read_input_tokens") or usage.get("cached_tokens") or 0)
+        return {
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+            "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
+            "cache_read_input_tokens": cache_tokens,
+        }
+
+    def _merge_claude_usage(self, current: dict, incoming: dict) -> dict:
+        """合并 usage：正数真实值覆盖估算"""
+        merged = dict(current or {})
+        for key in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+            val = incoming.get(key)
+            if isinstance(val, int) and val > 0:
+                merged[key] = val
+            elif key not in merged:
+                merged[key] = int(val or 0)
+        return merged
+
+    def _estimate_claude_compat_input_tokens(self, body: Any) -> int:
+        """粗估 input token，仅用于 message_start 初始阶段"""
+        if not isinstance(body, dict):
+            return 0
+        total = 0
+        for key in ("system", "messages", "tools"):
+            val = body.get(key)
+            if val is None:
+                continue
+            try:
+                text = json.dumps(val, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError):
+                text = str(val)
+            total += max(len(text) // 4, 0)
+        return total
+
+    def is_claudecode_token_compat_enabled(self, provider: Optional[str]) -> bool:
+        """判断 provider 是否启用 Claude Code token 兼容"""
+        if not provider:
+            return False
+        provider_lower = str(provider).strip().lower()
+        if not provider_lower:
+            return False
+        try:
+            from config import export_config
+            providers_list = export_config.get("claudecode_token_compat_providers") or []
+        except Exception:
+            providers_list = []
+        if not isinstance(providers_list, list):
+            return False
+        enabled = {str(p).strip().lower() for p in providers_list if str(p or "").strip()}
+        return provider_lower in enabled
+
+    def adapt_chat_response_to_claude_message(self, response_data: Any, fallback_model: Optional[str] = None) -> Any:
+        """OpenAI Chat 非流式响应 → Claude Messages 响应"""
+        if not isinstance(response_data, dict):
+            return response_data
+        choice = (response_data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+
+        content_blocks: list[dict] = []
+        text = self._extract_chat_message_text(message)
+        if text:
+            content_blocks.append({"type": "text", "text": text})
+        for tc in message.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            args_str = fn.get("arguments") or "{}"
+            try:
+                parsed_args = json.loads(args_str) if isinstance(args_str, str) else args_str
+            except json.JSONDecodeError:
+                parsed_args = {"raw": args_str}
+            content_blocks.append({
+                "type": "tool_use",
+                "id": tc.get("id") or f"call_{int(time.time() * 1000)}",
+                "name": fn.get("name") or "tool",
+                "input": parsed_args or {},
+            })
+
+        usage = self._normalize_claude_usage_from_chat_usage(response_data.get("usage") or {})
+        has_tool_use = any(b.get("type") == "tool_use" for b in content_blocks)
+
+        return {
+            "id": response_data.get("id", f"msg_{int(time.time() * 1000)}"),
+            "type": "message",
+            "role": "assistant",
+            "model": response_data.get("model") or fallback_model,
+            "content": content_blocks,
+            "stop_reason": "tool_use" if has_tool_use else "end_turn",
+            "stop_sequence": None,
+            "usage": usage,
+        }
+
+    async def adapt_chat_stream_to_claude_messages(
+        self,
+        stream_response: AsyncGenerator[bytes, None],
+        model: Optional[str],
+        input_tokens_estimate: int = 0,
+    ) -> AsyncGenerator[bytes, None]:
+        """OpenAI Chat SSE 流 → Claude Messages SSE 流"""
+        message_id = f"msg_{int(time.time() * 1000)}"
+        index = 0
+        started = False
+        text_started = False
+        buffer = ""
+        tool_states: dict[int, dict] = {}
+        finish_reason: Optional[str] = None
+        message_usage = {
+            "input_tokens": max(int(input_tokens_estimate or 0), 0),
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+
+        def sse(name: str, data: dict) -> bytes:
+            return self._build_sse_event(name, data)
+
+        async def ensure_started():
+            nonlocal started
+            if not started:
+                started = True
+                yield sse("message_start", {
+                    "type": "message_start",
+                    "message": {
+                        "id": message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": dict(message_usage),
+                    },
+                })
+
+        async def ensure_text_started():
+            nonlocal text_started, index
+            async for item in ensure_started():
+                yield item
+            if not text_started:
+                text_started = True
+                yield sse("content_block_start", {"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}})
+
+        async def close_text_block():
+            nonlocal text_started, index
+            if text_started:
+                yield sse("content_block_stop", {"type": "content_block_stop", "index": index})
+                text_started = False
+                index += 1
+
+        # 主循环：解析上游 Chat SSE
+        async for chunk in stream_response:
+            buffer += chunk.decode("utf-8", "ignore")
+            while "\n\n" in buffer:
+                event_block, buffer = buffer.split("\n\n", 1)
+                data_lines = [ln[5:].strip() for ln in event_block.splitlines() if ln.startswith("data:")]
+                if not data_lines:
+                    continue
+                data_text = "\n".join(data_lines)
+                if data_text == "[DONE]":
+                    continue
+                try:
+                    payload = json.loads(data_text)
+                except json.JSONDecodeError:
+                    continue
+
+                # 持续合并 usage
+                if isinstance(payload, dict) and isinstance(payload.get("usage"), dict):
+                    message_usage = self._merge_claude_usage(
+                        message_usage,
+                        self._normalize_claude_usage_from_chat_usage(payload["usage"]),
+                    )
+
+                choice = ((payload.get("choices") or [{}])[0] if isinstance(payload, dict) else {})
+                delta = choice.get("delta") or {}
+
+                # 文本 delta
+                delta_content = delta.get("content")
+                if isinstance(delta_content, str) and delta_content:
+                    async for item in ensure_text_started():
+                        yield item
+                    yield sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "text_delta", "text": delta_content},
+                    })
+
+                # 工具调用 delta
+                for tc_delta in delta.get("tool_calls") or []:
+                    async for item in close_text_block():
+                        yield item
+                    tc_index = int(tc_delta.get("index", 0) or 0)
+                    state = tool_states.setdefault(tc_index, {
+                        "id": tc_delta.get("id") or f"call_{message_id}_{tc_index}",
+                        "name": "",
+                        "arguments": "",
+                        "started": False,
+                        "block_index": None,
+                    })
+                    fn_delta = tc_delta.get("function") or {}
+                    if tc_delta.get("id"):
+                        state["id"] = tc_delta["id"]
+                    if fn_delta.get("name"):
+                        state["name"] += fn_delta["name"]
+                    # 开始 tool_use block
+                    if not state["started"] and state["name"]:
+                        async for item in ensure_started():
+                            yield item
+                        state["started"] = True
+                        state["block_index"] = index
+                        yield sse("content_block_start", {
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": {"type": "tool_use", "id": state["id"], "name": state["name"], "input": {}},
+                        })
+                    # arguments delta
+                    args_chunk = fn_delta.get("arguments") or ""
+                    if args_chunk and state["started"]:
+                        state["arguments"] += args_chunk
+                        yield sse("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": state["block_index"],
+                            "delta": {"type": "input_json_delta", "partial_json": args_chunk},
+                        })
+
+                # 记录 finish_reason 但不 break（等后续 usage 事件）
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+
+        # 流结束：关闭所有 block
+        async for item in close_text_block():
+            yield item
+        for state in sorted(tool_states.values(), key=lambda s: s.get("block_index") or 0):
+            if state.get("started"):
+                yield sse("content_block_stop", {"type": "content_block_stop", "index": state["block_index"]})
+                index += 1
+
+        # 确保至少发过 message_start
+        async for item in ensure_started():
+            yield item
+
+        # 确定 stop_reason
+        has_tools = any(s.get("started") for s in tool_states.values())
+        stop_reason = "tool_use" if has_tools or finish_reason == "tool_calls" else "end_turn"
+
+        # message_delta + message_stop
+        yield sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": dict(message_usage),
+        })
+        yield sse("message_stop", {"type": "message_stop"})
 
 
 # 全局实例

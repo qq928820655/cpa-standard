@@ -30,6 +30,9 @@ class ApiKey(Base):
     # API Key（加密存储更安全，此处简化处理）
     api_key: Mapped[str] = mapped_column(Text, nullable=False)
 
+    # API 类型：newapi、sub2api、other；为空按 other 处理
+    api_type: Mapped[str] = mapped_column(String(30), nullable=True, default="other")
+
     # 请求基础地址
     base_url: Mapped[str] = mapped_column(String(500), nullable=False)
 
@@ -58,6 +61,18 @@ class ApiKey(Base):
 
     # 备注
     remark: Mapped[str] = mapped_column(Text, nullable=True)
+
+    # 登录密码（用于查询余额等，为空则取系统设置的供应商默认密码）
+    password: Mapped[str] = mapped_column(Text, nullable=True)
+
+    # 网页网址（用于余额查询、图片回填等网页访问，为空则取 base_url）
+    wz_url: Mapped[str] = mapped_column(String(500), nullable=True)
+
+    # 内容安全违规计数
+    security_violation_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # 最近一次内容安全违规原因
+    last_security_violation: Mapped[str] = mapped_column(Text, nullable=True)
 
     # 创建时间
     created_at: Mapped[datetime] = mapped_column(

@@ -20,6 +20,55 @@ DEFAULT_EXPORT_CONFIG = {
     "image_auto_refresh_interval_seconds": 30,
     "image_auto_refresh_max_attempts": 10,
     "image_stale_task_cleanup_interval_seconds": 60,
+    # provider 扩展配置：{ "bb": { "password": "xxx" }, ... }
+    "provider_ext": {},
+    # 是否向管理员显示实际使用的模型（格式：请求模型/映射模型），默认关闭
+    "show_actual_model": False,
+    # 供应商迁移规则：余额不足时自动切换供应商
+    "provider_migration_rules": [
+        {
+            "from_provider": "bb",
+            "to_provider": "bbimg",
+            "min_balance": 0.04,
+            "max_balance": 0.18,
+            "supported_models": [
+                "gpt-image-1",
+                "gpt-image-2",
+                "gpt-image-2-pro",
+                "nano-banana-pro",
+                "nano-banana-pro-4k",
+            ],
+        }
+    ],
+    # 流式缓冲规则：命中规则的请求先完整缓冲上游响应再输出，断流可重试
+    # provider/model 支持 * 通配，均为空则匹配所有
+    # 示例：{"provider": "lumora", "model": "kiro*"} 或 {"provider": "lumora"}
+    "stream_buffer_rules": [],
+    # ClaudeCode 通过 OpenAI Chat 兼容上游时，部分 provider 需要提前返回 input_tokens
+    "claudecode_token_compat_providers": ["skk"],
+    # 余额不足降权规则（按 min 降序，第一个匹配生效）
+    # action: none=不处理, weight=降权, disable=关闭
+    "balance_downgrade_rules": [
+        {"min": 0.5,  "max": None, "action": "none"},
+        {"min": 0.35, "max": 0.5,  "action": "weight", "weight": 3},
+        {"min": 0.25, "max": 0.35, "action": "weight", "weight": 2},
+        {"min": 0.18, "max": 0.25, "action": "weight", "weight": 1},
+        {"min": 0.0,  "max": 0.18, "action": "disable"},
+    ],
+    # 上游内容安全防护：默认关闭，开启后扫描广告与危险代码片段
+    "content_guard": {
+        "enabled": False,
+        "check_ads": True,
+        "check_dangerous_code": True,
+        "block_on_violation": True,
+        "ad_action": "record",
+        "auto_disable_key": False,
+        "disable_threshold": 3,
+        "downgrade_weight": 1,
+        "ad_patterns": ["powered by", "buy now", "推广", "广告", "优惠码", "邀请码", "加群"],
+        "ad_regex_patterns": [],
+        "dangerous_patterns": [],
+    },
 }
 
 

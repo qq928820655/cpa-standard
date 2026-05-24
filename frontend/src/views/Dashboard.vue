@@ -60,6 +60,16 @@
               <div class="panel-title">API Key 状态</div>
             </div>
             <div class="dashboard-filters">
+              <el-tooltip content="刷新" placement="top" :show-after="300">
+                <el-button
+                  :icon="Refresh"
+                  circle
+                  size="small"
+                  :loading="keyStatsRefreshing"
+                  class="dashboard-refresh-btn"
+                  @click="handleKeyStatsRefresh"
+                />
+              </el-tooltip>
               <el-select
                 v-model="keyStatsDays"
                 class="dashboard-filter dashboard-filter--quick-range"
@@ -167,7 +177,11 @@
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="total_requests" label="请求数" width="120" sortable="custom" />
+          <el-table-column prop="total_requests" label="请求数" width="120" sortable="custom">
+            <template #default="{ row }">
+              {{ Number(row.total_requests || 0).toLocaleString('zh-CN') }}
+            </template>
+          </el-table-column>
           <el-table-column prop="total_tokens" label="Token 数" min-width="140" sortable="custom">
             <template #default="{ row }">
               {{ formatNumber(row.total_tokens) }}
@@ -196,18 +210,47 @@
       <div v-loading="keyDetailLoading" class="key-detail-dialog">
         <el-descriptions :column="2" border>
           <el-descriptions-item label="Key ID">{{ keyDetail.id || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="名称">{{ keyDetail.name || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="名称">
+            <span>{{ keyDetail.name || '-' }}</span>
+            <el-button
+              v-if="keyDetail.password"
+              link
+              size="small"
+              style="margin-left: 6px; padding: 0"
+              title="复制登录密码"
+              @click="copyKeyPassword(keyDetail.password)"
+            ><el-icon><View /></el-icon></el-button>
+          </el-descriptions-item>
           <el-descriptions-item label="提供商">{{ keyDetail.provider || '-' }}</el-descriptions-item>
           <el-descriptions-item label="API Key">{{ keyDetail.api_key_masked || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="请求地址" :span="2">{{ keyDetail.base_url || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="总请求数">{{ keyDetailSummary.total_requests || 0 }}</el-descriptions-item>
+          <el-descriptions-item label="请求地址">{{ keyDetail.base_url || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="启用状态">
+            <el-button
+              :type="keyDetail.is_active ? 'success' : 'danger'"
+              size="small"
+              :loading="keyDetailToggling"
+              @click="toggleKeyDetailActive"
+            >
+              {{ keyDetail.is_active ? '已启用' : '已关闭' }}
+            </el-button>
+          </el-descriptions-item>
+          <el-descriptions-item label="权重">{{ keyDetail.weight ?? '-' }}</el-descriptions-item>
+          <el-descriptions-item label="总请求数">{{ Number(keyDetailSummary.total_requests || 0).toLocaleString('zh-CN') }}</el-descriptions-item>
           <el-descriptions-item label="成功率">{{ getSuccessRate(keyDetailSummary) }}%</el-descriptions-item>
           <el-descriptions-item label="总 Token">{{ formatNumber(keyDetailSummary.total_tokens || 0) }}</el-descriptions-item>
           <el-descriptions-item label="输入 Token">{{ formatNumber(keyDetailSummary.prompt_tokens || 0) }}</el-descriptions-item>
+          <el-descriptions-item label="缓存 Token">{{ formatNumber(keyDetailSummary.cache_tokens || 0) }}</el-descriptions-item>
           <el-descriptions-item label="输出 Token">{{ formatNumber(keyDetailSummary.completion_tokens || 0) }}</el-descriptions-item>
-          <el-descriptions-item label="平均总耗时">{{ formatLatency(keyDetailSummary.avg_latency_ms) }}</el-descriptions-item>
           <el-descriptions-item label="平均上游耗时">{{ formatLatency(keyDetailSummary.avg_upstream_latency_ms) }}</el-descriptions-item>
           <el-descriptions-item label="CPA 额外耗时">{{ formatLatency(keyDetailSummary.avg_cpa_overhead_ms) }}</el-descriptions-item>
+          <el-descriptions-item label="账户余额" :span="2">
+            <span v-if="keyDetailBalanceLoading" style="color: #909399; font-size: 13px">查询中...</span>
+            <span v-else-if="keyDetailBalance">
+              <span style="color: #10b981; font-weight: 600">${{ keyDetailBalance.balance_usd.toFixed(4) }}</span>
+              <span style="color: #909399; font-size: 12px; margin-left: 8px">已用 ${{ keyDetailBalance.used_usd.toFixed(4) }}</span>
+            </span>
+            <span v-else style="color: #909399; font-size: 13px">-</span>
+          </el-descriptions-item>
         </el-descriptions>
 
         <el-card shadow="never" class="key-detail-logs-card">
@@ -222,35 +265,51 @@
 
           <el-table :data="keyDetailLogs" stripe border size="small" v-loading="keyDetailLogsLoading" max-height="360" class="dashboard-key-detail-table">
             <el-table-column prop="id" label="ID" width="72" />
-            <el-table-column prop="model" label="模型" min-width="180" show-overflow-tooltip />
-            <el-table-column prop="prompt_tokens" label="输入 Token" width="110" align="right">
+            <el-table-column prop="model" label="模型" min-width="140">
+              <template #default="{ row }">
+                <el-tooltip v-if="row.model" effect="dark" placement="top" :show-after="80">
+                  <template #content>{{ row.actual_model ? `${row.model} / ${row.actual_model}` : row.model }}</template>
+                  <div class="model-cell" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap">
+                    <span>{{ row.model }}</span>
+                    <span v-if="row.actual_model" style="color: #909399; font-size: 10px"> /{{ row.actual_model }}</span>
+                  </div>
+                </el-tooltip>
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="prompt_tokens" label="输入 Token" width="90" align="right">
               <template #default="{ row }">
                 {{ formatNumber(row.prompt_tokens || 0) }}
               </template>
             </el-table-column>
-            <el-table-column prop="completion_tokens" label="输出 Token" width="110" align="right">
+            <el-table-column prop="completion_tokens" label="输出 Token" width="90" align="right">
               <template #default="{ row }">
                 {{ formatNumber(row.completion_tokens || 0) }}
               </template>
             </el-table-column>
-            <el-table-column prop="total_tokens" label="总 Token" width="110" align="right">
+            <el-table-column prop="cache_tokens" label="缓存 Token" width="90" align="right">
+              <template #default="{ row }">
+                {{ row.cache_tokens ? formatNumber(row.cache_tokens) : '-' }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="total_tokens" label="总 Token" width="90" align="right">
               <template #default="{ row }">
                 {{ formatNumber(row.total_tokens || 0) }}
               </template>
             </el-table-column>
-            <el-table-column prop="latency_ms" label="总耗时" width="100" align="right">
+            <el-table-column prop="latency_ms" label="总耗时" width="90" align="right">
               <template #default="{ row }">
                 {{ formatLatency(row.latency_ms) }}
               </template>
             </el-table-column>
-            <el-table-column prop="status" label="状态" width="90" align="center">
+            <el-table-column prop="status" label="状态" width="72" align="center">
               <template #default="{ row }">
                 <el-tag :type="getStatusTagType(row.status)" size="small">
                   {{ getStatusLabel(row.status) }}
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column prop="request_time" label="请求时间" width="160" show-overflow-tooltip />
+            <el-table-column prop="request_time" label="请求时间" width="118" show-overflow-tooltip />
           </el-table>
 
           <div class="pagination key-detail-pagination">
@@ -282,7 +341,12 @@ import { LineChart, PieChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
 import { ElMessage } from 'element-plus'
+import { Refresh, View } from '@element-plus/icons-vue'
 import { adminApi, statsApi, authApi } from '../api'
+import { useDisplaySettings } from '../stores/displaySettings'
+
+const { formatToken } = useDisplaySettings()
+const formatNumber = (value) => formatToken.value(value)
 
 use([CanvasRenderer, LineChart, PieChart, GridComponent, TooltipComponent, LegendComponent])
 
@@ -325,6 +389,9 @@ const keyDetailLogsLoading = ref(false)
 const keyDetailLogsPage = ref(1)
 const keyDetailLogsPageSize = ref(20)
 const keyDetailLogsTotal = ref(0)
+const keyDetailBalance = ref(null)       // { balance_usd, used_usd } 或 null
+const keyDetailBalanceLoading = ref(false)
+const keyDetailToggling = ref(false)
 const summary = ref({
   total_requests: 0,
   success_requests: 0,
@@ -340,6 +407,8 @@ const keyUsageSort = ref({
   prop: typeof savedState.keyUsageSort?.prop === 'string' ? savedState.keyUsageSort.prop : '',
   order: ['ascending', 'descending', null].includes(savedState.keyUsageSort?.order) ? savedState.keyUsageSort.order : null,
 })
+
+const keyStatsRefreshing = ref(false)
 
 const normalizeText = (value) => String(value || '').trim().toLowerCase()
 
@@ -422,6 +491,26 @@ const handleFilterChange = () => {
   loadData()
 }
 
+const handleKeyStatsRefresh = async () => {
+  if (keyStatsRefreshing.value) return
+  keyStatsRefreshing.value = true
+  try {
+    const userParam = userIdFilter.value ? { user_id: userIdFilter.value } : {}
+    const keyParams = {
+      ...buildKeyStatsTimeParams(),
+      providers: providerFilters.value,
+      models: buildEffectiveModelFilters(),
+      ...userParam,
+    }
+    const keyData = await statsApi.getByKey(keyParams)
+    keyUsage.value = Array.isArray(keyData) ? keyData : []
+  } catch (e) {
+    ElMessage.error(e.message || '刷新 Key 状态失败')
+  } finally {
+    keyStatsRefreshing.value = false
+  }
+}
+
 const buildKeyStatsTimeParams = () => {
   const hasDateRange = Array.isArray(keyStatsDateRange.value) && keyStatsDateRange.value.length === 2
   if (hasDateRange) {
@@ -448,14 +537,10 @@ const handleKeyStatsDateRangeChange = (value) => {
   loadData()
 }
 
-const formatNumber = (num) => {
-  const value = Number(num || 0)
-  if (value >= 1000000) return `${(value / 1000000).toFixed(1)}M`
-  if (value >= 1000) return `${(value / 1000).toFixed(1)}K`
-  return `${value}`
+const formatLatency = (value) => {
+  const ms = Math.round(Number(value || 0))
+  return `${ms.toLocaleString('zh-CN')} ms`
 }
-
-const formatLatency = (value) => `${Math.round(Number(value || 0))} ms`
 
 const getStatusLabel = (status) => {
   if (status === 'success') return '成功'
@@ -488,6 +573,7 @@ const handleKeyDetailDialogClosed = () => {
   keyDetailLogs.value = []
   keyDetailLogsTotal.value = 0
   keyDetailLogsPage.value = 1
+  keyDetailBalance.value = null
 }
 
 const loadKeyDetailLogs = async (keyId = keyDetail.value?.id) => {
@@ -523,6 +609,7 @@ const openKeyDetail = async (apiKeyId) => {
   if (!apiKeyId) return
   keyDetailDialogVisible.value = true
   keyDetailLoading.value = true
+  keyDetailBalance.value = null
   try {
     const [keyData, summaryData] = await Promise.all([
       adminApi.getKey(apiKeyId),
@@ -532,6 +619,8 @@ const openKeyDetail = async (apiKeyId) => {
     keyDetailSummary.value = summaryData || {}
     keyDetailLogsPage.value = 1
     await loadKeyDetailLogs(apiKeyId)
+    // 异步加载余额（不阻塞弹窗打开）
+    loadKeyDetailBalance(apiKeyId)
   } catch (e) {
     ElMessage.error(e.message || '加载 Key 详情失败')
   } finally {
@@ -539,17 +628,55 @@ const openKeyDetail = async (apiKeyId) => {
   }
 }
 
+const loadKeyDetailBalance = async (keyId) => {
+  keyDetailBalanceLoading.value = true
+  try {
+    const data = await adminApi.getProviderBalance(keyId)
+    keyDetailBalance.value = data
+  } catch {
+    // 余额查询失败不报错，静默处理
+    keyDetailBalance.value = null
+  } finally {
+    keyDetailBalanceLoading.value = false
+  }
+}
+
+const toggleKeyDetailActive = async () => {
+  const keyId = keyDetail.value?.id
+  if (!keyId || keyDetailToggling.value) return
+  keyDetailToggling.value = true
+  try {
+    const updated = await adminApi.toggleKey(keyId)
+    keyDetail.value = { ...keyDetail.value, is_active: updated.is_active }
+    ElMessage.success(updated.is_active ? 'Key 已启用' : 'Key 已关闭')
+  } catch (e) {
+    ElMessage.error(e.message || '操作失败')
+  } finally {
+    keyDetailToggling.value = false
+  }
+}
+
+const copyKeyPassword = async (password) => {
+  if (!password) return
+  try {
+    await navigator.clipboard.writeText(password)
+    ElMessage.success('密码已复制')
+  } catch {
+    ElMessage.error('复制失败')
+  }
+}
+
 const metricCards = computed(() => [
   {
     label: '总请求数',
-    value: summary.value.total_requests,
+    value: Number(summary.value.total_requests || 0).toLocaleString('zh-CN'),
     hint: '当前时间窗累计进入代理的请求规模',
     icon: 'Connection',
     gradient: 'linear-gradient(135deg, #3b82f6, #06b6d4)',
   },
   {
     label: '成功请求',
-    value: summary.value.success_requests,
+    value: Number(summary.value.success_requests || 0).toLocaleString('zh-CN'),
     hint: '请求成功返回的总次数',
     icon: 'CircleCheck',
     gradient: 'linear-gradient(135deg, #10b981, #34d399)',
@@ -563,7 +690,7 @@ const metricCards = computed(() => [
   },
   {
     label: '平均延迟',
-    value: `${Math.round(Number(summary.value.avg_latency_ms || 0))} ms`,
+    value: formatLatency(summary.value.avg_latency_ms),
     hint: '请求从进入到完成的平均耗时',
     icon: 'Timer',
     gradient: 'linear-gradient(135deg, #f59e0b, #fb7185)',
@@ -884,6 +1011,10 @@ onMounted(async () => {
   width: 100%;
   min-width: 0;
   flex-wrap: nowrap;
+}
+
+.dashboard-refresh-btn {
+  flex: 0 0 auto;
 }
 
 .dashboard-filter {

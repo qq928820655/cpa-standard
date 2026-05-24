@@ -34,9 +34,19 @@ const routes = [
     component: () => import('./views/UsageStats.vue'),
   },
   {
+    path: '/security-events',
+    name: 'SecurityEvents',
+    component: () => import('./views/SecurityEvents.vue'),
+  },
+  {
     path: '/models',
     name: 'ModelMarket',
     component: () => import('./views/ModelMarket.vue'),
+  },
+  {
+    path: '/provider-model-mappings',
+    name: 'ProviderModelMapping',
+    component: () => import('./views/ProviderModelMapping.vue'),
   },
   {
     path: '/images',

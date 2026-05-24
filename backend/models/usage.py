@@ -23,13 +23,17 @@ class UsageLog(Base):
     # 发起请求的用户 ID（null 表示通过 master key 直接调用）
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("admin_users.id"), nullable=True)
 
-    # 使用的模型名称
+    # 使用的模型名称（用户请求的原始模型）
     model: Mapped[str] = mapped_column(String(100), nullable=True)
+    # 实际转发的模型（模型映射后，无映射时与 model 相同）
+    actual_model: Mapped[str] = mapped_column(String(100), nullable=True)
 
     # Token 用量
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # 缓存命中的输入 Token（来自上游 usage.prompt_tokens_details.cached_tokens 等字段）
+    cache_tokens: Mapped[int] = mapped_column(Integer, default=0)
 
     # 请求耗时（毫秒）
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
@@ -69,6 +73,7 @@ class UsageDailySummary(Base):
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_tokens: Mapped[int] = mapped_column(Integer, default=0)
 
     latency_sum_ms: Mapped[int] = mapped_column(Integer, default=0)
     latency_count: Mapped[int] = mapped_column(Integer, default=0)

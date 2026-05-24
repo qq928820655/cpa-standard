@@ -7,7 +7,6 @@
             <div class="logo-mark">CPA</div>
           </div>
 
-          <div class="nav-caption">Workspace</div>
           <el-menu
             :default-active="currentRoute"
             router
@@ -29,6 +28,10 @@
               <el-icon><Grid /></el-icon>
               <span>模型广场</span>
             </el-menu-item>
+            <el-menu-item index="/provider-model-mappings">
+              <el-icon><Connection /></el-icon>
+              <span>模型映射</span>
+            </el-menu-item>
             <el-menu-item index="/images">
               <el-icon><Picture /></el-icon>
               <span>光影世界</span>
@@ -36,6 +39,10 @@
             <el-menu-item v-if="showUserManage" index="/users">
               <el-icon><User /></el-icon>
               <span>用户管理</span>
+            </el-menu-item>
+            <el-menu-item v-if="showSettings" index="/security-events">
+              <el-icon><Warning /></el-icon>
+              <span>安全事件</span>
             </el-menu-item>
             <el-menu-item v-if="showSettings" index="/settings">
               <el-icon><Setting /></el-icon>
@@ -60,13 +67,9 @@
             </div>
           </div>
 
-          <div class="sidebar-footer">
-            <div class="footer-chip">Local Gateway</div>
-            <p>统一管理上游 Key、模型能力与调用统计。</p>
-            <div v-if="loginEnabled && isLoggedIn" class="logout-row">
-              <span class="logout-user">{{ username }}</span>
-              <button type="button" class="logout-btn" @click="handleLogout">退出</button>
-            </div>
+          <div v-if="loginEnabled && isLoggedIn" class="logout-row sidebar-logout-row">
+            <span class="logout-user">{{ username }}</span>
+            <button type="button" class="logout-btn" @click="handleLogout">退出</button>
           </div>
         </div>
       </el-aside>
@@ -89,7 +92,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import zhCn from 'element-plus/dist/locale/zh-cn.mjs'
 import { authApi } from './api'
-import { User } from '@element-plus/icons-vue'
+import { Connection, User, Warning } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -198,7 +201,7 @@ html, body, #app {
 
 .sidebar-shell {
   width: 220px;
-  padding: 16px 0 16px 16px;
+  padding: 10px 0 10px 14px;
   background: transparent;
   position: fixed;
   left: 0;
@@ -210,20 +213,21 @@ html, body, #app {
 .sidebar-panel {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 32px);
-  padding: 18px 14px 16px;
+  height: calc(100vh - 20px);
+  padding: 14px 14px 12px;
   border: 1px solid var(--cpa-sidebar-border);
   border-radius: 24px;
   background: var(--cpa-sidebar-bg);
   box-shadow: var(--cpa-sidebar-shadow);
   backdrop-filter: blur(16px);
+  overflow: hidden;
 }
 
 .logo-block {
   display: flex;
   align-items: center;
   width: 100%;
-  padding: 0 0 14px;
+  padding: 0 0 12px;
 }
 
 .logo-mark {
@@ -231,7 +235,7 @@ html, body, #app {
   align-items: center;
   justify-content: center;
   width: 100%;
-  height: 64px;
+  height: 58px;
   border-radius: 18px;
   background: var(--cpa-brand-gradient);
   color: #fff;
@@ -242,13 +246,7 @@ html, body, #app {
 }
 
 .nav-caption {
-  margin: 8px 0 10px;
-  padding-left: 12px;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--cpa-text-tertiary);
+  display: none;
 }
 
 .app-menu {
@@ -258,8 +256,8 @@ html, body, #app {
 }
 
 .app-menu .el-menu-item {
-  height: 48px;
-  margin-bottom: 8px;
+  height: 44px;
+  margin-bottom: 6px;
   border-radius: 14px;
   color: var(--cpa-menu-text);
   font-weight: 600;
@@ -281,8 +279,8 @@ html, body, #app {
 
 .theme-switcher {
   margin-top: 4px;
-  margin-bottom: 12px;
-  padding: 12px;
+  margin-bottom: 0;
+  padding: 10px;
   border: 1px solid var(--cpa-panel-border-soft);
   border-radius: 18px;
   background: var(--cpa-theme-panel-bg);
@@ -299,7 +297,7 @@ html, body, #app {
   align-items: center;
   justify-content: center;
   width: 100%;
-  padding: 10px 0;
+  padding: 8px 0;
   border: 1px solid var(--cpa-theme-option-border);
   border-radius: 14px;
   background: var(--cpa-theme-option-bg);

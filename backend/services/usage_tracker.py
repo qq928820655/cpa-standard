@@ -14,6 +14,7 @@ class UsageTracker:
         db: AsyncSession,
         api_key_id: int,
         model: Optional[str] = None,
+        actual_model: Optional[str] = None,
         user_id: Optional[int] = None,
     ) -> Any:
         """创建进行中的用量记录"""
@@ -23,6 +24,7 @@ class UsageTracker:
             api_key_id=api_key_id,
             user_id=user_id,
             model=model,
+            actual_model=actual_model or model,
             prompt_tokens=0,
             completion_tokens=0,
             total_tokens=0,
@@ -75,6 +77,7 @@ class UsageTracker:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,
+        cache_tokens: int = 0,
         latency_ms: int = 0,
         upstream_latency_ms: int = 0,
         cpa_overhead_ms: Optional[int] = None,
@@ -96,6 +99,7 @@ class UsageTracker:
         persistent_log.prompt_tokens = prompt_tokens
         persistent_log.completion_tokens = completion_tokens
         persistent_log.total_tokens = total_tokens
+        persistent_log.cache_tokens = cache_tokens
         persistent_log.latency_ms = latency_ms
         persistent_log.upstream_latency_ms = upstream_latency_ms
         persistent_log.cpa_overhead_ms = cpa_overhead_ms
@@ -112,6 +116,7 @@ class UsageTracker:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,
+        cache_tokens: int = 0,
         latency_ms: int = 0,
         upstream_latency_ms: int = 0,
         cpa_overhead_ms: Optional[int] = None,
@@ -127,6 +132,7 @@ class UsageTracker:
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
+                cache_tokens=cache_tokens,
                 latency_ms=latency_ms,
                 upstream_latency_ms=upstream_latency_ms,
                 cpa_overhead_ms=cpa_overhead_ms,
@@ -143,6 +149,7 @@ class UsageTracker:
         persistent_log.prompt_tokens = prompt_tokens
         persistent_log.completion_tokens = completion_tokens
         persistent_log.total_tokens = total_tokens
+        persistent_log.cache_tokens = cache_tokens
         persistent_log.latency_ms = latency_ms
         persistent_log.upstream_latency_ms = upstream_latency_ms
         persistent_log.cpa_overhead_ms = cpa_overhead_ms
@@ -157,9 +164,11 @@ class UsageTracker:
         db: AsyncSession,
         api_key_id: int,
         model: Optional[str] = None,
+        actual_model: Optional[str] = None,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,
+        cache_tokens: int = 0,
         latency_ms: int = 0,
         upstream_latency_ms: int = 0,
         cpa_overhead_ms: Optional[int] = None,
@@ -177,6 +186,7 @@ class UsageTracker:
             prompt_tokens: 输入 Token 数
             completion_tokens: 输出 Token 数
             total_tokens: 总 Token 数
+            cache_tokens: 缓存命中 Token 数
             latency_ms: 请求耗时（毫秒）
             upstream_latency_ms: 上游耗时（毫秒）
             cpa_overhead_ms: CPA 自身增加的耗时（毫秒）
@@ -187,13 +197,14 @@ class UsageTracker:
         Returns:
             UsageLog 记录
         """
-        pending_log = await UsageTracker.create_pending_record(db, api_key_id=api_key_id, model=model, user_id=user_id)
+        pending_log = await UsageTracker.create_pending_record(db, api_key_id=api_key_id, model=model, actual_model=actual_model, user_id=user_id)
         return await UsageTracker.update_record(
             db=db,
             log=pending_log,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
+            cache_tokens=cache_tokens,
             latency_ms=latency_ms,
             upstream_latency_ms=upstream_latency_ms,
             cpa_overhead_ms=cpa_overhead_ms,

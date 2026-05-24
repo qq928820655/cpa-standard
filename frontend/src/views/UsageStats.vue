@@ -103,15 +103,29 @@
         </div>
       </template>
       <el-table :data="logs" stripe border v-loading="loadingLogs" height="600" class="logs-table" size="small">
-        <el-table-column prop="id" label="ID" width="72" />
-        <el-table-column prop="api_key_id" label="Key ID" width="64">
+        <el-table-column prop="id" label="ID" width="64" />
+        <el-table-column prop="api_key_id" label="Key ID" width="60">
           <template #default="{ row }">
             <el-button link type="primary" class="key-id-link" @click="openKeyDetail(row.api_key_id)">
               {{ row.api_key_id }}
             </el-button>
           </template>
         </el-table-column>
-        <el-table-column prop="model" label="模型" width="100">
+        <el-table-column prop="api_key_name" label="Key 名称" width="90">
+          <template #default="{ row }">
+            <el-tooltip
+              v-if="getLogKeyName(row)"
+              effect="dark"
+              placement="top"
+              :show-after="80"
+              :content="getLogKeyName(row)"
+            >
+              <div class="model-cell">{{ getLogKeyName(row) }}</div>
+            </el-tooltip>
+            <span v-else>-</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="model" label="模型" width="90">
           <template #default="{ row }">
             <el-tooltip
               v-if="row.model"
@@ -124,56 +138,66 @@
               :popper-options="modelTooltipPopperOptions"
             >
               <template #content>
-                <div class="model-tooltip__content">{{ row.model }}</div>
+                <div class="model-tooltip__content">
+                  {{ row.actual_model ? `${row.model} / ${row.actual_model}` : row.model }}
+                </div>
               </template>
-              <div class="model-cell">{{ row.model }}</div>
+              <div class="model-cell">
+                <span>{{ row.model }}</span>
+                <span v-if="row.actual_model" style="color: #909399; font-size: 10px"> /{{ row.actual_model }}</span>
+              </div>
             </el-tooltip>
             <span v-else>-</span>
           </template>
         </el-table-column>
-        <el-table-column prop="prompt_tokens" label="输入 Token" width="100" align="right">
+        <el-table-column prop="prompt_tokens" label="输入 Token" width="88" align="right">
           <template #default="{ row }">
             {{ formatCompactTokenValue(row.prompt_tokens) }}
           </template>
         </el-table-column>
-        <el-table-column prop="completion_tokens" label="输出 Token" width="100" align="right">
+        <el-table-column prop="completion_tokens" label="输出 Token" width="88" align="right">
           <template #default="{ row }">
             {{ formatCompactTokenValue(row.completion_tokens) }}
           </template>
         </el-table-column>
-        <el-table-column prop="total_tokens" label="总 Token" width="100" align="right">
+        <el-table-column prop="cache_tokens" label="缓存 Token" width="88" align="right">
+          <template #default="{ row }">
+            {{ row.cache_tokens ? formatCompactTokenValue(row.cache_tokens) : '-' }}
+          </template>
+        </el-table-column>
+        <el-table-column prop="total_tokens" label="总 Token" width="88" align="right">
           <template #default="{ row }">
             {{ formatCompactTokenValue(row.total_tokens) }}
           </template>
         </el-table-column>
-        <el-table-column prop="latency_ms" label="总耗时" width="100" align="right">
+        <el-table-column prop="latency_ms" label="总耗时" width="88" align="right">
           <template #default="{ row }">
             {{ formatCompactLatency(row.latency_ms) }}
           </template>
         </el-table-column>
-        <el-table-column prop="upstream_latency_ms" label="上游耗时" width="100" align="right">
+        <el-table-column prop="upstream_latency_ms" label="上游耗时" width="88" align="right">
           <template #default="{ row }">
             {{ formatCompactLatency(row.upstream_latency_ms) }}
           </template>
         </el-table-column>
-        <el-table-column prop="cpa_overhead_ms" label="CPA 耗时" width="100" align="right">
+        <el-table-column prop="cpa_overhead_ms" label="CPA 耗时" width="88" align="right">
           <template #default="{ row }">
             {{ formatCompactLatency(row.cpa_overhead_ms) }}
           </template>
         </el-table-column>
-        <el-table-column prop="status" label="状态" width="72" align="center">
+        <el-table-column prop="status" label="状态" width="64" align="center">
           <template #default="{ row }">
             <el-tag :type="getStatusTagType(row.status)" size="small">
               {{ getStatusLabel(row.status) }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="request_time" label="请求时间" width="118">
+        <el-table-column prop="request_time" label="请求时间" width="108">
           <template #default="{ row }">
             {{ formatTableTime(row.request_time) }}
           </template>
         </el-table-column>
-        <el-table-column prop="error_message" label="错误信息" min-width="180">
+        <el-table-column prop="error_message" label="错误信息" min-width="120">
           <template #default="{ row }">
             <el-tooltip
               v-if="row.error_message"
@@ -214,18 +238,47 @@
       <div v-loading="keyDetailLoading" class="key-detail-dialog">
         <el-descriptions :column="2" border>
           <el-descriptions-item label="Key ID">{{ keyDetail.id || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="名称">{{ keyDetail.name || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="名称">
+            <span>{{ keyDetail.name || '-' }}</span>
+            <el-button
+              v-if="keyDetail.password"
+              link
+              size="small"
+              style="margin-left: 6px; padding: 0"
+              title="复制登录密码"
+              @click="copyKeyPassword(keyDetail.password)"
+            ><el-icon><View /></el-icon></el-button>
+          </el-descriptions-item>
           <el-descriptions-item label="提供商">{{ keyDetail.provider || '-' }}</el-descriptions-item>
           <el-descriptions-item label="API Key">{{ keyDetail.api_key_masked || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="请求地址" :span="2">{{ keyDetail.base_url || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="总请求数">{{ keyDetailSummary.total_requests || 0 }}</el-descriptions-item>
+          <el-descriptions-item label="请求地址">{{ keyDetail.base_url || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="启用状态">
+            <el-button
+              :type="keyDetail.is_active ? 'success' : 'danger'"
+              size="small"
+              :loading="keyDetailToggling"
+              @click="toggleKeyDetailActive"
+            >
+              {{ keyDetail.is_active ? '已启用' : '已关闭' }}
+            </el-button>
+          </el-descriptions-item>
+          <el-descriptions-item label="权重">{{ keyDetail.weight ?? '-' }}</el-descriptions-item>
+          <el-descriptions-item label="总请求数">{{ Number(keyDetailSummary.total_requests || 0).toLocaleString('zh-CN') }}</el-descriptions-item>
           <el-descriptions-item label="成功率">{{ getSuccessRate(keyDetailSummary) }}%</el-descriptions-item>
           <el-descriptions-item label="总 Token">{{ formatTokenValue(keyDetailSummary.total_tokens) }}</el-descriptions-item>
           <el-descriptions-item label="输入 Token">{{ formatTokenValue(keyDetailSummary.prompt_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="缓存 Token">{{ formatTokenValue(keyDetailSummary.cache_tokens) }}</el-descriptions-item>
           <el-descriptions-item label="输出 Token">{{ formatTokenValue(keyDetailSummary.completion_tokens) }}</el-descriptions-item>
-          <el-descriptions-item label="平均总耗时">{{ formatLatency(keyDetailSummary.avg_latency_ms) }}</el-descriptions-item>
           <el-descriptions-item label="平均上游耗时">{{ formatLatency(keyDetailSummary.avg_upstream_latency_ms) }}</el-descriptions-item>
           <el-descriptions-item label="CPA 额外耗时">{{ formatLatency(keyDetailSummary.avg_cpa_overhead_ms) }}</el-descriptions-item>
+          <el-descriptions-item label="账户余额" :span="2">
+            <span v-if="keyDetailBalanceLoading" style="color: #909399; font-size: 13px">查询中...</span>
+            <span v-else-if="keyDetailBalance">
+              <span style="color: #10b981; font-weight: 600">${{ keyDetailBalance.balance_usd.toFixed(4) }}</span>
+              <span style="color: #909399; font-size: 12px; margin-left: 8px">已用 ${{ keyDetailBalance.used_usd.toFixed(4) }}</span>
+            </span>
+            <span v-else style="color: #909399; font-size: 13px">-</span>
+          </el-descriptions-item>
         </el-descriptions>
 
         <el-card shadow="never" class="key-detail-logs-card">
@@ -240,35 +293,51 @@
 
           <el-table :data="keyDetailLogs" stripe border size="small" v-loading="keyDetailLogsLoading" max-height="360" class="usage-key-detail-table">
             <el-table-column prop="id" label="ID" width="72" />
-            <el-table-column prop="model" label="模型" min-width="180" show-overflow-tooltip />
-            <el-table-column prop="prompt_tokens" label="输入 Token" width="110" align="right">
+            <el-table-column prop="model" label="模型" min-width="140">
+              <template #default="{ row }">
+                <el-tooltip v-if="row.model" effect="dark" placement="top" :show-after="80">
+                  <template #content>{{ row.actual_model ? `${row.model} / ${row.actual_model}` : row.model }}</template>
+                  <div class="model-cell">
+                    <span>{{ row.model }}</span>
+                    <span v-if="row.actual_model" style="color: #909399; font-size: 10px"> /{{ row.actual_model }}</span>
+                  </div>
+                </el-tooltip>
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="prompt_tokens" label="输入 Token" width="90" align="right">
               <template #default="{ row }">
                 {{ formatCompactTokenValue(row.prompt_tokens) }}
               </template>
             </el-table-column>
-            <el-table-column prop="completion_tokens" label="输出 Token" width="110" align="right">
+            <el-table-column prop="completion_tokens" label="输出 Token" width="90" align="right">
               <template #default="{ row }">
                 {{ formatCompactTokenValue(row.completion_tokens) }}
               </template>
             </el-table-column>
-            <el-table-column prop="total_tokens" label="总 Token" width="110" align="right">
+            <el-table-column prop="cache_tokens" label="缓存 Token" width="90" align="right">
+              <template #default="{ row }">
+                {{ row.cache_tokens ? formatCompactTokenValue(row.cache_tokens) : '-' }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="total_tokens" label="总 Token" width="90" align="right">
               <template #default="{ row }">
                 {{ formatCompactTokenValue(row.total_tokens) }}
               </template>
             </el-table-column>
-            <el-table-column prop="latency_ms" label="总耗时" width="100" align="right">
+            <el-table-column prop="latency_ms" label="总耗时" width="90" align="right">
               <template #default="{ row }">
                 {{ formatCompactLatency(row.latency_ms) }}
               </template>
             </el-table-column>
-            <el-table-column prop="status" label="状态" width="90" align="center">
+            <el-table-column prop="status" label="状态" width="72" align="center">
               <template #default="{ row }">
                 <el-tag :type="getKeyDetailStatusType(row.status)" size="small">
                   {{ getKeyDetailStatusLabel(row.status) }}
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column prop="request_time" label="请求时间" width="140">
+            <el-table-column prop="request_time" label="请求时间" width="118">
               <template #default="{ row }">
                 {{ formatTime(row.request_time) }}
               </template>
@@ -304,7 +373,11 @@ import { LineChart, BarChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
 import { ElMessage } from 'element-plus'
+import { View } from '@element-plus/icons-vue'
 import { statsApi, adminApi, authApi } from '../api'
+import { useDisplaySettings } from '../stores/displaySettings'
+
+const { formatToken, formatTokenCompact } = useDisplaySettings()
 
 use([CanvasRenderer, LineChart, BarChart, GridComponent, TooltipComponent, LegendComponent])
 
@@ -333,6 +406,13 @@ if (isCustomDateRange.value) {
 const filterKeyId = ref(savedState.filterKeyId || null)
 const filterStatus = ref(typeof savedState.filterStatus === 'string' ? savedState.filterStatus : '')
 const keyOptions = ref([])
+
+const keyNameMap = computed(() => {
+  const map = {}
+  keyOptions.value.forEach((k) => { map[k.id] = k.name })
+  return map
+})
+const getLogKeyName = (row) => row?.api_key_name || keyNameMap.value[row?.api_key_id] || ''
 const userIdFilter = ref(null)
 const userOptions = ref([])
 const showUserFilter = computed(() => authApi.isAdmin() && authApi.isLoggedIn())
@@ -368,6 +448,9 @@ const keyDetailLogsLoading = ref(false)
 const keyDetailLogsPage = ref(1)
 const keyDetailLogsPageSize = ref(20)
 const keyDetailLogsTotal = ref(0)
+const keyDetailBalance = ref(null)
+const keyDetailBalanceLoading = ref(false)
+const keyDetailToggling = ref(false)
 
 const normalizeKeyId = (value) => {
   if (value === null || value === undefined || value === '') return null
@@ -404,19 +487,23 @@ const buildStatsParams = () => {
   return params
 }
 
-const formatTokenValue = (value) => `${value || 0}`
+const formatTokenValue = (value) => formatToken.value(value)
 
-const formatCompactTokenValue = (value) => {
-  const amount = Number(value || 0)
-  if (amount >= 1000000) return `${(amount / 1000000).toFixed(1)}M`
-  if (amount >= 1000) return `${(amount / 1000).toFixed(1)}k`
-  return `${amount}`
+const formatCompactTokenValue = (value) => formatTokenCompact.value(value)
+
+const formatLatencyValue = (value) => {
+  const ms = Number(value || 0)
+  return `${ms.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ms`
 }
 
-const formatLatencyValue = (value) => `${Number(value || 0).toFixed(2)} ms`
-
-const formatCompactLatency = (value) => `${Math.round(Number(value || 0))}ms`
-const formatLatency = (value) => `${Math.round(Number(value || 0))} ms`
+const formatCompactLatency = (value) => {
+  const ms = Math.round(Number(value || 0))
+  return `${ms.toLocaleString('zh-CN')}ms`
+}
+const formatLatency = (value) => {
+  const ms = Math.round(Number(value || 0))
+  return `${ms.toLocaleString('zh-CN')} ms`
+}
 
 const getSuccessRate = (row) => {
   const totalRequests = Number(row?.total_requests || 0)
@@ -431,6 +518,7 @@ const openKeyDetail = async (apiKeyId) => {
 
   keyDetailDialogVisible.value = true
   keyDetailLoading.value = true
+  keyDetailBalance.value = null
   try {
     const [keyData, summaryData] = await Promise.all([
       adminApi.getKey(keyId),
@@ -440,10 +528,48 @@ const openKeyDetail = async (apiKeyId) => {
     keyDetailSummary.value = summaryData || {}
     keyDetailLogsPage.value = 1
     await loadKeyDetailLogs(keyId)
+    loadKeyDetailBalance(keyId)
   } catch (e) {
     ElMessage.error(e.message || '加载 Key 详情失败')
   } finally {
     keyDetailLoading.value = false
+  }
+}
+
+const loadKeyDetailBalance = async (keyId) => {
+  keyDetailBalanceLoading.value = true
+  try {
+    const data = await adminApi.getProviderBalance(keyId)
+    keyDetailBalance.value = data
+  } catch {
+    keyDetailBalance.value = null
+  } finally {
+    keyDetailBalanceLoading.value = false
+  }
+}
+
+const toggleKeyDetailActive = async () => {
+  const keyId = normalizeKeyId(keyDetail.value?.id)
+  if (!keyId || keyDetailToggling.value) return
+  keyDetailToggling.value = true
+  try {
+    const updated = await adminApi.toggleKey(keyId)
+    keyDetail.value = { ...keyDetail.value, is_active: updated.is_active }
+    ElMessage.success(updated.is_active ? 'Key 已启用' : 'Key 已关闭')
+  } catch (e) {
+    ElMessage.error(e.message || '操作失败')
+  } finally {
+    keyDetailToggling.value = false
+  }
+}
+
+const copyKeyPassword = async (password) => {
+  if (!password) return
+  try {
+    await navigator.clipboard.writeText(password)
+    ElMessage.success('密码已复制')
+  } catch {
+    ElMessage.error('复制失败')
   }
 }
 
@@ -501,6 +627,7 @@ const handleKeyDetailDialogClosed = () => {
   keyDetailLogs.value = []
   keyDetailLogsTotal.value = 0
   keyDetailLogsPage.value = 1
+  keyDetailBalance.value = null
 }
 
 const getStatusLabel = (status) => {
@@ -525,6 +652,7 @@ const summary = ref({
   total_tokens: 0,
   prompt_tokens: 0,
   completion_tokens: 0,
+  cache_tokens: 0,
   avg_latency_ms: 0,
   avg_upstream_latency_ms: 0,
   avg_cpa_overhead_ms: 0,
@@ -533,43 +661,43 @@ const summary = ref({
 const summaryCards = computed(() => [
   {
     label: '总请求数',
-    value: summary.value.total_requests,
+    value: Number(summary.value.total_requests || 0).toLocaleString('zh-CN'),
     hint: '选定时间窗内累计请求次数',
   },
   {
     label: '成功请求',
-    value: summary.value.success_requests,
+    value: Number(summary.value.success_requests || 0).toLocaleString('zh-CN'),
     hint: '返回成功响应的请求数量',
   },
   {
     label: '失败请求',
-    value: summary.value.error_requests,
+    value: Number(summary.value.error_requests || 0).toLocaleString('zh-CN'),
     hint: '命中错误状态的请求数量',
   },
   {
     label: '进行中请求',
-    value: summary.value.in_progress_requests,
+    value: Number(summary.value.in_progress_requests || 0).toLocaleString('zh-CN'),
     hint: '仍在处理或尚未完成的请求',
   },
   {
     label: '总 Token',
-    value: summary.value.total_tokens,
+    value: Number(summary.value.total_tokens || 0).toLocaleString('zh-CN'),
     hint: '输入与输出 Token 总和',
   },
   {
     label: '输入 Token',
-    value: summary.value.prompt_tokens,
+    value: Number(summary.value.prompt_tokens || 0).toLocaleString('zh-CN'),
     hint: '请求侧累计输入 Token',
   },
   {
     label: '输出 Token',
-    value: summary.value.completion_tokens,
+    value: Number(summary.value.completion_tokens || 0).toLocaleString('zh-CN'),
     hint: '响应侧累计输出 Token',
   },
   {
-    label: '平均总耗时',
-    value: formatLatencyValue(summary.value.avg_latency_ms),
-    hint: '请求端到端平均耗时',
+    label: '缓存 Token',
+    value: Number(summary.value.cache_tokens || 0).toLocaleString('zh-CN'),
+    hint: '命中缓存的输入 Token 数',
   },
   {
     label: '平均上游耗时',

@@ -28,6 +28,7 @@ class UsageSummary(BaseModel):
     total_tokens: int
     prompt_tokens: int
     completion_tokens: int
+    cache_tokens: int
     avg_latency_ms: float
     avg_upstream_latency_ms: float
     avg_cpa_overhead_ms: float
@@ -46,6 +47,7 @@ class KeyUsageSummary(BaseModel):
     total_tokens: int
     prompt_tokens: int
     completion_tokens: int
+    cache_tokens: int
     avg_latency_ms: float
     avg_upstream_latency_ms: float
     avg_cpa_overhead_ms: float
@@ -62,10 +64,13 @@ class UsageLogResponse(BaseModel):
     """用量记录响应"""
     id: int
     api_key_id: int
+    api_key_name: Optional[str] = None
     model: Optional[str]
+    actual_model: Optional[str] = None
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    cache_tokens: int
     latency_ms: int
     upstream_latency_ms: int
     cpa_overhead_ms: int
@@ -94,6 +99,7 @@ def _empty_metrics() -> dict:
         "total_tokens": 0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
+        "cache_tokens": 0,
         "latency_sum_ms": 0,
         "latency_count": 0,
         "upstream_latency_sum_ms": 0,
@@ -122,6 +128,7 @@ def _format_summary(metrics: dict) -> UsageSummary:
         total_tokens=metrics["total_tokens"],
         prompt_tokens=metrics["prompt_tokens"],
         completion_tokens=metrics["completion_tokens"],
+        cache_tokens=metrics.get("cache_tokens", 0),
         avg_latency_ms=round(metrics["latency_sum_ms"] / latency_count, 2) if latency_count else 0,
         avg_upstream_latency_ms=round(metrics["upstream_latency_sum_ms"] / upstream_count, 2) if upstream_count else 0,
         avg_cpa_overhead_ms=round(metrics["cpa_overhead_sum_ms"] / cpa_count, 2) if cpa_count else 0,
@@ -214,6 +221,7 @@ async def _get_summary_metrics(
             func.coalesce(func.sum(UsageDailySummary.total_tokens), 0).label("total_tokens"),
             func.coalesce(func.sum(UsageDailySummary.prompt_tokens), 0).label("prompt_tokens"),
             func.coalesce(func.sum(UsageDailySummary.completion_tokens), 0).label("completion_tokens"),
+            func.coalesce(func.sum(UsageDailySummary.cache_tokens), 0).label("cache_tokens"),
             func.coalesce(func.sum(UsageDailySummary.latency_sum_ms), 0).label("latency_sum_ms"),
             func.coalesce(func.sum(UsageDailySummary.latency_count), 0).label("latency_count"),
             func.coalesce(func.sum(UsageDailySummary.upstream_latency_sum_ms), 0).label("upstream_latency_sum_ms"),
@@ -240,6 +248,7 @@ async def _get_summary_metrics(
             func.coalesce(func.sum(UsageLog.total_tokens), 0).label("total_tokens"),
             func.coalesce(func.sum(UsageLog.prompt_tokens), 0).label("prompt_tokens"),
             func.coalesce(func.sum(UsageLog.completion_tokens), 0).label("completion_tokens"),
+            func.coalesce(func.sum(UsageLog.cache_tokens), 0).label("cache_tokens"),
             func.coalesce(func.sum(UsageLog.latency_ms), 0).label("latency_sum_ms"),
             func.coalesce(func.sum(case((UsageLog.latency_ms > 0, 1), else_=0)), 0).label("latency_count"),
             func.coalesce(func.sum(case((UsageLog.upstream_latency_ms > 0, UsageLog.upstream_latency_ms), else_=0)), 0).label("upstream_latency_sum_ms"),
@@ -305,6 +314,7 @@ async def get_usage_by_key(
                 func.coalesce(func.sum(UsageDailySummary.total_tokens), 0).label("total_tokens"),
                 func.coalesce(func.sum(UsageDailySummary.prompt_tokens), 0).label("prompt_tokens"),
                 func.coalesce(func.sum(UsageDailySummary.completion_tokens), 0).label("completion_tokens"),
+                func.coalesce(func.sum(UsageDailySummary.cache_tokens), 0).label("cache_tokens"),
                 func.coalesce(func.sum(UsageDailySummary.latency_sum_ms), 0).label("latency_sum_ms"),
                 func.coalesce(func.sum(UsageDailySummary.latency_count), 0).label("latency_count"),
                 func.coalesce(func.sum(UsageDailySummary.upstream_latency_sum_ms), 0).label("upstream_latency_sum_ms"),
@@ -334,6 +344,7 @@ async def get_usage_by_key(
                 func.coalesce(func.sum(UsageLog.total_tokens), 0).label("total_tokens"),
                 func.coalesce(func.sum(UsageLog.prompt_tokens), 0).label("prompt_tokens"),
                 func.coalesce(func.sum(UsageLog.completion_tokens), 0).label("completion_tokens"),
+                func.coalesce(func.sum(UsageLog.cache_tokens), 0).label("cache_tokens"),
                 func.coalesce(func.sum(UsageLog.latency_ms), 0).label("latency_sum_ms"),
                 func.coalesce(func.sum(case((UsageLog.latency_ms > 0, 1), else_=0)), 0).label("latency_count"),
                 func.coalesce(func.sum(case((UsageLog.upstream_latency_ms > 0, UsageLog.upstream_latency_ms), else_=0)), 0).label("upstream_latency_sum_ms"),
@@ -389,6 +400,7 @@ async def get_usage_by_key(
                 total_tokens=metrics["total_tokens"],
                 prompt_tokens=metrics["prompt_tokens"],
                 completion_tokens=metrics["completion_tokens"],
+                cache_tokens=metrics.get("cache_tokens", 0),
                 avg_latency_ms=round(metrics["latency_sum_ms"] / latency_count, 2) if latency_count else 0,
                 avg_upstream_latency_ms=round(metrics["upstream_latency_sum_ms"] / upstream_count, 2) if upstream_count else 0,
                 avg_cpa_overhead_ms=round(metrics["cpa_overhead_sum_ms"] / cpa_count, 2) if cpa_count else 0,
@@ -482,7 +494,7 @@ async def get_usage_logs(
     auth_info: dict = Depends(verify_admin_key),
 ):
     """获取用量记录列表，仅返回最近 7 天实时明细"""
-    from models import UsageLog
+    from models import ApiKey, UsageLog
 
     effective_user_id = _resolve_user_id(auth_info, user_id)
     normalized_start, normalized_end = usage_rollup_service.normalize_time_range(days, start_time, end_time)
@@ -516,8 +528,31 @@ async def get_usage_logs(
     query = query.order_by(UsageLog.request_time.desc()).offset(offset_value).limit(limit_value)
     logs = (await db.execute(query)).scalars().all()
 
+    key_ids = sorted({int(log.api_key_id) for log in logs if log.api_key_id})
+    key_name_map = {}
+    if key_ids:
+        key_result = await db.execute(select(ApiKey.id, ApiKey.name).where(ApiKey.id.in_(key_ids)))
+        key_name_map = {int(row.id): row.name for row in key_result.all()}
+
+    items = []
+    from config import export_config as _export_config
+    show_actual = bool(_export_config.get("show_actual_model", False))
+    is_admin_request = auth_info.get("is_admin", False)
+
+    for log in logs:
+        item = UsageLogResponse.model_validate(log)
+        item.api_key_name = key_name_map.get(int(log.api_key_id)) or f"Key {log.api_key_id}"
+        actual = getattr(log, "actual_model", None) or item.model
+        if is_admin_request and show_actual and actual and actual != item.model:
+            # 管理员且开启显示：格式为 请求模型/映射模型
+            item.actual_model = actual
+        else:
+            # 其他情况：model 显示原始请求模型，actual_model 不暴露
+            item.actual_model = None
+        items.append(item)
+
     return {
-        "items": [UsageLogResponse.model_validate(log) for log in logs],
+        "items": items,
         "total": total,
         "page": page_value,
         "limit": limit_value,

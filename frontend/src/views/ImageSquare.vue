@@ -620,12 +620,27 @@
       <div v-loading="imageKeyDetailLoading" class="key-detail-dialog">
         <el-descriptions :column="2" border>
           <el-descriptions-item label="Key ID">{{ imageKeyDetail.id || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="名称">{{ imageKeyDetail.name || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="名称">
+            <span>{{ imageKeyDetail.name || '-' }}</span>
+            <el-button
+              v-if="imageKeyDetail.password"
+              link
+              size="small"
+              style="margin-left: 6px; padding: 0"
+              title="复制登录密码"
+              @click="copyKeyPassword(imageKeyDetail.password)"
+            ><el-icon><View /></el-icon></el-button>
+          </el-descriptions-item>
           <el-descriptions-item label="提供商">{{ imageKeyDetail.provider || '-' }}</el-descriptions-item>
           <el-descriptions-item label="启用状态">
-            <el-tag :type="imageKeyDetail.is_active ? 'success' : 'danger'" size="small">
-              {{ imageKeyDetail.is_active ? '启用' : '停用' }}
-            </el-tag>
+            <el-button
+              :type="imageKeyDetail.is_active ? 'success' : 'danger'"
+              size="small"
+              :loading="imageKeyDetailToggling"
+              @click="toggleImageKeyDetailActive"
+            >
+              {{ imageKeyDetail.is_active ? '已启用' : '已关闭' }}
+            </el-button>
           </el-descriptions-item>
           <el-descriptions-item label="API Key">{{ imageKeyDetail.api_key_masked || '-' }}</el-descriptions-item>
           <el-descriptions-item label="请求地址">{{ imageKeyDetail.base_url || '-' }}</el-descriptions-item>
@@ -639,7 +654,14 @@
           <el-descriptions-item label="生图成功率">{{ imageKeySuccessRate }}%</el-descriptions-item>
           <el-descriptions-item label="成功次数">{{ formatNumber(imageKeyDetailImageStats.success_count || 0) }}</el-descriptions-item>
           <el-descriptions-item label="失败次数">{{ formatNumber(imageKeyDetailImageStats.error_count || 0) }}</el-descriptions-item>
-          <el-descriptions-item label="最近生图时间">{{ formatTime(imageKeyDetailImageStats.last_generated_at) }}</el-descriptions-item>
+          <el-descriptions-item label="当前余额">
+            <span v-if="imageKeyDetailBalanceLoading" style="color: #909399; font-size: 13px">查询中...</span>
+            <span v-else-if="imageKeyDetailBalance">
+              <span style="color: #10b981; font-weight: 600">${{ imageKeyDetailBalance.balance_usd.toFixed(4) }}</span>
+              <span style="color: #909399; font-size: 12px; margin-left: 8px">已用 ${{ imageKeyDetailBalance.used_usd.toFixed(4) }}</span>
+            </span>
+            <span v-else style="color: #909399; font-size: 13px">-</span>
+          </el-descriptions-item>
           <el-descriptions-item label="生图记录数">{{ formatNumber(imageKeyDetailTasksTotal) }}</el-descriptions-item>
         </el-descriptions>
 
@@ -886,6 +908,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { View } from '@element-plus/icons-vue'
 import { adminApi, authApi } from '../api'
 
 const imageModels = ref([])
@@ -921,6 +944,9 @@ const imageKeyDetailTasksLoading = ref(false)
 const imageKeyDetailTasksPage = ref(1)
 const imageKeyDetailTasksPageSize = ref(10)
 const imageKeyDetailTasksTotal = ref(0)
+const imageKeyDetailBalance = ref(null)
+const imageKeyDetailBalanceLoading = ref(false)
+const imageKeyDetailToggling = ref(false)
 const loadingModels = ref(false)
 const loadingStats = ref(false)
 const loadingModelKeys = ref(false)
@@ -1021,7 +1047,7 @@ const form = reactive({
   size: 'auto',
   quality: 'high',
   count: 1,
-  request_format: 'chat',
+  request_format: 'images',
   mode: 'text_to_image',
   input_images: [],
 })
@@ -1321,7 +1347,7 @@ const promptTipGroups = [
 ]
 
 const selectedModel = computed(() => imageModels.value.find((item) => item.model === form.model))
-const requestFormatOptions = computed(() => selectedModel.value?.request_formats?.length ? selectedModel.value.request_formats : ['chat'])
+const requestFormatOptions = computed(() => selectedModel.value?.request_formats?.length ? selectedModel.value.request_formats : ['images', 'chat'])
 const maxCount = computed(() => Math.max(1, Number(selectedModel.value?.max_count || 1)))
 const successResults = computed(() => (currentTask.value?.results || []).filter((item) => item.status === 'success' && imageSrc(item)))
 const previewImages = computed(() => successResults.value.map((item) => imageSrc(item)).filter(Boolean))
@@ -1508,8 +1534,13 @@ const selectModel = (model) => {
 }
 
 const handleModelChange = () => {
-  if (!requestFormatOptions.value.includes(form.request_format)) {
-    form.request_format = requestFormatOptions.value[0] || 'images'
+  const opts = requestFormatOptions.value
+  if (!opts.includes(form.request_format)) {
+    // 当前格式不在新模型支持列表里，重新选，优先 images
+    form.request_format = opts.includes('images') ? 'images' : (opts[0] || 'images')
+  } else if (opts.includes('images')) {
+    // 新模型支持 images，始终切换为 images（每次切换模型都优先 images）
+    form.request_format = 'images'
   }
   if (form.count > maxCount.value) {
     form.count = maxCount.value
@@ -2109,6 +2140,7 @@ const openImageKeyDetail = async (apiKeyId) => {
   if (!apiKeyId) return
   imageKeyDetailDialogVisible.value = true
   imageKeyDetailLoading.value = true
+  imageKeyDetailBalance.value = null
   try {
     const keyData = await adminApi.getKey(apiKeyId)
     imageKeyDetail.value = keyData || {}
@@ -2117,10 +2149,49 @@ const openImageKeyDetail = async (apiKeyId) => {
       loadImageKeyStats(apiKeyId),
       loadImageKeyDetailTasks(apiKeyId),
     ])
+    // 异步加载余额，不阻塞弹窗
+    loadImageKeyDetailBalance(apiKeyId)
   } catch (error) {
     ElMessage.error(error.message || '加载 Key 详情失败')
   } finally {
     imageKeyDetailLoading.value = false
+  }
+}
+
+const loadImageKeyDetailBalance = async (keyId) => {
+  imageKeyDetailBalanceLoading.value = true
+  try {
+    const data = await adminApi.getProviderBalance(keyId)
+    imageKeyDetailBalance.value = data
+  } catch {
+    imageKeyDetailBalance.value = null
+  } finally {
+    imageKeyDetailBalanceLoading.value = false
+  }
+}
+
+const toggleImageKeyDetailActive = async () => {
+  const keyId = imageKeyDetail.value?.id
+  if (!keyId || imageKeyDetailToggling.value) return
+  imageKeyDetailToggling.value = true
+  try {
+    const updated = await adminApi.toggleKey(keyId)
+    imageKeyDetail.value = { ...imageKeyDetail.value, is_active: updated.is_active }
+    ElMessage.success(updated.is_active ? 'Key 已启用' : 'Key 已关闭')
+  } catch (e) {
+    ElMessage.error(e.message || '操作失败')
+  } finally {
+    imageKeyDetailToggling.value = false
+  }
+}
+
+const copyKeyPassword = async (password) => {
+  if (!password) return
+  try {
+    await navigator.clipboard.writeText(password)
+    ElMessage.success('密码已复制')
+  } catch {
+    ElMessage.error('复制失败')
   }
 }
 
@@ -2142,6 +2213,7 @@ const handleImageKeyDetailDialogClosed = () => {
   imageKeyDetailTasksTotal.value = 0
   imageKeyDetailTasksPage.value = 1
   imageKeyDetailTasksPageSize.value = 10
+  imageKeyDetailBalance.value = null
 }
 
 const imageSizeText = (item) => {
@@ -2478,7 +2550,12 @@ watch(() => form.mode, (value) => {
 
 watch(requestFormatOptions, () => {
   if (!requestFormatOptions.value.includes(form.request_format)) {
-    form.request_format = requestFormatOptions.value[0] || 'images'
+    form.request_format = requestFormatOptions.value.includes('images')
+      ? 'images'
+      : (requestFormatOptions.value[0] || 'images')
+  } else if (requestFormatOptions.value.includes('images')) {
+    // 模型切换后，只要新模型支持 images，始终优先切换为 images
+    form.request_format = 'images'
   }
 })
 

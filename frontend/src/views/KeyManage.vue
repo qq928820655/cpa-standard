@@ -151,20 +151,33 @@
         >
         <el-table-column type="selection" width="34" />
         <el-table-column prop="id" label="ID" width="62" sortable="custom" />
-        <el-table-column prop="name" label="名称" width="102" show-overflow-tooltip sortable="custom" />
-        <el-table-column prop="provider" label="提供商" width="100" sortable="custom">
+        <el-table-column prop="name" label="名称" width="102" show-overflow-tooltip sortable="custom">
+          <template #default="{ row }">
+            <el-button link type="primary" style="padding: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap" @click="openKeyDetail(row.id)">
+              {{ row.name }}
+            </el-button>
+          </template>
+        </el-table-column>
+        <el-table-column prop="provider" label="提供商" width="91" sortable="custom">
           <template #default="{ row }">
             <el-tag :type="getProviderType(row.provider)" size="small">
               {{ row.provider }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="api_key_masked" label="API Key" width="152" show-overflow-tooltip>
+        <el-table-column prop="api_type" label="类型" width="80" align="center">
+          <template #default="{ row }">
+            <el-tag :type="getApiTypeTagType(row.api_type)" size="small">
+              {{ getApiTypeLabel(row.api_type) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="api_key_masked" label="API Key" width="127" show-overflow-tooltip>
           <template #default="{ row }">
             <code class="code-cell">{{ row.api_key_masked }}</code>
           </template>
         </el-table-column>
-        <el-table-column prop="base_url" label="请求地址" width="163">
+        <el-table-column prop="base_url" label="请求地址" width="152">
           <template #default="{ row }">
             <el-tooltip
               v-if="row.base_url"
@@ -183,8 +196,8 @@
             <span v-else>-</span>
           </template>
         </el-table-column>
-        <el-table-column prop="weight" label="权重" width="75" align="center" sortable="custom" />
-        <el-table-column label="支持模型" width="169">
+        <el-table-column prop="weight" label="权重" width="74" align="center" sortable="custom" />
+        <el-table-column label="支持模型" width="141">
           <template #default="{ row }">
             <span v-if="!row.supported_models?.length">全部模型</span>
             <div v-else class="model-cell">
@@ -209,7 +222,7 @@
             </div>
           </template>
         </el-table-column>
-        <el-table-column prop="is_active" label="状态" width="95" align="center" sortable="custom">
+        <el-table-column prop="is_active" label="状态" width="75" align="center" sortable="custom">
           <template #default="{ row }">
             <div class="status-cell">
               <el-switch
@@ -234,7 +247,12 @@
           <template #default="{ row }">
             <div class="check-result-cell">
               <span v-if="row.check_state === 'checking'" class="check-result-pending">检测中...</span>
-              <span v-else-if="row.check_state === 'success'" class="check-result-success">{{ formatCheckLatency(row.check_latency_ms) }}</span>
+              <template v-else-if="row.check_state === 'success'">
+                <span v-if="row.check_mode === 'balance'" class="check-result-success">
+                  ${{ Number(row.check_balance_usd || 0).toFixed(4) }}
+                </span>
+                <span v-else class="check-result-success">{{ formatCheckLatency(row.check_latency_ms) }}</span>
+              </template>
               <el-button
                 v-else-if="row.check_state === 'error'"
                 type="danger"
@@ -333,6 +351,26 @@
             placeholder="留空表示不修改请求地址"
           />
         </el-form-item>
+        <el-form-item label="提供商">
+          <el-select
+            v-model="batchNewProvider"
+            clearable
+            filterable
+            allow-create
+            placeholder="留空表示不修改提供商"
+            style="width: 100%"
+          >
+            <el-option v-for="item in providerOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="API 类型">
+          <el-radio-group v-model="batchApiTypeMode" class="batch-mode-group">
+            <el-radio value="keep">不修改</el-radio>
+            <el-radio value="newapi">改为 New API</el-radio>
+            <el-radio value="sub2api">改为 sub2api</el-radio>
+            <el-radio value="other">改为其他</el-radio>
+          </el-radio-group>
+        </el-form-item>
         <el-form-item label="模型调整">
           <el-radio-group v-model="batchModelMode" class="batch-mode-group">
             <el-radio value="keep">不修改</el-radio>
@@ -426,7 +464,17 @@
             </template>
           </div>
         </el-form-item>
-        <el-form-item label="检测模型" required>
+        <el-form-item label="检测模式">
+          <el-radio-group v-model="checkMode">
+            <el-radio value="model">模型检测</el-radio>
+            <el-radio value="balance">余额检测</el-radio>
+          </el-radio-group>
+          <div class="form-tip no-margin" style="margin-top: 4px">
+            <span v-if="checkMode === 'model'">发起真实请求验证模型可用性</span>
+            <span v-else>登录上游账户查询余额（需在系统设置中配置供应商密码）</span>
+          </div>
+        </el-form-item>
+        <el-form-item v-if="checkMode === 'model'" label="检测模型" required>
           <el-input
             v-model="checkTargetModel"
             clearable
@@ -593,8 +641,8 @@
       </el-table>
     </el-dialog>
 
-    <el-dialog v-model="cooldownDialogVisible" title="冷却设置" width="520px">
-      <el-form :model="cooldownForm" label-width="150px">
+    <el-dialog v-model="cooldownDialogVisible" title="冷却设置" width="620px">
+      <el-form :model="cooldownForm" label-width="170px">
         <el-form-item label="429 冷却秒数">
           <el-input-number v-model="cooldownForm.rate_limit_cooldown_seconds" :min="0" :step="30" style="width: 100%" />
         </el-form-item>
@@ -603,6 +651,21 @@
         </el-form-item>
         <el-form-item label="5xx 冷却秒数">
           <el-input-number v-model="cooldownForm.upstream_error_cooldown_seconds" :min="0" :step="30" style="width: 100%" />
+        </el-form-item>
+        <el-form-item label="524 自动继续提供商">
+          <el-select
+            v-model="cooldownForm.cloudflare_524_auto_continue_providers"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            clearable
+            placeholder="默认关闭，可输入或选择提供商"
+            style="width: 100%"
+          >
+            <el-option v-for="item in providerOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+          <div class="form-tip">仅高级场景使用：命中 Cloudflare 524 时使用当前 Key 追加“继续”重试一次；仍失败后再按默认策略冷却并换 Key。</div>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -616,6 +679,7 @@
       v-model="dialogVisible"
       :title="isEdit ? '编辑 API Key' : '添加 API Key'"
       width="500px"
+      align-center
     >
       <el-form :model="form" :rules="rules" ref="formRef" label-width="100px">
         <el-form-item label="名称" prop="name">
@@ -638,6 +702,13 @@
               :value="item.value"
               :label="item.label"
             />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="API 类型">
+          <el-select v-model="form.api_type" placeholder="选择 API 类型" style="width: 100%">
+            <el-option label="New API" value="newapi" />
+            <el-option label="sub2api" value="sub2api" />
+            <el-option label="其他" value="other" />
           </el-select>
         </el-form-item>
         <el-form-item label="API Key" prop="api_key">
@@ -717,9 +788,22 @@
             </el-select>
           </div>
         </el-form-item>
-        <el-form-item label="备注">
-          <el-input v-model="form.remark" type="textarea" rows="2" placeholder="可选备注" />
-        </el-form-item>
+        <el-collapse class="form-extra-collapse">
+          <el-collapse-item name="extra">
+            <template #title>
+              <span style="font-size: 13px; color: var(--cpa-text-secondary)">高级配置（备注 / 登录密码 / 网页网址）</span>
+            </template>
+            <el-form-item label="登录密码" style="margin-top: 8px">
+              <el-input v-model="form.password" type="password" show-password placeholder="留空则使用系统设置中的供应商默认密码" />
+            </el-form-item>
+            <el-form-item label="网页网址">
+              <el-input v-model="form.wz_url" placeholder="留空则使用请求地址（余额查询、图片回填等）" />
+            </el-form-item>
+            <el-form-item label="备注">
+              <el-input v-model="form.remark" type="textarea" rows="2" placeholder="可选备注" />
+            </el-form-item>
+          </el-collapse-item>
+        </el-collapse>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
@@ -733,13 +817,122 @@
         </el-button>
       </template>
     </el-dialog>
+
+    <!-- Key 详情弹窗 -->
+    <el-dialog
+      v-model="keyDetailDialogVisible"
+      title="Key 详情"
+      width="960px"
+      @closed="handleKeyDetailDialogClosed"
+    >
+      <div v-loading="keyDetailLoading" class="key-detail-dialog">
+        <el-descriptions :column="2" border>
+          <el-descriptions-item label="Key ID">{{ keyDetailData.id || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="名称">
+            <span>{{ keyDetailData.name || '-' }}</span>
+            <el-button
+              v-if="keyDetailData.password"
+              link
+              size="small"
+              style="margin-left: 6px; padding: 0"
+              :title="'复制登录密码'"
+              @click="copyText(keyDetailData.password).then(() => ElMessage.success('密码已复制')).catch(() => ElMessage.error('复制失败'))"
+            >
+              <el-icon><View /></el-icon>
+            </el-button>
+          </el-descriptions-item>
+          <el-descriptions-item label="提供商">{{ keyDetailData.provider || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="API 类型">{{ getApiTypeLabel(keyDetailData.api_type) }}</el-descriptions-item>
+          <el-descriptions-item label="API Key">{{ keyDetailData.api_key_masked || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="请求地址">{{ keyDetailData.base_url || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="启用状态">
+            <el-button
+              :type="keyDetailData.is_active ? 'success' : 'danger'"
+              size="small"
+              :loading="keyDetailToggling"
+              @click="toggleKeyDetailActive"
+            >
+              {{ keyDetailData.is_active ? '已启用' : '已关闭' }}
+            </el-button>
+          </el-descriptions-item>
+          <el-descriptions-item label="权重">{{ keyDetailData.weight ?? '-' }}</el-descriptions-item>
+          <el-descriptions-item label="总请求数">{{ Number(keyDetailSummary.total_requests || 0).toLocaleString('zh-CN') }}</el-descriptions-item>
+          <el-descriptions-item label="成功率">{{ getKeyDetailSuccessRate() }}%</el-descriptions-item>
+          <el-descriptions-item label="总 Token">{{ formatKeyDetailToken(keyDetailSummary.total_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="输入 Token">{{ formatKeyDetailToken(keyDetailSummary.prompt_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="缓存 Token">{{ formatKeyDetailToken(keyDetailSummary.cache_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="输出 Token">{{ formatKeyDetailToken(keyDetailSummary.completion_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="平均上游耗时">{{ formatKeyDetailLatency(keyDetailSummary.avg_upstream_latency_ms) }}</el-descriptions-item>
+          <el-descriptions-item label="CPA 额外耗时">{{ formatKeyDetailLatency(keyDetailSummary.avg_cpa_overhead_ms) }}</el-descriptions-item>
+          <el-descriptions-item label="账户余额" :span="2">
+            <span v-if="keyDetailBalanceLoading" style="color: #909399; font-size: 13px">查询中...</span>
+            <span v-else-if="keyDetailBalance">
+              <span style="color: #10b981; font-weight: 600">${{ keyDetailBalance.balance_usd.toFixed(4) }}</span>
+              <span style="color: #909399; font-size: 12px; margin-left: 8px">已用 ${{ keyDetailBalance.used_usd.toFixed(4) }}</span>
+            </span>
+            <span v-else style="color: #909399; font-size: 13px">-</span>
+          </el-descriptions-item>
+        </el-descriptions>
+
+        <el-card shadow="never" style="margin-top: 16px">
+          <template #header>
+            <div>
+              <div class="panel-title">最近请求记录</div>
+              <div class="panel-subtitle">查看该 Key 最近命中的请求明细</div>
+            </div>
+          </template>
+          <el-table :data="keyDetailLogs" stripe border size="small" v-loading="keyDetailLogsLoading" max-height="360">
+            <el-table-column prop="id" label="ID" width="72" />
+            <el-table-column prop="model" label="模型" min-width="140" show-overflow-tooltip />
+            <el-table-column prop="prompt_tokens" label="输入 Token" width="90" align="right">
+              <template #default="{ row }">{{ formatKeyDetailCompactToken(row.prompt_tokens) }}</template>
+            </el-table-column>
+            <el-table-column prop="completion_tokens" label="输出 Token" width="90" align="right">
+              <template #default="{ row }">{{ formatKeyDetailCompactToken(row.completion_tokens) }}</template>
+            </el-table-column>
+            <el-table-column prop="cache_tokens" label="缓存 Token" width="90" align="right">
+              <template #default="{ row }">{{ row.cache_tokens ? formatKeyDetailCompactToken(row.cache_tokens) : '-' }}</template>
+            </el-table-column>
+            <el-table-column prop="total_tokens" label="总 Token" width="90" align="right">
+              <template #default="{ row }">{{ formatKeyDetailCompactToken(row.total_tokens) }}</template>
+            </el-table-column>
+            <el-table-column prop="latency_ms" label="总耗时" width="90" align="right">
+              <template #default="{ row }">{{ formatKeyDetailLatency(row.latency_ms) }}</template>
+            </el-table-column>
+            <el-table-column prop="status" label="状态" width="72" align="center">
+              <template #default="{ row }">
+                <el-tag :type="row.status === 'success' ? 'success' : row.status === 'error' ? 'danger' : 'warning'" size="small">
+                  {{ row.status === 'success' ? '成功' : row.status === 'error' ? '失败' : '进行中' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="request_time" label="请求时间" width="118" show-overflow-tooltip />
+          </el-table>
+          <div style="margin-top: 12px; display: flex; justify-content: flex-end">
+            <el-pagination
+              v-model:current-page="keyDetailLogsPage"
+              v-model:page-size="keyDetailLogsPageSize"
+              :page-sizes="[10, 20, 50, 100]"
+              :total="keyDetailLogsTotal"
+              layout="total, sizes, prev, pager, next"
+              @current-change="handleKeyDetailLogsPageChange"
+              @size-change="handleKeyDetailLogsPageSizeChange"
+            />
+          </div>
+        </el-card>
+      </div>
+      <template #footer>
+        <el-button @click="keyDetailDialogVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { computed, ref, reactive, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
-import { adminApi } from '../api'
+import { View } from '@element-plus/icons-vue'
+import { adminApi, statsApi } from '../api'
 
 const KEY_MANAGE_STATE_STORAGE_KEY = 'keyManageViewState'
 const FILTERS_COLLAPSED_KEY = 'keyManageFiltersCollapsed'
@@ -843,12 +1036,15 @@ const batchBaseUrl = ref('')
 const batchModelMode = ref('keep')
 const batchWeightMode = ref('keep')
 const batchFakeIpMode = ref('keep')
+const batchApiTypeMode = ref('keep')
+const batchNewProvider = ref('')
 const batchWeight = ref(1)
 const batchSupportedModels = ref([])
 const customProviders = ref([])
 const keyProviderOptions = ref([])
 const checkTargetModel = ref('')
 const defaultCheckTargetModel = ref('')
+const checkMode = ref('model')  // 'model' | 'balance'
 const latestCheckTasks = ref([])
 const activeCheckTaskId = ref(null)
 const activeCheckTaskSummary = ref(null)
@@ -927,6 +1123,7 @@ const defaultUrls = {
 const form = reactive({
   name: '',
   provider: 'openai',
+  api_type: 'other',
   api_key: '',
   base_url: defaultUrls.openai,
   weight: 1,
@@ -938,12 +1135,15 @@ const form = reactive({
   fake_ip: '',
   supported_models: [],
   remark: '',
+  password: '',
+  wz_url: '',
 })
 
 const cooldownForm = reactive({
   rate_limit_cooldown_seconds: 300,
   auth_failure_cooldown_seconds: 600,
   upstream_error_cooldown_seconds: 120,
+  cloudflare_524_auto_continue_providers: [],
 })
 
 const rules = {
@@ -994,6 +1194,29 @@ const getProviderType = (provider) => {
     custom: 'info',
   }
   return types[provider] || 'info'
+}
+
+const normalizeApiType = (value) => {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return ['newapi', 'sub2api', 'other'].includes(normalized) ? normalized : 'other'
+}
+
+const getApiTypeLabel = (value) => {
+  const labels = {
+    newapi: 'New API',
+    sub2api: 'sub2api',
+    other: '其他',
+  }
+  return labels[normalizeApiType(value)] || labels.other
+}
+
+const getApiTypeTagType = (value) => {
+  const types = {
+    newapi: 'primary',
+    sub2api: 'success',
+    other: 'info',
+  }
+  return types[normalizeApiType(value)] || 'primary'
 }
 
 const buildFilteredModelOptions = (keywordValue) => {
@@ -1131,6 +1354,8 @@ const createDefaultCheckState = () => ({
   check_error_detail: '',
   check_target_model: '',
   check_batch_token: '',
+  check_mode: 'model',
+  check_balance_usd: null,
 })
 
 const normalizeCheckTask = (task) => ({
@@ -1493,6 +1718,7 @@ const fillForm = (data) => {
   Object.assign(form, {
     name: data.name || '',
     provider: data.provider || 'openai',
+    api_type: normalizeApiType(data.api_type),
     api_key: data.api_key || '',
     base_url: data.base_url || defaultUrls[data.provider] || '',
     weight: Number.isFinite(Number(data.weight)) ? Number(data.weight) : 1,
@@ -1504,6 +1730,8 @@ const fillForm = (data) => {
     fake_ip: data.fake_ip || '',
     supported_models: Array.isArray(data.supported_models) ? [...data.supported_models] : [],
     remark: data.remark || '',
+    password: data.password || '',
+    wz_url: data.wz_url || '',
   })
 }
 
@@ -1511,6 +1739,7 @@ const buildKeyConfig = (data) => {
   const config = {
     name: data.name || '',
     provider: data.provider || 'openai',
+    api_type: normalizeApiType(data.api_type),
     api_key: data.api_key || '',
     base_url: data.base_url || defaultUrls[data.provider] || '',
     is_active: typeof data.is_active === 'boolean' ? data.is_active : true,
@@ -1524,6 +1753,8 @@ const buildKeyConfig = (data) => {
       ? [...data.supported_models]
       : null,
     remark: data.remark || '',
+    password: data.password || null,
+    wz_url: data.wz_url || null,
   }
 
   if (data.weight !== undefined && data.weight !== null && data.weight !== '') {
@@ -1650,6 +1881,9 @@ const loadCooldownConfig = async () => {
     rate_limit_cooldown_seconds: Number(result.rate_limit_cooldown_seconds) || 0,
     auth_failure_cooldown_seconds: Number(result.auth_failure_cooldown_seconds) || 0,
     upstream_error_cooldown_seconds: Number(result.upstream_error_cooldown_seconds) || 0,
+    cloudflare_524_auto_continue_providers: Array.isArray(result.cloudflare_524_auto_continue_providers)
+      ? result.cloudflare_524_auto_continue_providers.filter(Boolean)
+      : [],
   })
 }
 
@@ -1781,8 +2015,8 @@ const pageSize = ref(KEY_MANAGE_PAGE_SIZE_OPTIONS.includes(Number(savedKeyManage
 const totalKeys = ref(0)
 const pageSizeOptions = KEY_MANAGE_PAGE_SIZE_OPTIONS
 const keySort = ref({
-  prop: typeof savedKeyManageState.keySort?.prop === 'string' ? savedKeyManageState.keySort.prop : '',
-  order: ['ascending', 'descending', null].includes(savedKeyManageState.keySort?.order) ? savedKeyManageState.keySort.order : null,
+  prop: typeof savedKeyManageState.keySort?.prop === 'string' ? savedKeyManageState.keySort.prop : 'id',
+  order: ['ascending', 'descending', null].includes(savedKeyManageState.keySort?.order) ? (savedKeyManageState.keySort.order || 'ascending') : 'ascending',
 })
 const selectedKeyIds = ref(Array.isArray(savedKeyManageState.selectedKeyIds) ? savedKeyManageState.selectedKeyIds.filter((item) => Number.isInteger(Number(item)) && Number(item) > 0).map((item) => Number(item)) : [])
 const selectedKeyIdSet = computed(() => new Set(selectedKeyIds.value))
@@ -1806,16 +2040,8 @@ const compareKeyValues = (left, right, prop) => {
 }
 
 const sortKeys = (items) => {
-  const result = [...items]
-  const { prop, order } = keySort.value
-  if (!prop || !order) return result
-
-  result.sort((left, right) => {
-    const compareResult = compareKeyValues(left, right, prop)
-    return order === 'ascending' ? compareResult : -compareResult
-  })
-
-  return result
+  // 排序已下推到后端，直接返回后端返回的顺序
+  return [...items]
 }
 
 const syncKeysTableData = () => {
@@ -1840,8 +2066,17 @@ const syncTableSelectionByIds = async () => {
 
 const handleKeySortChange = ({ prop, order }) => {
   keySort.value = { prop, order }
-  syncKeysTableData()
-  syncTableSelectionByIds()
+  resetToFirstPage()
+  loadKeys()
+}
+
+let _loadKeysDebounceTimer = null
+const loadKeysDebounced = (delay = 300) => {
+  if (_loadKeysDebounceTimer) clearTimeout(_loadKeysDebounceTimer)
+  _loadKeysDebounceTimer = setTimeout(() => {
+    _loadKeysDebounceTimer = null
+    loadKeys()
+  }, delay)
 }
 
 const loadKeys = async () => {
@@ -1850,6 +2085,8 @@ const loadKeys = async () => {
     const params = {
       page: currentPage.value,
       limit: pageSize.value,
+      sort_by: keySort.value.prop || 'id',
+      sort_order: keySort.value.order || 'ascending',
     }
     const providers = normalizeModelNames(filterProviders.value)
     const models = normalizeModelNames(filterModels.value)
@@ -1925,6 +2162,7 @@ const showAddDialog = () => {
   fillForm({
     name: '',
     provider: 'openai',
+    api_type: 'other',
     api_key: '',
     base_url: defaultUrls.openai,
     weight: 1,
@@ -1936,6 +2174,8 @@ const showAddDialog = () => {
     fake_ip: '',
     supported_models: [],
     remark: '',
+    password: '',
+    wz_url: '',
   })
   dialogVisible.value = true
 }
@@ -1948,6 +2188,7 @@ const showEditDialog = (row) => {
   fillForm({
     name: row.name,
     provider: row.provider,
+    api_type: normalizeApiType(row.api_type),
     api_key: row.api_key,
     base_url: row.base_url,
     weight: row.weight,
@@ -1959,6 +2200,8 @@ const showEditDialog = (row) => {
     fake_ip: row.fake_ip || '',
     supported_models: row.supported_models || [],
     remark: row.remark || '',
+    password: row.password || '',
+    wz_url: row.wz_url || '',
   })
   dialogVisible.value = true
 }
@@ -1971,6 +2214,7 @@ const openDuplicateDialog = (row) => {
   fillForm({
     name: createDuplicateName(row.name),
     provider: row.provider,
+    api_type: normalizeApiType(row.api_type),
     api_key: row.api_key,
     base_url: row.base_url,
     weight: row.weight,
@@ -1982,6 +2226,8 @@ const openDuplicateDialog = (row) => {
     fake_ip: row.fake_ip || '',
     supported_models: row.supported_models || [],
     remark: row.remark || '',
+    password: row.password || '',
+    wz_url: row.wz_url || '',
   })
   dialogVisible.value = true
 }
@@ -2053,11 +2299,13 @@ const exportConfigs = async () => {
 }
 
 const resetBatchForm = () => {
-  batchScope.value = hasFilteredConditions.value ? 'filtered' : 'selected'
+  batchScope.value = selectedKeys.value.length ? 'selected' : (hasFilteredConditions.value ? 'filtered' : 'selected')
   batchBaseUrl.value = ''
+  batchNewProvider.value = ''
   batchModelMode.value = 'keep'
   batchWeightMode.value = 'keep'
   batchFakeIpMode.value = 'keep'
+  batchApiTypeMode.value = 'keep'
   batchWeight.value = 1
   batchSupportedModels.value = []
   batchModelKeyword.value = ''
@@ -2228,22 +2476,102 @@ const batchCheckEndpoints = async () => {
   }
 }
 
+const batchCheckBalance = async () => {
+  if (!validateBatchScope()) return
+
+  const payload = buildBatchScopePayload()
+  const currentPageRows = getCurrentPageRowsForCheck(payload)
+
+  if (!currentPageRows.length) {
+    ElMessage.warning('当前页没有可检测的 Key')
+    return
+  }
+
+  const batchToken = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  currentCheckBatchToken.value = batchToken
+  checkDialogVisible.value = false
+  batchChecking.value = true
+
+  // 标记为检测中
+  currentPageRows.forEach((row) => {
+    Object.assign(row, {
+      ...createDefaultCheckState(),
+      check_state: 'checking',
+      check_mode: 'balance',
+      check_batch_token: batchToken,
+    })
+  })
+
+  const concurrency = 4
+  let cursor = 0
+
+  const worker = async () => {
+    while (cursor < currentPageRows.length) {
+      const idx = cursor++
+      const row = currentPageRows[idx]
+      if (!row || row.check_batch_token !== batchToken) continue
+      try {
+        const data = await adminApi.getProviderBalance(row.id)
+        if (row.check_batch_token !== batchToken) return
+        Object.assign(row, {
+          check_state: 'success',
+          check_mode: 'balance',
+          check_balance_usd: data.balance_usd,
+          check_latency_ms: 0,
+          check_error_category: '',
+          check_error_detail: '',
+        })
+      } catch (e) {
+        if (row.check_batch_token !== batchToken) return
+        const msg = e?.response?.data?.detail || e?.message || '查询失败'
+        Object.assign(row, {
+          check_state: 'error',
+          check_mode: 'balance',
+          check_balance_usd: null,
+          check_error_category: 'request_error',
+          check_error_detail: msg,
+        })
+      }
+    }
+  }
+
+  try {
+    await Promise.all(Array.from({ length: Math.min(concurrency, currentPageRows.length) }, () => worker()))
+    const completedRows = currentPageRows.filter((r) => r.check_batch_token === batchToken)
+    const successCount = completedRows.filter((r) => r.check_state === 'success').length
+    const errorCount = completedRows.filter((r) => r.check_state === 'error').length
+    ElMessage.success(`余额检测完成：成功 ${successCount} 个，失败 ${errorCount} 个`)
+  } catch (e) {
+    ElMessage.error(e.message || '余额检测失败')
+  } finally {
+    if (currentCheckBatchToken.value === batchToken) currentCheckBatchToken.value = ''
+    batchChecking.value = false
+  }
+}
+
 const submitBatchCheck = async () => {
-  await batchCheckEndpoints()
+  if (checkMode.value === 'balance') {
+    await batchCheckBalance()
+  } else {
+    await batchCheckEndpoints()
+  }
 }
 
 const submitBatchUpdate = async () => {
   if (!validateBatchScope()) return
 
   const normalizedBaseUrl = typeof batchBaseUrl.value === 'string' ? batchBaseUrl.value.trim() : ''
+  const normalizedNewProvider = typeof batchNewProvider.value === 'string' ? batchNewProvider.value.trim() : ''
   const normalizedBatchModels = normalizeModelNames(batchSupportedModels.value || [])
   const shouldUpdateBaseUrl = hasBatchBaseUpdate()
   const shouldUpdateModels = hasBatchModelUpdate()
   const shouldUpdateWeight = hasBatchWeightUpdate()
   const shouldUpdateFakeIp = hasBatchFakeIpUpdate()
+  const shouldUpdateProvider = !!normalizedNewProvider
+  const shouldUpdateApiType = batchApiTypeMode.value !== 'keep'
   const normalizedWeight = shouldUpdateWeight ? Number(batchWeight.value) : null
 
-  if (!shouldUpdateBaseUrl && !shouldUpdateModels && !shouldUpdateWeight && !shouldUpdateFakeIp) {
+  if (!shouldUpdateBaseUrl && !shouldUpdateModels && !shouldUpdateWeight && !shouldUpdateFakeIp && !shouldUpdateProvider && !shouldUpdateApiType) {
     ElMessage.warning('请至少选择一项要调整的内容')
     return
   }
@@ -2268,13 +2596,19 @@ const submitBatchUpdate = async () => {
     let modelResult = null
     let fakeIpResult = null
 
-    if (shouldUpdateBaseUrl || shouldUpdateModels || shouldUpdateWeight) {
+    if (shouldUpdateBaseUrl || shouldUpdateModels || shouldUpdateWeight || shouldUpdateProvider || shouldUpdateApiType) {
       const payload = buildBatchScopePayload()
       if (shouldUpdateBaseUrl) {
         payload.base_url = normalizedBaseUrl
       }
+      if (shouldUpdateProvider) {
+        payload.new_provider = normalizedNewProvider
+      }
       if (shouldUpdateWeight) {
         payload.weight = normalizedWeight
+      }
+      if (shouldUpdateApiType) {
+        payload.api_type = normalizeApiType(batchApiTypeMode.value)
       }
       if (batchModelMode.value === 'replace') {
         payload.supported_models = normalizedBatchModels
@@ -2337,6 +2671,7 @@ const submitCooldownConfig = async () => {
       rate_limit_cooldown_seconds: Number(cooldownForm.rate_limit_cooldown_seconds) || 0,
       auth_failure_cooldown_seconds: Number(cooldownForm.auth_failure_cooldown_seconds) || 0,
       upstream_error_cooldown_seconds: Number(cooldownForm.upstream_error_cooldown_seconds) || 0,
+      cloudflare_524_auto_continue_providers: normalizeModelNames(cooldownForm.cloudflare_524_auto_continue_providers),
     })
     ElMessage.success('冷却设置已保存')
     cooldownDialogVisible.value = false
@@ -2359,6 +2694,7 @@ const submitForm = async () => {
     const data = {
       ...form,
       provider: typeof form.provider === 'string' ? form.provider.trim() : form.provider,
+      api_type: normalizeApiType(form.api_type),
       base_url: typeof form.base_url === 'string' ? form.base_url.trim() : form.base_url,
       weight: Number.isFinite(Number(form.weight)) ? Number(form.weight) : 1,
       enable_proxy: enableProxy,
@@ -2368,6 +2704,7 @@ const submitForm = async () => {
       enable_fake_ip: enableFakeIp,
       fake_ip: enableFakeIp ? ((typeof form.fake_ip === 'string' ? form.fake_ip.trim() : form.fake_ip) || randomFakeIp()) : null,
       supported_models: form.supported_models?.length ? normalizeModelNames(form.supported_models) : null,
+      wz_url: (typeof form.wz_url === 'string' ? form.wz_url.trim() : form.wz_url) || null,
     }
     syncCustomProviders([data.provider])
     if (isEdit.value) {
@@ -2411,6 +2748,7 @@ const submitAndContinue = async () => {
     const data = {
       ...form,
       provider: trimmedProvider,
+      api_type: normalizeApiType(form.api_type),
       base_url: typeof form.base_url === 'string' ? form.base_url.trim() : form.base_url,
       weight: Number.isFinite(Number(form.weight)) ? Number(form.weight) : 1,
       enable_proxy: enableProxy,
@@ -2420,17 +2758,20 @@ const submitAndContinue = async () => {
       enable_fake_ip: enableFakeIp,
       fake_ip: enableFakeIp ? ((typeof form.fake_ip === 'string' ? form.fake_ip.trim() : form.fake_ip) || randomFakeIp()) : null,
       supported_models: form.supported_models?.length ? normalizeModelNames(form.supported_models) : null,
+      wz_url: (typeof form.wz_url === 'string' ? form.wz_url.trim() : form.wz_url) || null,
     }
     syncCustomProviders([data.provider])
     await adminApi.createKey(data)
     ElMessage.success('添加成功，可继续添加')
     // 重置表单，保留 provider 和 base_url 便于连续添加
     const keepProvider = form.provider
+    const keepApiType = form.api_type
     const keepBaseUrl = form.base_url
     const keepFakeIp = form.fake_ip
     formRef.value.resetFields()
     form.name = createDuplicateName(trimmedName)
     form.provider = keepProvider
+    form.api_type = keepApiType
     form.base_url = keepBaseUrl
     form.fake_ip = keepFakeIp
     resetToFirstPage()
@@ -2446,11 +2787,11 @@ const submitAndContinue = async () => {
 
 const fillImportTemplate = () => {
   importText.value = [
-    JSON.stringify({ name: 'openai-1', provider: 'openai', api_key: 'sk-xxx', base_url: 'https://api.openai.com', remark: '模板示例' }),
-    JSON.stringify({ name: 'claude-1', provider: 'claude', api_key: 'sk-ant-xxx', base_url: 'https://api.anthropic.com', supported_models: ['claude-3-7-sonnet-20250219'], remark: '模板示例' }),
-    JSON.stringify({ name: 'openai-proxy-1', provider: 'openai', api_key: 'sk-xxx', base_url: 'https://api.openai.com', enable_proxy: true, proxy_url: 'http://127.0.0.1:7890', proxy_username: '', proxy_password: '', remark: '代理模板示例' }),
-    JSON.stringify({ name: 'openai-fake-ip-1', provider: 'openai', api_key: 'sk-xxx', base_url: 'https://api.openai.com', enable_fake_ip: true, fake_ip: '203.0.113.10', remark: '伪装 IP 模板示例' }),
-    JSON.stringify({ name: 'openai-auto-fake-ip-1', provider: 'openai', api_key: 'sk-xxx', base_url: 'https://api.openai.com', enable_fake_ip: true, fake_ip: null, remark: '自动分配伪装 IP 示例' }),
+    JSON.stringify({ name: 'openai-1', provider: 'openai', api_type: 'newapi', api_key: 'sk-xxx', base_url: 'https://api.openai.com', remark: 'New API 模板示例' }),
+    JSON.stringify({ name: 'sub2api-1', provider: 'openai', api_type: 'sub2api', api_key: 'sk-xxx', base_url: 'https://api.example.com', password: 'login-password', wz_url: 'https://example.com', remark: 'sub2api 模板示例' }),
+    JSON.stringify({ name: 'openai-proxy-1', provider: 'openai', api_type: 'newapi', api_key: 'sk-xxx', base_url: 'https://api.openai.com', enable_proxy: true, proxy_url: 'http://127.0.0.1:7890', proxy_username: '', proxy_password: '', remark: '代理模板示例' }),
+    JSON.stringify({ name: 'openai-fake-ip-1', provider: 'openai', api_type: 'newapi', api_key: 'sk-xxx', base_url: 'https://api.openai.com', enable_fake_ip: true, fake_ip: '203.0.113.10', remark: '伪装 IP 模板示例' }),
+    JSON.stringify({ name: 'openai-auto-fake-ip-1', provider: 'openai', api_type: 'newapi', api_key: 'sk-xxx', base_url: 'https://api.openai.com', enable_fake_ip: true, fake_ip: null, remark: '自动分配伪装 IP 示例' }),
   ].join('\n')
 }
 
@@ -2485,8 +2826,10 @@ const submitImport = async () => {
         : null
       const enableProxy = Boolean(item.enable_proxy)
       const enableFakeIp = Boolean(item.enable_fake_ip)
+      const rawWzUrl = item.wz_url ?? item.wzurl ?? item.wzUrl ?? item.web_url ?? item.webUrl
       return {
         ...item,
+        api_type: normalizeApiType(item.api_type),
         enable_proxy: enableProxy,
         proxy_url: enableProxy ? (typeof item.proxy_url === 'string' ? item.proxy_url.trim() : item.proxy_url) : null,
         proxy_username: enableProxy ? (typeof item.proxy_username === 'string' ? item.proxy_username.trim() : item.proxy_username) : null,
@@ -2494,6 +2837,7 @@ const submitImport = async () => {
         enable_fake_ip: enableFakeIp,
         fake_ip: enableFakeIp ? (typeof item.fake_ip === 'string' ? item.fake_ip.trim() : item.fake_ip) : null,
         supported_models: supportedModels?.length ? supportedModels : null,
+        wz_url: typeof rawWzUrl === 'string' ? rawWzUrl.trim() || null : rawWzUrl || null,
       }
     })
     const result = await adminApi.importKeys(items)
@@ -2610,6 +2954,140 @@ onBeforeUnmount(() => {
   stopActiveCheckTaskPolling()
   stopCooldownTimer()
 })
+
+// ── Key 详情弹窗 ──────────────────────────────────────────
+const keyDetailDialogVisible = ref(false)
+const keyDetailLoading = ref(false)
+const keyDetailData = ref({})
+const keyDetailSummary = ref({})
+const keyDetailLogs = ref([])
+const keyDetailLogsLoading = ref(false)
+const keyDetailLogsPage = ref(1)
+const keyDetailLogsPageSize = ref(20)
+const keyDetailLogsTotal = ref(0)
+const keyDetailBalance = ref(null)
+const keyDetailBalanceLoading = ref(false)
+const keyDetailToggling = ref(false)
+
+const formatKeyDetailToken = (value) => {
+  const num = Number(value || 0)
+  if (num >= 1_000_000) {
+    return `${(num / 1_000_000).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} M`
+  }
+  return num.toLocaleString('zh-CN')
+}
+
+const formatKeyDetailCompactToken = (value) => {
+  const num = Number(value || 0)
+  if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(1)}M`
+  if (num >= 1_000) return `${(num / 1_000).toFixed(1)}k`
+  return `${num}`
+}
+
+const formatKeyDetailLatency = (value) => {
+  const ms = Math.round(Number(value || 0))
+  return `${ms.toLocaleString('zh-CN')} ms`
+}
+
+const getKeyDetailSuccessRate = () => {
+  const total = Number(keyDetailSummary.value?.total_requests || 0)
+  const success = Number(keyDetailSummary.value?.success_requests || 0)
+  if (!total) return 0
+  return Math.round((success / total) * 100)
+}
+
+const loadKeyDetailLogs = async (keyId) => {
+  if (!keyId) return
+  keyDetailLogsLoading.value = true
+  try {
+    const result = await statsApi.getLogs({
+      api_key_id: keyId,
+      days: 7,
+      page: keyDetailLogsPage.value,
+      limit: keyDetailLogsPageSize.value,
+    })
+    keyDetailLogs.value = Array.isArray(result) ? result : (result.items || [])
+    keyDetailLogsTotal.value = Array.isArray(result) ? result.length : (result.total || 0)
+  } catch (e) {
+    ElMessage.error(e.message || '加载请求记录失败')
+  } finally {
+    keyDetailLogsLoading.value = false
+  }
+}
+
+const loadKeyDetailBalance = async (keyId) => {
+  keyDetailBalanceLoading.value = true
+  try {
+    const data = await adminApi.getProviderBalance(keyId)
+    keyDetailBalance.value = data
+  } catch {
+    keyDetailBalance.value = null
+  } finally {
+    keyDetailBalanceLoading.value = false
+  }
+}
+
+const openKeyDetail = async (keyId) => {
+  if (!keyId) return
+  keyDetailDialogVisible.value = true
+  keyDetailLoading.value = true
+  keyDetailBalance.value = null
+  try {
+    const [keyData, summaryData] = await Promise.all([
+      adminApi.getKey(keyId),
+      statsApi.getSummary({ api_key_id: keyId, days: 7 }),
+    ])
+    keyDetailData.value = keyData || {}
+    keyDetailSummary.value = summaryData || {}
+    keyDetailLogsPage.value = 1
+    await loadKeyDetailLogs(keyId)
+    loadKeyDetailBalance(keyId)
+  } catch (e) {
+    ElMessage.error(e.message || '加载 Key 详情失败')
+  } finally {
+    keyDetailLoading.value = false
+  }
+}
+
+const toggleKeyDetailActive = async () => {
+  const keyId = keyDetailData.value?.id
+  if (!keyId || keyDetailToggling.value) return
+  keyDetailToggling.value = true
+  try {
+    const updated = await adminApi.toggleKey(keyId)
+    keyDetailData.value = { ...keyDetailData.value, is_active: updated.is_active }
+    // 同步主表数据
+    const idx = keys.value.findIndex((k) => k.id === keyId)
+    if (idx >= 0) keys.value[idx] = { ...keys.value[idx], is_active: updated.is_active }
+    syncKeysTableData()
+    ElMessage.success(updated.is_active ? 'Key 已启用' : 'Key 已关闭')
+  } catch (e) {
+    ElMessage.error(e.message || '操作失败')
+  } finally {
+    keyDetailToggling.value = false
+  }
+}
+
+const handleKeyDetailLogsPageChange = (page) => {
+  keyDetailLogsPage.value = page
+  loadKeyDetailLogs(keyDetailData.value?.id)
+}
+
+const handleKeyDetailLogsPageSizeChange = (size) => {
+  keyDetailLogsPageSize.value = size
+  keyDetailLogsPage.value = 1
+  loadKeyDetailLogs(keyDetailData.value?.id)
+}
+
+const handleKeyDetailDialogClosed = () => {
+  keyDetailData.value = {}
+  keyDetailSummary.value = {}
+  keyDetailLogs.value = []
+  keyDetailLogsTotal.value = 0
+  keyDetailLogsPage.value = 1
+  keyDetailBalance.value = null
+}
+// ─────────────────────────────────────────────────────────
 </script>
 
 <style scoped>
@@ -3088,4 +3566,25 @@ code {
   width: 100%;
 }
 
+.form-extra-collapse {
+  border: none;
+  margin-bottom: 4px;
+}
+
+.form-extra-collapse :deep(.el-collapse-item__header) {
+  border: none;
+  background: transparent;
+  height: 32px;
+  line-height: 32px;
+  padding: 0 2px;
+}
+
+.form-extra-collapse :deep(.el-collapse-item__wrap) {
+  border: none;
+  background: transparent;
+}
+
+.form-extra-collapse :deep(.el-collapse-item__content) {
+  padding: 4px 0 0 0;
+}
 </style>

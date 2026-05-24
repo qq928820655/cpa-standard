@@ -1,10 +1,10 @@
-"""
+﻿"""
 登录认证路由
 """
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel
@@ -76,6 +76,13 @@ class UserCreateRequest(BaseModel):
     username: str
     password: str
     supported_models: list[str] | None = None
+    daily_token_limit: int | None = None
+    weekly_token_limit: int | None = None
+    monthly_token_limit: int | None = None
+    quota_exceeded_mode: str | None = None
+    quota_exceeded_message: str | None = None
+    model_mapping: dict[str, Any] | None = None
+    show_quota_to_user: bool = False
 
 
 class UserUpdateRequest(BaseModel):
@@ -83,6 +90,16 @@ class UserUpdateRequest(BaseModel):
     password: str | None = None
     role: str | None = None
     supported_models: list[str] | None = None
+    daily_token_limit: int | None = None
+    weekly_token_limit: int | None = None
+    monthly_token_limit: int | None = None
+    clear_daily_limit: bool = False
+    clear_weekly_limit: bool = False
+    clear_monthly_limit: bool = False
+    quota_exceeded_mode: str | None = None
+    quota_exceeded_message: str | None = None
+    model_mapping: dict[str, Any] | None = None
+    show_quota_to_user: bool | None = None
 
 
 class UserResponse(BaseModel):
@@ -91,6 +108,13 @@ class UserResponse(BaseModel):
     role: str
     api_key: str | None
     supported_models: list[str]
+    daily_token_limit: int | None
+    weekly_token_limit: int | None
+    monthly_token_limit: int | None
+    quota_exceeded_mode: str | None
+    quota_exceeded_message: str | None
+    model_mapping: dict[str, Any]
+    show_quota_to_user: bool
     created_at: datetime | None
 
 
@@ -114,6 +138,20 @@ def _parse_supported_models(raw: str | None) -> list[str]:
     return []
 
 
+def _parse_model_mapping(raw: str | None) -> dict:
+    """解析 model_mapping JSON 字段"""
+    if not raw:
+        return {}
+    try:
+        mapping = json.loads(raw)
+        if isinstance(mapping, dict):
+            # value 可以是字符串（直接映射）或列表（阶梯映射），保留原始类型
+            return {str(k): v for k, v in mapping.items() if k and v is not None}
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return {}
+
+
 def _user_to_response(user: AdminUser) -> UserResponse:
     """将 AdminUser 转换为 UserResponse"""
     return UserResponse(
@@ -122,6 +160,13 @@ def _user_to_response(user: AdminUser) -> UserResponse:
         role=user.role or "user",
         api_key=user.api_key,
         supported_models=_parse_supported_models(user.supported_models),
+        daily_token_limit=getattr(user, "daily_token_limit", None),
+        weekly_token_limit=getattr(user, "weekly_token_limit", None),
+        monthly_token_limit=getattr(user, "monthly_token_limit", None),
+        quota_exceeded_mode=getattr(user, "quota_exceeded_mode", None) or "normal",
+        quota_exceeded_message=getattr(user, "quota_exceeded_message", None),
+        model_mapping=_parse_model_mapping(getattr(user, "model_mapping", None)),
+        show_quota_to_user=bool(getattr(user, "show_quota_to_user", False)),
         created_at=user.created_at,
     )
 
@@ -440,6 +485,13 @@ async def create_user(
         role="user",
         api_key=AdminUser.generate_api_key(),
         supported_models=supported_models_json,
+        daily_token_limit=req.daily_token_limit,
+        weekly_token_limit=req.weekly_token_limit,
+        monthly_token_limit=req.monthly_token_limit,
+        quota_exceeded_mode=req.quota_exceeded_mode or "normal",
+        quota_exceeded_message=req.quota_exceeded_message,
+        model_mapping=json.dumps(req.model_mapping, ensure_ascii=False) if req.model_mapping else None,
+        show_quota_to_user=int(req.show_quota_to_user),
     )
     user.set_password(req.password)
     db.add(user)
@@ -492,6 +544,31 @@ async def update_user(
 
     if req.supported_models is not None:
         user.supported_models = json.dumps(req.supported_models, ensure_ascii=False)
+
+    # 限额字段：有值则更新，clear_xxx=True 则清空
+    if req.clear_daily_limit:
+        user.daily_token_limit = None
+    elif req.daily_token_limit is not None:
+        user.daily_token_limit = req.daily_token_limit
+
+    if req.clear_weekly_limit:
+        user.weekly_token_limit = None
+    elif req.weekly_token_limit is not None:
+        user.weekly_token_limit = req.weekly_token_limit
+
+    if req.clear_monthly_limit:
+        user.monthly_token_limit = None
+    elif req.monthly_token_limit is not None:
+        user.monthly_token_limit = req.monthly_token_limit
+
+    if req.quota_exceeded_mode is not None:
+        user.quota_exceeded_mode = req.quota_exceeded_mode
+    if req.quota_exceeded_message is not None:
+        user.quota_exceeded_message = req.quota_exceeded_message or None
+    if req.model_mapping is not None:
+        user.model_mapping = json.dumps(req.model_mapping, ensure_ascii=False) if req.model_mapping else None
+    if req.show_quota_to_user is not None:
+        user.show_quota_to_user = int(req.show_quota_to_user)
 
     await db.commit()
     await db.refresh(user)
