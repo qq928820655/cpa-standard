@@ -3,6 +3,7 @@
 """
 from typing import Optional, Any
 from datetime import datetime
+import hashlib
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy import select
@@ -21,6 +22,16 @@ REQUEST_RETRY_LIMIT = 3
 # 设置较大值确保能遍历足够多的 Key
 PERMANENT_FAILURE_DISABLE_LIMIT = 20
 SESSION_KEY_HEADER = "x-cpa-session-key"
+STICKY_SESSION_HEADERS = (
+    SESSION_KEY_HEADER,
+    "x-session-id",
+    "x-conversation-id",
+    "x-client-id",
+)
+CLAUDE_MESSAGES_NATIVE_PROVIDERS = {"claude", "cc"}
+CLAUDE_MESSAGES_NATIVE_EXCLUDED_PROVIDERS = {"skk"}
+CLAUDE_MESSAGES_NATIVE_PROTOCOL = "anthropic_messages"
+CLAUDE_MODEL_KEYWORDS = ("claude", "sonnet", "opus", "haiku")
 
 
 def log_proxy_hit(path: str, body: dict):
@@ -74,10 +85,26 @@ def append_continue_message(body: Optional[dict]) -> dict:
     return next_body
 
 
-def get_sticky_session_key(headers: dict) -> Optional[str]:
+def get_sticky_session_key(headers: dict, model: Optional[str] = None) -> Optional[str]:
     if not settings.proxy_session_sticky_enabled:
         return None
-    return headers.get(SESSION_KEY_HEADER)
+    for header_name in STICKY_SESSION_HEADERS:
+        header_value = headers.get(header_name)
+        if header_value:
+            return f"{header_name}:{header_value}"
+
+    if not settings.proxy_session_sticky_fallback_enabled:
+        return None
+
+    auth = headers.get("authorization") or headers.get("x-api-key") or ""
+    user_agent = headers.get("user-agent") or ""
+    model_value = model or ""
+    if not auth and not user_agent and not model_value:
+        return None
+
+    raw_key = f"{auth}\n{user_agent}\n{model_value}"
+    digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    return f"fallback:{digest}"
 
 
 def _parse_model_directive(raw_model: str) -> tuple[str, list[str], Optional[str]]:
@@ -146,6 +173,8 @@ PERMANENT_BALANCE_FAILURE_KEYWORDS = [
     "insufficient quota",
     "insufficient balance",
     "insufficient credits",
+    "insufficient account balance",
+    "insufficient_balance",
     "not enough credits",
     "balance not enough",
     "quota exceeded",
@@ -290,6 +319,19 @@ def is_balance_insufficient_failure(response_data: Any) -> bool:
     return any(keyword in message for keyword in PERMANENT_BALANCE_FAILURE_KEYWORDS)
 
 
+def is_service_unavailable_error(response_data: Any) -> bool:
+    """判断是否为服务暂不可用错误（应切换到其他提供商的 Key 重试）"""
+    if not isinstance(response_data, dict):
+        return False
+    error = response_data.get("error")
+    if isinstance(error, dict):
+        msg = str(error.get("message") or "").lower()
+        err_type = str(error.get("type") or "").lower()
+        if "temporarily unavailable" in msg and err_type == "api_error":
+            return True
+    return False
+
+
 async def disable_failed_api_key(db: AsyncSession, api_key: Any, reason: str):
     api_key.is_active = False
     api_key.updated_at = datetime.utcnow()
@@ -425,6 +467,7 @@ async def select_api_key(
     tried_key_ids: list[int],
     filter_providers: Optional[list[str]] = None,
     filter_key_name: Optional[str] = None,
+    exclude_providers: Optional[list[str]] = None,
 ):
     sticky_ttl_seconds = settings.proxy_session_sticky_ttl_seconds if sticky_session_key else 0
     return await pool_manager.get_next_key(
@@ -436,6 +479,7 @@ async def select_api_key(
         prefer_bound_key=True,
         providers=filter_providers or None,
         key_name=filter_key_name,
+        exclude_providers=exclude_providers or None,
     )
 
 
@@ -485,7 +529,7 @@ async def forward_stream_with_retry(
         if not original_model:
             original_model = actual_model
     model = body.get("model") if isinstance(body, dict) else None
-    sticky_session_key = get_sticky_session_key(headers)
+    sticky_session_key = get_sticky_session_key(headers, model)
     tried_key_ids = []
     last_status_code = 503
     last_response_headers = {}
@@ -493,6 +537,8 @@ async def forward_stream_with_retry(
 
     retry_count = 0
     disable_count = 0
+    service_unavailable_providers: list[str] = []
+    SERVICE_UNAVAILABLE_BYPASS_LIMIT = 10
 
     while retry_count < STREAM_RETRY_LIMIT and disable_count < PERMANENT_FAILURE_DISABLE_LIMIT:
         api_key = await select_api_key(
@@ -502,6 +548,7 @@ async def forward_stream_with_retry(
             tried_key_ids=tried_key_ids,
             filter_providers=filter_providers or None,
             filter_key_name=filter_key_name,
+            exclude_providers=service_unavailable_providers or None,
         )
         if not api_key:
             break
@@ -544,6 +591,19 @@ async def forward_stream_with_retry(
         last_status_code = status_code
         last_response_headers = response_headers
         last_response_body = stream_response
+
+        # 服务暂不可用：切换到其他提供商的 Key，不计入重试次数，对客户端透明
+        if is_service_unavailable_error(stream_response):
+            provider = getattr(api_key, "provider", None) or ""
+            if provider and provider not in service_unavailable_providers:
+                service_unavailable_providers.append(provider)
+            pool_manager.mark_key_cooldown(api_key.id, pool_manager.get_cooldown_seconds_for_status(503))
+            if sticky_session_key:
+                pool_manager.clear_session_binding(sticky_session_key)
+            print(f"[CPA SERVICE UNAVAILABLE SWITCH] api_key_id={api_key.id} provider={provider} excluded_providers={service_unavailable_providers}")
+            if len(service_unavailable_providers) >= SERVICE_UNAVAILABLE_BYPASS_LIMIT:
+                break
+            continue
 
         if await handle_permanent_key_failure(
             db,
@@ -596,7 +656,7 @@ async def forward_request_with_retry(
         if not original_model:
             original_model = actual_model
     model = body.get("model") if isinstance(body, dict) else None
-    sticky_session_key = get_sticky_session_key(headers)
+    sticky_session_key = get_sticky_session_key(headers, model)
     tried_key_ids = []
     last_status_code = 503
     last_response_headers = {}
@@ -605,6 +665,8 @@ async def forward_request_with_retry(
     retry_count = 0          # 非永久失败的重试次数
     disable_count = 0        # 永久失败禁用 Key 的次数
     auto_continue_used = False
+    service_unavailable_providers: list[str] = []
+    SERVICE_UNAVAILABLE_BYPASS_LIMIT = 10
 
     while retry_count < REQUEST_RETRY_LIMIT and disable_count < PERMANENT_FAILURE_DISABLE_LIMIT:
         api_key = await select_api_key(
@@ -614,6 +676,7 @@ async def forward_request_with_retry(
             tried_key_ids=tried_key_ids,
             filter_providers=filter_providers or None,
             filter_key_name=filter_key_name,
+            exclude_providers=service_unavailable_providers or None,
         )
         if not api_key:
             break
@@ -646,6 +709,19 @@ async def forward_request_with_retry(
         last_status_code = status_code
         last_response_headers = response_headers
         last_response_body = response_data
+
+        # 服务暂不可用：切换到其他提供商的 Key，不计入重试次数，对客户端透明
+        if is_service_unavailable_error(response_data):
+            provider = getattr(api_key, "provider", None) or ""
+            if provider and provider not in service_unavailable_providers:
+                service_unavailable_providers.append(provider)
+            pool_manager.mark_key_cooldown(api_key.id, pool_manager.get_cooldown_seconds_for_status(503))
+            if sticky_session_key:
+                pool_manager.clear_session_binding(sticky_session_key)
+            print(f"[CPA SERVICE UNAVAILABLE SWITCH] api_key_id={api_key.id} provider={provider} excluded_providers={service_unavailable_providers}")
+            if len(service_unavailable_providers) >= SERVICE_UNAVAILABLE_BYPASS_LIMIT:
+                break
+            continue
 
         if await handle_permanent_key_failure(
             db,
@@ -734,7 +810,7 @@ async def forward_image_request_with_retry(
         else:
             model = model_value
 
-    sticky_session_key = get_sticky_session_key(headers)
+    sticky_session_key = get_sticky_session_key(headers, model)
     tried_key_ids = []
     last_status_code = 503
     last_response_headers = {}
@@ -1058,6 +1134,81 @@ def _restore_model_in_response(response_data: Any, original_model: str) -> Any:
         response_data = dict(response_data)
         response_data["model"] = original_model
     return response_data
+
+
+def is_claude_family_model(model: str) -> bool:
+    """自动识别 Claude 家族模型名。"""
+    model_base, _ = _strip_model_suffix(model or "")
+    normalized = model_base.lower()
+    return any(keyword in normalized for keyword in CLAUDE_MODEL_KEYWORDS)
+
+
+def is_claude_messages_native_unsupported(status_code: int, response_data: Any) -> bool:
+    """判断上游是否不支持原生 Claude Messages 路径。"""
+    if status_code in {404, 405, 501}:
+        return True
+    if status_code != 400:
+        return False
+    message = " ".join(collect_upstream_error_texts(response_data)).lower()
+    return any(keyword in message for keyword in ("not found", "unsupported", "no route", "unknown endpoint", "invalid path"))
+
+
+async def resolve_claude_messages_native_providers(
+    db: AsyncSession,
+    model: str,
+    force_providers: Optional[list[str]] = None,
+) -> list[str]:
+    """根据模型协议配置和模型名自动解析可原生处理 Claude Messages 的 provider。"""
+    model_base, _ = _strip_model_suffix(model or "")
+    candidates = [item for item in [model, model_base] if item]
+    if not candidates:
+        return []
+
+    from models import ApiKey, ModelCatalog
+
+    providers: list[str] = []
+    seen: set[str] = set()
+
+    def add_provider(provider: Optional[str]):
+        value = (provider or "").strip()
+        if not value or value in seen or value in CLAUDE_MESSAGES_NATIVE_EXCLUDED_PROVIDERS:
+            return
+        seen.add(value)
+        providers.append(value)
+
+    catalog_query = select(ModelCatalog).where(
+        ModelCatalog.is_active == True,
+        ModelCatalog.protocol == CLAUDE_MESSAGES_NATIVE_PROTOCOL,
+        ModelCatalog.model_id.in_(candidates),
+    )
+    if force_providers:
+        catalog_query = catalog_query.where(ModelCatalog.provider.in_(force_providers))
+    catalog_result = await db.execute(catalog_query)
+    for item in catalog_result.scalars().all():
+        add_provider(getattr(item, "provider", None))
+
+    if providers:
+        return providers
+
+    if force_providers:
+        for provider in force_providers:
+            if provider in CLAUDE_MESSAGES_NATIVE_PROVIDERS:
+                add_provider(provider)
+        if providers or not is_claude_family_model(model):
+            return providers
+
+    if not is_claude_family_model(model):
+        return []
+
+    key_query = select(ApiKey.provider).where(ApiKey.is_active == True)
+    if force_providers:
+        key_query = key_query.where(ApiKey.provider.in_(force_providers))
+    key_result = await db.execute(key_query.distinct())
+    for provider in key_result.scalars().all():
+        provider_value = (provider or "").strip()
+        if provider_value and provider_value not in CLAUDE_MESSAGES_NATIVE_EXCLUDED_PROVIDERS:
+            add_provider(provider_value)
+    return providers
 
 
 async def _check_user_quota(auth_info: dict, db: AsyncSession):
@@ -1571,7 +1722,10 @@ async def claude_messages(
     is_stream = body.get("stream", False)
     user_id = auth_info.get("user_id")
 
-    should_convert_to_chat = not (_dir_providers and len(_dir_providers) == 1 and _dir_providers[0] == "claude")
+    native_providers = await resolve_claude_messages_native_providers(db, body.get("model") or "", _dir_providers or None)
+    if not native_providers and _dir_providers:
+        native_providers = [provider for provider in _dir_providers if provider in CLAUDE_MESSAGES_NATIVE_PROVIDERS]
+    should_convert_to_chat = not bool(native_providers)
 
     if is_stream:
         if should_convert_to_chat:
@@ -1616,10 +1770,41 @@ async def claude_messages(
             request=request,
             user_id=user_id,
             original_model=original_model,
-            force_providers=_dir_providers if _dir_providers else None,
+            force_providers=native_providers,
             force_key_name=_dir_key,
         )
         if status_code >= 400:
+            if is_claude_messages_native_unsupported(status_code, stream_response):
+                chat_body = proxy_service.adapt_claude_messages_request_to_chat(body)
+                status_code, response_headers, stream_response, selected_api_key = await forward_stream_with_retry(
+                    db=db,
+                    method="POST",
+                    path="/v1/chat/completions",
+                    headers=headers,
+                    body=chat_body,
+                    request=request,
+                    user_id=user_id,
+                    original_model=original_model,
+                    force_providers=_dir_providers if _dir_providers else None,
+                    force_key_name=_dir_key,
+                )
+                if status_code < 400:
+                    token_compat_provider = getattr(selected_api_key, "provider", None)
+                    input_tokens_estimate = (
+                        proxy_service._estimate_claude_compat_input_tokens(body)
+                        if proxy_service.is_claudecode_token_compat_enabled(token_compat_provider)
+                        else 0
+                    )
+                    return StreamingResponse(
+                        proxy_service.adapt_chat_stream_to_claude_messages(
+                            stream_response,
+                            original_model or model,
+                            input_tokens_estimate,
+                        ),
+                        status_code=status_code,
+                        media_type="text/event-stream",
+                        headers=response_headers,
+                    )
             return JSONResponse(content=stream_response, status_code=status_code)
         return StreamingResponse(
             stream_response,
@@ -1653,9 +1838,24 @@ async def claude_messages(
             body=body,
             user_id=user_id,
             original_model=original_model,
-            force_providers=_dir_providers if _dir_providers else None,
+            force_providers=native_providers,
             force_key_name=_dir_key,
         )
+        if status_code >= 400 and is_claude_messages_native_unsupported(status_code, response_data):
+            chat_body = proxy_service.adapt_claude_messages_request_to_chat(body)
+            status_code, _, response_data, _selected_api_key = await forward_request_with_retry(
+                db=db,
+                method="POST",
+                path="/v1/chat/completions",
+                headers=headers,
+                body=chat_body,
+                user_id=user_id,
+                original_model=original_model,
+                force_providers=_dir_providers if _dir_providers else None,
+                force_key_name=_dir_key,
+            )
+            if status_code < 400:
+                response_data = proxy_service.adapt_chat_response_to_claude_message(response_data, original_model or model)
         return JSONResponse(content=_restore_model_in_response(response_data, original_model), status_code=status_code)
 
 

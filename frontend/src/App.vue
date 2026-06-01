@@ -4,7 +4,7 @@
       <el-aside width="220px" class="sidebar-shell">
         <div class="sidebar-panel">
           <div class="logo-block">
-            <div class="logo-mark">CPA</div>
+            <div class="logo-mark" @click="toggleMenuMode">CPA</div>
           </div>
 
           <el-menu
@@ -12,42 +12,50 @@
             router
             class="app-menu"
           >
-            <el-menu-item index="/dashboard">
-              <el-icon><DataAnalysis /></el-icon>
-              <span>仪表盘</span>
-            </el-menu-item>
-            <el-menu-item v-if="showKeyManage" index="/keys">
-              <el-icon><Key /></el-icon>
-              <span>Key 管理</span>
-            </el-menu-item>
-            <el-menu-item index="/usage">
-              <el-icon><TrendCharts /></el-icon>
-              <span>用量统计</span>
-            </el-menu-item>
-            <el-menu-item index="/models">
-              <el-icon><Grid /></el-icon>
-              <span>模型广场</span>
-            </el-menu-item>
-            <el-menu-item index="/provider-model-mappings">
-              <el-icon><Connection /></el-icon>
-              <span>模型映射</span>
-            </el-menu-item>
-            <el-menu-item index="/images">
-              <el-icon><Picture /></el-icon>
-              <span>光影世界</span>
-            </el-menu-item>
-            <el-menu-item v-if="showUserManage" index="/users">
-              <el-icon><User /></el-icon>
-              <span>用户管理</span>
-            </el-menu-item>
-            <el-menu-item v-if="showSettings" index="/security-events">
-              <el-icon><Warning /></el-icon>
-              <span>安全事件</span>
-            </el-menu-item>
-            <el-menu-item v-if="showSettings" index="/settings">
-              <el-icon><Setting /></el-icon>
-              <span>系统设置</span>
-            </el-menu-item>
+            <template v-if="menuMode === 'main'">
+              <el-menu-item index="/dashboard">
+                <el-icon><DataAnalysis /></el-icon>
+                <span>仪表盘</span>
+              </el-menu-item>
+              <el-menu-item v-if="showKeyManage" index="/keys">
+                <el-icon><Key /></el-icon>
+                <span>Key 管理</span>
+              </el-menu-item>
+              <el-menu-item index="/usage">
+                <el-icon><TrendCharts /></el-icon>
+                <span>用量统计</span>
+              </el-menu-item>
+              <el-menu-item index="/models">
+                <el-icon><Grid /></el-icon>
+                <span>模型广场</span>
+              </el-menu-item>
+              <el-menu-item index="/provider-model-mappings">
+                <el-icon><Connection /></el-icon>
+                <span>模型映射</span>
+              </el-menu-item>
+              <el-menu-item index="/images">
+                <el-icon><Picture /></el-icon>
+                <span>光影世界</span>
+              </el-menu-item>
+              <el-menu-item v-if="showUserManage" index="/users">
+                <el-icon><User /></el-icon>
+                <span>用户管理</span>
+              </el-menu-item>
+              <el-menu-item v-if="showSettings" index="/security-events">
+                <el-icon><Warning /></el-icon>
+                <span>安全事件</span>
+              </el-menu-item>
+              <el-menu-item v-if="showSettings" index="/settings">
+                <el-icon><Setting /></el-icon>
+                <span>系统设置</span>
+              </el-menu-item>
+            </template>
+            <template v-else>
+              <el-menu-item v-if="showSettings" index="/openai-plus">
+                <el-icon><Link /></el-icon>
+                <span>OpenAI</span>
+              </el-menu-item>
+            </template>
           </el-menu>
 
           <div class="theme-switcher">
@@ -92,7 +100,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import zhCn from 'element-plus/dist/locale/zh-cn.mjs'
 import { authApi } from './api'
-import { Connection, User, Warning } from '@element-plus/icons-vue'
+import { Connection, User, Warning, Link } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -107,6 +115,25 @@ const username = computed(() => {
 })
 const loginEnabled = ref(false)
 const userRole = ref('')
+const menuMode = ref('main')
+const lastMainRoute = ref('/dashboard')
+const lastOpenAIRoute = ref('/openai-plus')
+
+const isOpenAIRoute = (path) => path === '/openai-plus'
+
+const toggleMenuMode = () => {
+  if (menuMode.value === 'main') {
+    if (!isOpenAIRoute(route.path)) {
+      lastMainRoute.value = route.path || lastMainRoute.value
+    }
+    menuMode.value = 'openai'
+    return
+  }
+  if (isOpenAIRoute(route.path)) {
+    lastOpenAIRoute.value = route.path || lastOpenAIRoute.value
+  }
+  menuMode.value = 'main'
+}
 
 const showKeyManage = computed(() => {
   if (!loginEnabled.value) return true
@@ -137,7 +164,14 @@ const checkLoginConfig = async () => {
 }
 
 // 监听路由变化，刷新登录配置（从设置页回来时）
-watch(() => route.path, () => {
+watch(() => route.path, (path) => {
+  if (isOpenAIRoute(path)) {
+    lastOpenAIRoute.value = path
+    menuMode.value = 'openai'
+  } else if (path !== '/login' && path !== '/register') {
+    lastMainRoute.value = path
+    menuMode.value = 'main'
+  }
   checkLoginConfig()
 })
 
@@ -242,7 +276,7 @@ html, body, #app {
   font-size: 30px;
   font-weight: 800;
   letter-spacing: 0.02em;
-  box-shadow: var(--cpa-brand-shadow);
+  cursor: pointer;
 }
 
 .nav-caption {

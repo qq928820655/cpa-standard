@@ -145,7 +145,10 @@
         <el-descriptions-item label="Key">#{{ currentEvent.api_key_id }} {{ currentEvent.key_name || '' }}</el-descriptions-item>
         <el-descriptions-item label="模型">{{ currentEvent.model || '-' }}</el-descriptions-item>
         <el-descriptions-item label="路径">{{ currentEvent.path || '-' }}</el-descriptions-item>
-        <el-descriptions-item label="Base URL" :span="2">{{ currentEvent.base_url || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="Base URL" :span="2">
+          <a v-if="currentEvent.base_url" :href="currentEvent.base_url" target="_blank" rel="noopener noreferrer" style="color:var(--el-color-primary);word-break:break-all;">{{ currentEvent.base_url }}</a>
+          <span v-else>-</span>
+        </el-descriptions-item>
         <el-descriptions-item label="命中规则" :span="2">{{ currentEvent.rule || '-' }}</el-descriptions-item>
         <el-descriptions-item label="说明" :span="2">{{ currentEvent.explanation || '-' }}</el-descriptions-item>
       </el-descriptions>

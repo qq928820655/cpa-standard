@@ -48,6 +48,7 @@ class UsageTracker:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,
+        cache_tokens: int = 0,
         latency_ms: Optional[int] = None,
         upstream_latency_ms: Optional[int] = None,
         cpa_overhead_ms: Optional[int] = None,
@@ -60,6 +61,7 @@ class UsageTracker:
         persistent_log.prompt_tokens = prompt_tokens
         persistent_log.completion_tokens = completion_tokens
         persistent_log.total_tokens = total_tokens
+        persistent_log.cache_tokens = cache_tokens
         if latency_ms is not None:
             persistent_log.latency_ms = latency_ms
         if upstream_latency_ms is not None:

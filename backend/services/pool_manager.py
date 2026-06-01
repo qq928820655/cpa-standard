@@ -347,8 +347,27 @@ class PoolManager:
         provider_models = plan.get("provider_models") or {}
         for provider_model in provider_models.get(provider, set()):
             if self.key_supports_model(key, provider_model):
-                return provider_model
-        return plan.get("direct_model") or model
+                return self.resolve_model_for_key(key, provider_model)
+        return self.resolve_model_for_key(key, plan.get("direct_model") or model)
+
+    def resolve_model_for_key(self, key: Any, model: Optional[str]) -> Optional[str]:
+        """若 Key 仅支持基础模型，则去掉请求模型中的 [...] 后缀后转发。"""
+        normalized_models = self._normalize_model_names([model] if model else [])
+        if not normalized_models:
+            return model
+        supported_models = self._parse_supported_models(getattr(key, "supported_models", None))
+        if not supported_models:
+            return model
+        request_model = normalized_models[0]
+        request_lower = request_model.lower()
+        base_model = self._strip_model_suffix(request_model) or request_model
+        base_lower = base_model.lower()
+        supported_lookup = {item.lower(): item for item in supported_models}
+        if request_lower in supported_lookup:
+            return request_model
+        if base_lower in supported_lookup:
+            return supported_lookup[base_lower]
+        return model
 
     def is_key_available_for_model_plan(
         self,
@@ -425,12 +444,17 @@ class PoolManager:
             return None
         return key
 
+    def _strip_model_suffix(self, model: Optional[str]) -> Optional[str]:
+        if not isinstance(model, str):
+            return model
+        import re as _re
+        return _re.sub(r'\[.*?\]', '', model).strip()
+
     def key_supports_model(self, key: Any, model: Optional[str]) -> bool:
         """判断 Key 是否支持指定模型。
         匹配时会去掉模型名中的 [...] 后缀（如 [1m]、[128k]），
         使 Key 只需配置基础模型名即可匹配带后缀的请求。
         """
-        import re as _re
         normalized_models = self._normalize_model_names([model] if model else [])
         if not normalized_models:
             return True
@@ -439,9 +463,8 @@ class PoolManager:
         if not supported_models:
             return True
 
-        # 去掉请求模型名中的 [...] 后缀后再匹配
         request_model = normalized_models[0].lower()
-        request_model_base = _re.sub(r'\[.*?\]', '', request_model).strip()
+        request_model_base = (self._strip_model_suffix(request_model) or "").lower()
 
         supported_lookup = {item.lower() for item in supported_models}
         # 先精确匹配，再匹配去掉后缀的基础名
@@ -487,6 +510,7 @@ class PoolManager:
         randomize_start: bool = False,
         providers: Optional[List[str]] = None,
         key_name: Optional[str] = None,
+        exclude_providers: Optional[List[str]] = None,
     ) -> Optional[Any]:
         """
         获取下一个可用的 API Key（轮询策略）
@@ -527,6 +551,8 @@ class PoolManager:
             query = query.where(ApiKey.provider == provider)
         elif providers:
             query = query.where(ApiKey.provider.in_(providers))
+        if exclude_providers:
+            query = query.where(ApiKey.provider.notin_(exclude_providers))
         if key_name:
             query = query.where(ApiKey.name == key_name)
         query = query.order_by(ApiKey.id)

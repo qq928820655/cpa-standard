@@ -119,14 +119,15 @@ class Settings(BaseSettings):
 
     # 代理超时配置（秒）
     proxy_timeout: int = 300
-    proxy_request_timeout_seconds: int = 60
+    proxy_request_timeout_seconds: int = 180
     proxy_stream_connect_timeout_seconds: int = 15
     proxy_stream_first_byte_timeout_seconds: int = 15
-    proxy_stream_read_timeout_seconds: int = 45
+    proxy_stream_read_timeout_seconds: int = 180
 
     # 会话粘滞配置
     proxy_session_sticky_enabled: bool = True
     proxy_session_sticky_ttl_seconds: int = 3600
+    proxy_session_sticky_fallback_enabled: bool = False
 
     class Config:
         env_file = ".env"

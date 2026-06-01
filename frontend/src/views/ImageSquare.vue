@@ -643,7 +643,10 @@
             </el-button>
           </el-descriptions-item>
           <el-descriptions-item label="API Key">{{ imageKeyDetail.api_key_masked || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="请求地址">{{ imageKeyDetail.base_url || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="请求地址">
+            <a v-if="imageKeyDetail.base_url" :href="imageKeyDetail.base_url" target="_blank" rel="noopener noreferrer" style="color:var(--el-color-primary);word-break:break-all;">{{ imageKeyDetail.base_url }}</a>
+            <span v-else>-</span>
+          </el-descriptions-item>
           <el-descriptions-item label="独立 fake IP">
             <el-tag :type="imageKeyDetail.enable_fake_ip ? 'success' : 'info'" size="small">
               {{ imageKeyDetail.enable_fake_ip ? '已启用' : '未启用' }}

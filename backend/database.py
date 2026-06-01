@@ -62,6 +62,8 @@ async def init_db():
         AdminUser,
         AdminSession,
         ContentGuardEvent,
+        OpenAIPlusAccount,
+        OpenAIPlusUsageLog,
     )
 
     async with engine.begin() as conn:

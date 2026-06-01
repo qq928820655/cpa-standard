@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 
 from config import settings, export_config
 from database import async_session_maker, init_db
-from routers import admin_router, proxy_router, stats_router, auth_router
+from routers import admin_router, proxy_router, stats_router, auth_router, openai_plus_router
 from services import usage_rollup_service
 
 logger = logging.getLogger(__name__)
@@ -107,6 +107,7 @@ app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
 app.include_router(stats_router, prefix="/api/stats", tags=["stats"])
 app.include_router(proxy_router, tags=["proxy"])
+app.include_router(openai_plus_router, tags=["openai-plus"])
 
 
 def _serve_frontend_file(request_path: str) -> FileResponse:

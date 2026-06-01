@@ -13,6 +13,16 @@ set AUTO_OPEN_BROWSER=1
 :: Backend bind address
 set BACKEND_HOST=0.0.0.0
 
+:: Session sticky TTL: keep same API key within a session to maximize prompt cache hit rate (seconds)
+set PROXY_SESSION_STICKY_TTL_SECONDS=86400
+
+:: Fallback session sticky: when clients do not send session headers, bind by auth/user-agent/model
+set PROXY_SESSION_STICKY_FALLBACK_ENABLED=1
+
+:: Proxy read timeout: wait up to 3 minutes for upstream responses
+set PROXY_REQUEST_TIMEOUT_SECONDS=180
+set PROXY_STREAM_READ_TIMEOUT_SECONDS=180
+
 :: Optional: pip timeout for first-time installs on a new machine
 set PIP_DEFAULT_TIMEOUT=120
 

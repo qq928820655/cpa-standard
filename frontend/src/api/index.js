@@ -265,6 +265,15 @@ export const adminApi = {
 
   getProviderMigrationRules: () => api.get('/admin/provider-migration-rules'),
   updateProviderMigrationRules: (data) => api.put('/admin/provider-migration-rules', data),
+
+  listOpenAIPlusAccounts: () => api.get('/admin/openai-plus/accounts'),
+  listOpenAIPlusQuotas: () => api.get('/admin/openai-plus/quotas'),
+  listOpenAIPlusUsageLogs: (params) => api.get('/admin/openai-plus/usage-logs', { params }),
+  getOpenAIPlusQuota: (id) => api.get(`/admin/openai-plus/accounts/${id}/quota`),
+  importOpenAIPlusAccounts: (content) => api.post('/admin/openai-plus/accounts/import', { content }),
+  updateOpenAIPlusAccount: (id, data) => api.put(`/admin/openai-plus/accounts/${id}`, data),
+  deleteOpenAIPlusAccount: (id) => api.delete(`/admin/openai-plus/accounts/${id}`),
+  checkOpenAIPlusAccount: (id) => api.post(`/admin/openai-plus/accounts/${id}/check`),
 }
 
 export const authApi = {

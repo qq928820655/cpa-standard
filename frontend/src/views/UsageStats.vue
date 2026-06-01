@@ -256,7 +256,10 @@
           </el-descriptions-item>
           <el-descriptions-item label="提供商">{{ keyDetail.provider || '-' }}</el-descriptions-item>
           <el-descriptions-item label="API Key">{{ keyDetail.api_key_masked || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="请求地址">{{ keyDetail.base_url || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="请求地址">
+            <a v-if="keyDetail.base_url" :href="keyDetail.base_url" target="_blank" rel="noopener noreferrer" style="color:var(--el-color-primary);word-break:break-all;">{{ keyDetail.base_url }}</a>
+            <span v-else>-</span>
+          </el-descriptions-item>
           <el-descriptions-item label="启用状态">
             <el-button
               :type="keyDetail.is_active ? 'success' : 'danger'"

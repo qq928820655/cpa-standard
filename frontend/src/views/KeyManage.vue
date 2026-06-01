@@ -503,7 +503,10 @@
     <el-dialog v-model="checkFailureDialogVisible" title="检测失败详情" width="700px">
       <el-descriptions :column="1" border>
         <el-descriptions-item label="Key 名称">{{ checkFailureDetail.name || '-' }}</el-descriptions-item>
-        <el-descriptions-item label="请求地址">{{ checkFailureDetail.base_url || '-' }}</el-descriptions-item>
+        <el-descriptions-item label="请求地址">
+          <a v-if="checkFailureDetail.base_url" :href="checkFailureDetail.base_url" target="_blank" rel="noopener noreferrer" style="color:var(--el-color-primary);word-break:break-all;">{{ checkFailureDetail.base_url }}</a>
+          <span v-else>-</span>
+        </el-descriptions-item>
         <el-descriptions-item label="检测模型">{{ checkFailureDetail.target_model || '-' }}</el-descriptions-item>
         <el-descriptions-item label="失败分类">{{ getCheckFailureLabel(checkFailureDetail.failure_category) }}</el-descriptions-item>
         <el-descriptions-item label="详细原因">
@@ -844,7 +847,10 @@
           <el-descriptions-item label="提供商">{{ keyDetailData.provider || '-' }}</el-descriptions-item>
           <el-descriptions-item label="API 类型">{{ getApiTypeLabel(keyDetailData.api_type) }}</el-descriptions-item>
           <el-descriptions-item label="API Key">{{ keyDetailData.api_key_masked || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="请求地址">{{ keyDetailData.base_url || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="请求地址">
+            <a v-if="keyDetailData.base_url" :href="keyDetailData.base_url" target="_blank" rel="noopener noreferrer" style="color:var(--el-color-primary);word-break:break-all;">{{ keyDetailData.base_url }}</a>
+            <span v-else>-</span>
+          </el-descriptions-item>
           <el-descriptions-item label="启用状态">
             <el-button
               :type="keyDetailData.is_active ? 'success' : 'danger'"

@@ -9,6 +9,8 @@ from .model_catalog import ModelCatalog
 from .provider_model_priority import ProviderModelPriority
 from .provider_model_mapping import ProviderModelMapping
 from .content_guard_event import ContentGuardEvent
+from .openai_plus_account import OpenAIPlusAccount
+from .openai_plus_usage_log import OpenAIPlusUsageLog
 from .usage import UsageLog, UsageDailySummary
 from .admin_user import AdminUser
 from .admin_session import AdminSession
@@ -25,6 +27,8 @@ __all__ = [
     "ProviderModelPriority",
     "ProviderModelMapping",
     "ContentGuardEvent",
+    "OpenAIPlusAccount",
+    "OpenAIPlusUsageLog",
     "UsageLog",
     "UsageDailySummary",
     "AdminUser",

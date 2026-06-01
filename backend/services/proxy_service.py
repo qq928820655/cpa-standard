@@ -7,8 +7,10 @@ import binascii
 import ipaddress
 import json
 import logging
+import os
 import re
 import time
+from pathlib import Path
 from typing import Optional, Any, AsyncGenerator
 from urllib.parse import quote, urlsplit, urlunsplit
 import httpx
@@ -80,7 +82,7 @@ class ProxyService:
             pool=seconds,
         )
 
-    def _build_headers(self, api_key: Any, original_headers: dict) -> dict:
+    def _build_headers(self, api_key: Any, original_headers: dict, path: Optional[str] = None) -> dict:
         """
         构建转发请求的 Headers
 
@@ -110,12 +112,20 @@ class ProxyService:
 
         headers.setdefault("content-type", "application/json")
 
-        # 根据不同的 provider 设置认证头
-        if api_key.provider == "claude":
+        is_anthropic_messages_path = (path or "").lstrip("/") == "v1/messages"
+        if api_key.provider == "claude" or is_anthropic_messages_path:
+            headers.pop("Authorization", None)
             headers["x-api-key"] = api_key.api_key
             headers["anthropic-version"] = original_headers.get(
                 "anthropic-version", headers.get("anthropic-version", "2023-06-01")
             )
+            existing_beta = original_headers.get("anthropic-beta") or ""
+            if "prompt-caching" not in existing_beta.lower():
+                beta_parts = [b.strip() for b in existing_beta.split(",") if b.strip()]
+                beta_parts.append("prompt-caching-2024-07-31")
+                headers["anthropic-beta"] = ",".join(beta_parts)
+            else:
+                headers["anthropic-beta"] = existing_beta
         else:
             # OpenAI 及其兼容接口
             headers["Authorization"] = f"Bearer {api_key.api_key}"
@@ -124,6 +134,495 @@ class ProxyService:
 
         self._apply_fake_ip_headers(api_key, headers)
         return headers
+
+    def _write_upstream_request_debug_dump(
+        self,
+        api_key: Any,
+        *,
+        method: str,
+        url: str,
+        path: str,
+        headers: dict,
+        body: Optional[dict],
+    ):
+        if os.environ.get("CPA_UPSTREAM_DEBUG_DUMP") != "1":
+            return
+
+        def mask_header(name: str, value: Any) -> Any:
+            if name.lower() in {"authorization", "x-api-key", "proxy-authorization"}:
+                return "***"
+            return value
+
+        def summarize_body(value: Any) -> Any:
+            if not isinstance(value, dict):
+                return {"type": type(value).__name__}
+            result = {}
+            for key, item in value.items():
+                if key == "messages" and isinstance(item, list):
+                    result[key] = [
+                        {
+                            "role": message.get("role") if isinstance(message, dict) else None,
+                            "content_type": type(message.get("content")).__name__ if isinstance(message, dict) else type(message).__name__,
+                            "content_length": len(message.get("content") or "") if isinstance(message, dict) and isinstance(message.get("content"), str) else None,
+                        }
+                        for message in item
+                    ]
+                elif key == "tools" and isinstance(item, list):
+                    result[key] = [
+                        {
+                            "type": tool.get("type") if isinstance(tool, dict) else None,
+                            "name": (tool.get("function") or {}).get("name") if isinstance(tool, dict) and isinstance(tool.get("function"), dict) else None,
+                            "description_length": len((tool.get("function") or {}).get("description") or "") if isinstance(tool, dict) and isinstance(tool.get("function"), dict) else None,
+                        }
+                        for tool in item
+                    ]
+                else:
+                    result[key] = item if isinstance(item, (str, int, float, bool)) or item is None else {"type": type(item).__name__}
+            return result
+
+        try:
+            dump_dir = Path(__file__).resolve().parent.parent / "data" / "debug_dumps"
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            key_id = getattr(api_key, "id", "unknown")
+            dump_path = dump_dir / f"upstream_request_{timestamp}_{key_id}.json"
+            payload = {
+                "method": method,
+                "url": url,
+                "path": path,
+                "api_key_id": getattr(api_key, "id", None),
+                "provider": getattr(api_key, "provider", None),
+                "key_name": getattr(api_key, "name", None),
+                "base_url": getattr(api_key, "base_url", None),
+                "headers": {name: mask_header(name, value) for name, value in headers.items()},
+                "body_summary": summarize_body(body),
+            }
+            dump_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[CPA UPSTREAM DEBUG DUMP] {dump_path}")
+        except Exception as exc:
+            print(f"[CPA UPSTREAM DEBUG DUMP ERROR] {exc}")
+
+    # ============ OpenAI Chat <-> Anthropic Messages 双向转换（用于升级普通客户端请求以命中缓存） ============
+
+    # 使用 OpenAI 兼容格式但实际是 Claude 模型的请求，经 CPA 自动升级为 Anthropic Messages 格式，
+    # 注入 cache_control，并在响应时转回 OpenAI 格式，对下游客户端透明。
+    # 此列表中的 provider 不支持原生 Anthropic 格式，不做升级。
+    _CLAUDE_MESSAGES_UPGRADE_EXCLUDED_PROVIDERS: frozenset = frozenset(["skk"])
+
+    _CLAUDE_MODEL_KEYWORDS: tuple = ("claude-opus", "claude-sonnet", "claude-haiku", "claude-3-", "claude-3.", "claude-4")
+
+    @staticmethod
+    def _is_claude_family_model(model: str) -> bool:
+        m = (model or "").lower()
+        return any(kw in m for kw in ("claude-opus", "claude-sonnet", "claude-haiku", "claude-3-", "claude-3.", "claude-4"))
+
+    def _should_upgrade_chat_to_claude_messages(self, api_key: Any, path: str, body: Optional[dict]) -> bool:
+        """检测是否需自动升级 OpenAI Chat 请求为 Anthropic Messages 格式以支持 prompt cache。"""
+        if (path or "").lstrip("/") != "v1/chat/completions":
+            return False
+        if not isinstance(body, dict):
+            return False
+        if not self._is_claude_family_model(body.get("model") or ""):
+            return False
+        provider = (getattr(api_key, "provider", "") or "").strip().lower()
+        if provider in self._CLAUDE_MESSAGES_UPGRADE_EXCLUDED_PROVIDERS:
+            return False
+        return True
+
+    def _adapt_chat_tools_to_claude_tools(self, tools: Any) -> list:
+        """OpenAI function tools → Anthropic tools"""
+        if not isinstance(tools, list):
+            return []
+        result = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            func = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            name = func.get("name")
+            if not name:
+                continue
+            result.append({
+                "name": name,
+                "description": func.get("description") or "",
+                "input_schema": func.get("parameters") or {"type": "object", "properties": {}},
+            })
+        return result
+
+    def _adapt_chat_tool_choice_to_claude(self, tool_choice: Any) -> Any:
+        """OpenAI tool_choice → Anthropic tool_choice"""
+        if tool_choice in ("auto", None):
+            return {"type": "auto"}
+        if tool_choice == "none":
+            return {"type": "auto"}
+        if tool_choice == "required":
+            return {"type": "any"}
+        if isinstance(tool_choice, dict):
+            tc_type = tool_choice.get("type")
+            if tc_type == "function":
+                func = tool_choice.get("function") or {}
+                return {"type": "tool", "name": func.get("name")}
+        return {"type": "auto"}
+
+    def _adapt_chat_messages_to_claude_messages(self, messages: list) -> list:
+        """OpenAI Chat messages → Anthropic Messages（处理 tool_calls / tool_result）"""
+        result = []
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if not isinstance(msg, dict):
+                i += 1
+                continue
+            role = msg.get("role")
+
+            if role == "assistant":
+                content_parts: list[dict] = []
+                text_content = msg.get("content") or ""
+                if isinstance(text_content, str) and text_content.strip():
+                    content_parts.append({"type": "text", "text": text_content})
+                elif isinstance(text_content, list):
+                    for block in text_content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            content_parts.append({"type": "text", "text": block.get("text") or ""})
+                for tc in msg.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    func = tc.get("function") or {}
+                    try:
+                        input_data = json.loads(func.get("arguments") or "{}")
+                    except (json.JSONDecodeError, ValueError):
+                        input_data = {}
+                    content_parts.append({
+                        "type": "tool_use",
+                        "id": tc.get("id") or f"call_{int(time.time() * 1000)}",
+                        "name": func.get("name") or "tool",
+                        "input": input_data,
+                    })
+                result.append({"role": "assistant", "content": content_parts or [{"type": "text", "text": ""}]})
+                i += 1
+
+            elif role == "tool":
+                tool_results: list[dict] = []
+                while i < len(messages) and isinstance(messages[i], dict) and messages[i].get("role") == "tool":
+                    t = messages[i]
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": t.get("tool_call_id") or t.get("id") or "",
+                        "content": t.get("content") or "",
+                    })
+                    i += 1
+                result.append({"role": "user", "content": tool_results})
+
+            elif role == "user":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    result.append({"role": "user", "content": content})
+                elif isinstance(content, list):
+                    claude_content = []
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        block_type = block.get("type")
+                        if block_type == "text":
+                            claude_content.append({"type": "text", "text": block.get("text") or ""})
+                        elif block_type == "image_url":
+                            image_url = block.get("image_url") or {}
+                            url = image_url.get("url") or "" if isinstance(image_url, dict) else str(image_url)
+                            if url.startswith("data:image/"):
+                                header, _, data = url.partition(",")
+                                media_type = header.split(";")[0].replace("data:", "")
+                                claude_content.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})
+                            else:
+                                claude_content.append({"type": "image", "source": {"type": "url", "url": url}})
+                    result.append({"role": "user", "content": claude_content or [{"type": "text", "text": ""}]})
+                else:
+                    result.append({"role": "user", "content": str(content or "")})
+                i += 1
+
+            else:
+                i += 1
+
+        return result
+
+    def _adapt_chat_body_to_claude_messages_body(self, body: dict) -> dict:
+        """OpenAI Chat 请求体 → Anthropic Messages 请求体，自动注入 cache_control。"""
+        claude_body: dict[str, Any] = {}
+        claude_body["model"] = body.get("model")
+        if "stream" in body:
+            claude_body["stream"] = body["stream"]
+        if "temperature" in body:
+            claude_body["temperature"] = body["temperature"]
+        if "top_p" in body:
+            claude_body["top_p"] = body["top_p"]
+        if "stop" in body:
+            stop = body["stop"]
+            claude_body["stop_sequences"] = stop if isinstance(stop, list) else [stop]
+        claude_body["max_tokens"] = body.get("max_tokens") or 8096
+
+        messages = body.get("messages") or []
+        system_texts: list[str] = []
+        non_system: list[dict] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                non_system.append(msg)
+                continue
+            if msg.get("role") == "system":
+                content = msg.get("content") or ""
+                if isinstance(content, str):
+                    system_texts.append(content)
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            system_texts.append(str(block.get("text") or ""))
+                        elif isinstance(block, str):
+                            system_texts.append(block)
+            else:
+                non_system.append(msg)
+
+        if system_texts:
+            claude_body["system"] = [{"type": "text", "text": "\n\n".join(filter(None, system_texts)), "cache_control": {"type": "ephemeral"}}]
+
+        claude_body["messages"] = self._adapt_chat_messages_to_claude_messages(non_system)
+
+        tools = body.get("tools")
+        if tools:
+            adapted_tools = self._adapt_chat_tools_to_claude_tools(tools)
+            if adapted_tools:
+                claude_body["tools"] = adapted_tools
+                tool_choice = body.get("tool_choice")
+                if tool_choice is not None:
+                    claude_body["tool_choice"] = self._adapt_chat_tool_choice_to_claude(tool_choice)
+
+        return claude_body
+
+    def _adapt_claude_messages_response_to_chat_response(self, response_data: Any) -> Any:
+        """Anthropic Messages 响应 → OpenAI Chat 响应（保留 cache 用量信息）"""
+        if not isinstance(response_data, dict):
+            return response_data
+        if "content" not in response_data and response_data.get("object") == "chat.completion":
+            return response_data
+
+        content = response_data.get("content") or []
+        text_parts: list[str] = []
+        tool_calls: list[dict] = []
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text_parts.append(str(block.get("text") or ""))
+            elif btype == "tool_use":
+                tool_calls.append({
+                    "id": block.get("id") or f"call_{int(time.time() * 1000)}",
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name") or "tool",
+                        "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                    },
+                })
+
+        stop_reason_map = {"end_turn": "stop", "max_tokens": "length", "tool_use": "tool_calls", "stop_sequence": "stop"}
+        finish_reason = stop_reason_map.get(response_data.get("stop_reason") or "", "stop")
+        if tool_calls:
+            finish_reason = "tool_calls"
+
+        message: dict[str, Any] = {"role": "assistant", "content": "\n".join(text_parts)}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+
+        usage = response_data.get("usage") or {}
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+
+        total_prompt_tokens = input_tokens + cache_read + cache_creation
+        openai_usage: dict[str, Any] = {
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": total_prompt_tokens + output_tokens,
+        }
+        if cache_read or cache_creation:
+            openai_usage["prompt_tokens_details"] = {"cached_tokens": cache_read}
+        openai_usage["cache_read_input_tokens"] = cache_read
+        openai_usage["cache_creation_input_tokens"] = cache_creation
+
+        return {
+            "id": response_data.get("id") or f"chatcmpl-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": response_data.get("model"),
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+            "usage": openai_usage,
+        }
+
+    async def adapt_claude_messages_stream_to_chat_stream(
+        self,
+        stream_response: AsyncGenerator[bytes, None],
+        model: Optional[str],
+    ) -> AsyncGenerator[bytes, None]:
+        """Anthropic Messages SSE 流 → OpenAI Chat SSE 流（对客户端透明）"""
+        response_id = f"chatcmpl-{int(time.time() * 1000)}"
+        created = int(time.time())
+        output_model = model or "unknown"
+        input_tokens = 0
+        output_tokens = 0
+        cache_read_tokens = 0
+        cache_creation_tokens = 0
+        tool_call_ids: dict[int, str] = {}
+        tool_call_names: dict[int, str] = {}
+        role_sent = False
+        buffer = ""
+
+        def make_chunk(delta: dict, finish_reason: Optional[str] = None) -> bytes:
+            chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": output_model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+            }
+            return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+
+        async for chunk_bytes in stream_response:
+            buffer += chunk_bytes.decode("utf-8", errors="replace")
+            while "\n\n" in buffer:
+                event_block, buffer = buffer.split("\n\n", 1)
+                if not event_block.strip():
+                    continue
+                event_name = None
+                data_lines = []
+                for line in event_block.splitlines():
+                    if line.startswith("event:"):
+                        event_name = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].strip())
+                data_text = "\n".join(data_lines)
+                if data_text == "[DONE]":
+                    yield b"data: [DONE]\n\n"
+                    return
+                if not data_text:
+                    continue
+                try:
+                    payload = json.loads(data_text)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                payload_type = payload.get("type") or event_name
+
+                if payload_type == "message_start":
+                    msg_obj = payload.get("message") or {}
+                    if msg_obj.get("id"):
+                        response_id = f"chatcmpl-{msg_obj['id']}"
+                    output_model = msg_obj.get("model") or output_model
+                    u = (msg_obj.get("usage") or {})
+                    input_tokens = int(u.get("input_tokens") or 0)
+                    cache_read_tokens = int(u.get("cache_read_input_tokens") or 0)
+                    cache_creation_tokens = int(u.get("cache_creation_input_tokens") or 0)
+                    if not role_sent:
+                        yield make_chunk({"role": "assistant", "content": ""})
+                        role_sent = True
+
+                elif payload_type == "content_block_start":
+                    if not role_sent:
+                        yield make_chunk({"role": "assistant", "content": ""})
+                        role_sent = True
+                    block = payload.get("content_block") or {}
+                    idx = int(payload.get("index") or 0)
+                    if block.get("type") == "tool_use":
+                        call_id = block.get("id") or f"call_{response_id}_{idx}"
+                        name = block.get("name") or "tool"
+                        tool_call_ids[idx] = call_id
+                        tool_call_names[idx] = name
+                        yield make_chunk({"tool_calls": [{"index": idx, "id": call_id, "type": "function", "function": {"name": name, "arguments": ""}}]})
+
+                elif payload_type == "content_block_delta":
+                    idx = int(payload.get("index") or 0)
+                    delta = payload.get("delta") or {}
+                    dtype = delta.get("type")
+                    if dtype == "text_delta":
+                        text = delta.get("text") or ""
+                        if text:
+                            yield make_chunk({"content": text})
+                    elif dtype == "input_json_delta":
+                        partial = delta.get("partial_json") or ""
+                        if partial:
+                            yield make_chunk({"tool_calls": [{"index": idx, "function": {"arguments": partial}}]})
+
+                elif payload_type == "message_delta":
+                    delta = payload.get("delta") or {}
+                    stop_reason = delta.get("stop_reason")
+                    u = payload.get("usage") or {}
+                    output_tokens = int(u.get("output_tokens") or 0)
+                    # 兼容部分代理在 message_delta 而非 message_start 里汇报 input_tokens
+                    _d_input = int(u.get("input_tokens") or 0)
+                    _d_cache_read = int(u.get("cache_read_input_tokens") or 0)
+                    _d_cache_creation = int(u.get("cache_creation_input_tokens") or 0)
+                    if _d_input:
+                        input_tokens = _d_input
+                    if _d_cache_read:
+                        cache_read_tokens = _d_cache_read
+                    if _d_cache_creation:
+                        cache_creation_tokens = _d_cache_creation
+                    finish_reason_map = {"end_turn": "stop", "max_tokens": "length", "tool_use": "tool_calls", "stop_sequence": "stop"}
+                    finish_reason = finish_reason_map.get(stop_reason or "", "stop")
+                    yield make_chunk({}, finish_reason=finish_reason)
+
+                elif payload_type == "message_stop":
+                    total_prompt = input_tokens + cache_read_tokens + cache_creation_tokens
+                    total = total_prompt + output_tokens
+                    usage_chunk: dict[str, Any] = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": output_model,
+                        "choices": [],
+                        "usage": {"prompt_tokens": total_prompt, "completion_tokens": output_tokens, "total_tokens": total},
+                    }
+                    if cache_read_tokens:
+                        usage_chunk["usage"]["prompt_tokens_details"] = {"cached_tokens": cache_read_tokens}
+                    usage_chunk["usage"]["cache_read_input_tokens"] = cache_read_tokens
+                    usage_chunk["usage"]["cache_creation_input_tokens"] = cache_creation_tokens
+                    yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                    yield b"data: [DONE]\n\n"
+                    return
+
+        yield b"data: [DONE]\n\n"
+
+    @staticmethod
+    def _normalize_body_for_upstream(body: Optional[dict]) -> Optional[dict]:
+        """归一化上游请求体，兼容不支持 developer role 与空 assistant 消息的上游。"""
+        if not isinstance(body, dict):
+            return body
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return body
+        normalized = []
+        changed = False
+        for message in messages:
+            if not isinstance(message, dict):
+                normalized.append(message)
+                continue
+
+            role = message.get("role")
+            if role == "developer":
+                message = {**message, "role": "system"}
+                changed = True
+
+            if role == "assistant":
+                content = message.get("content")
+                has_text = isinstance(content, str) and bool(content.strip())
+                has_content_parts = isinstance(content, list) and bool(content)
+                has_tool_calls = bool(message.get("tool_calls"))
+                if not has_text and not has_content_parts and not has_tool_calls:
+                    changed = True
+                    continue
+
+            normalized.append(message)
+
+        if not changed:
+            return body
+        return {**body, "messages": normalized}
 
     def _apply_fake_ip_headers(self, api_key: Any, headers: dict):
         if not bool(getattr(api_key, "enable_fake_ip", False)):
@@ -1768,7 +2267,7 @@ class ProxyService:
         total_tokens = usage.get("total_tokens") or (prompt_tokens + completion_tokens)
 
         # 缓存 token：OpenAI 格式在 prompt_tokens_details.cached_tokens
-        # Claude 格式在 cache_read_input_tokens
+        # Claude 格式在 cache_read_input_tokens / cache_creation_input_tokens
         cache_tokens = 0
         prompt_tokens_details = usage.get("prompt_tokens_details") or {}
         if isinstance(prompt_tokens_details, dict):
@@ -1776,6 +2275,7 @@ class ProxyService:
         if not cache_tokens:
             cache_tokens = int(
                 usage.get("cache_read_input_tokens")
+                or usage.get("cache_creation_input_tokens")
                 or usage.get("cached_tokens")
                 or usage.get("cache_tokens")
                 or 0
@@ -2488,8 +2988,23 @@ class ProxyService:
         """
         from .usage_tracker import usage_tracker
 
+        # 检测并升级为 Anthropic Messages 格式（支持 prompt cache）
+        upgrade_to_claude = self._should_upgrade_chat_to_claude_messages(api_key, path, body)
+        if upgrade_to_claude:
+            body = self._adapt_chat_body_to_claude_messages_body(body)
+            path = "v1/messages"
+
         url = self._build_url(api_key, path)
-        forward_headers = self._build_headers(api_key, headers)
+        forward_headers = self._build_headers(api_key, headers, path)
+        upstream_body = self._normalize_body_for_upstream(body) if body else None
+        self._write_upstream_request_debug_dump(
+            api_key,
+            method=method,
+            url=url,
+            path=path,
+            headers=forward_headers,
+            body=upstream_body,
+        )
 
         total_start = time.perf_counter()
         upstream_wait_seconds = 0.0
@@ -2506,10 +3021,8 @@ class ProxyService:
                     method=method,
                     url=url,
                     headers=forward_headers,
-                    json=body if body else None,
+                    json=upstream_body,
                 )
-                upstream_wait_seconds += time.perf_counter() - upstream_wait_start
-                upstream_wait_start = None
 
                 status_code = response.status_code
                 response_data = self._parse_response_body(response)
@@ -2587,6 +3100,10 @@ class ProxyService:
             user_id=user_id,
         )
 
+        # 升级模式：将 Anthropic Messages 响应转回 OpenAI Chat 格式
+        if upgrade_to_claude and status_code < 400:
+            response_data = self._adapt_claude_messages_response_to_chat_response(response_data)
+
         return status_code, {}, response_data
 
     async def forward_image_request(
@@ -2605,7 +3122,7 @@ class ProxyService:
         from .usage_tracker import usage_tracker
 
         url = self._build_url(api_key, path)
-        forward_headers = self._build_headers(api_key, headers)
+        forward_headers = self._build_headers(api_key, headers, path)
         if files:
             forward_headers.pop("content-type", None)
 
@@ -2765,8 +3282,13 @@ class ProxyService:
         from .usage_tracker import usage_tracker
 
         url = self._build_url(api_key, path)
-        forward_headers = self._build_headers(api_key, headers)
+        forward_headers = self._build_headers(api_key, headers, path)
         model = body.get("model") if body else None
+        # OpenAI 协议流式请求：注入 stream_options 确保上游返回 usage 含 cache_tokens
+        if isinstance(body, dict) and body.get("stream") is True and not body.get("stream_options"):
+            if (path or "").lstrip("/") != "v1/messages":
+                body = {**body, "stream_options": {"include_usage": True}}
+        upstream_body = self._normalize_body_for_upstream(body) if body else None
 
         request_meta = {
             "api_key_id": getattr(api_key, "id", None),
@@ -2792,7 +3314,7 @@ class ProxyService:
             method=method,
             url=url,
             headers=forward_headers,
-            json=body if body else None,
+            json=upstream_body,
         )
 
         upstream_wait_start = None
@@ -3105,8 +3627,27 @@ class ProxyService:
         """
         from .usage_tracker import usage_tracker
 
+        # 检测并升级为 Anthropic Messages 格式（支持 prompt cache）
+        upgrade_to_claude = self._should_upgrade_chat_to_claude_messages(api_key, path, body)
+        original_model_name = (body.get("model") if isinstance(body, dict) else None) or original_model
+        if upgrade_to_claude:
+            body = self._adapt_chat_body_to_claude_messages_body(body)
+            path = "v1/messages"
+        elif isinstance(body, dict) and body.get("stream") is True and not body.get("stream_options"):
+            # OpenAI 协议流式请求：注入 stream_options 确保上游返回 usage 含 cache_tokens
+            body = {**body, "stream_options": {"include_usage": True}}
+
         url = self._build_url(api_key, path)
-        forward_headers = self._build_headers(api_key, headers)
+        forward_headers = self._build_headers(api_key, headers, path)
+        upstream_body = self._normalize_body_for_upstream(body) if body else None
+        self._write_upstream_request_debug_dump(
+            api_key,
+            method=method,
+            url=url,
+            path=path,
+            headers=forward_headers,
+            body=upstream_body,
+        )
 
         total_start = time.perf_counter()
         upstream_wait_seconds = 0.0
@@ -3126,7 +3667,7 @@ class ProxyService:
             method=method,
             url=url,
             headers=forward_headers,
-            json=body if body else None,
+            json=upstream_body,
         )
 
         upstream_wait_start = None
@@ -3362,6 +3903,7 @@ class ProxyService:
                                     prompt_tokens=prompt_tokens,
                                     completion_tokens=completion_tokens,
                                     total_tokens=total_tokens,
+                                    cache_tokens=cache_tokens,
                                     latency_ms=current_latency_ms,
                                     upstream_latency_ms=current_upstream_latency_ms,
                                     cpa_overhead_ms=max(current_latency_ms - current_upstream_latency_ms, 0),
@@ -3460,7 +4002,10 @@ class ProxyService:
                 await response.aclose()
                 await client.aclose()
 
-        return response.status_code, response_headers, stream_generator(), False
+        raw_stream = stream_generator()
+        if upgrade_to_claude:
+            return response.status_code, response_headers, self.adapt_claude_messages_stream_to_chat_stream(raw_stream, original_model_name), False
+        return response.status_code, response_headers, raw_stream, False
 
     # ============ Claude Messages <-> OpenAI Chat 兼容层 ============
 
