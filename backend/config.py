@@ -55,6 +55,20 @@ DEFAULT_EXPORT_CONFIG = {
         {"min": 0.18, "max": 0.25, "action": "weight", "weight": 1},
         {"min": 0.0,  "max": 0.18, "action": "disable"},
     ],
+    # provider/model 兼容覆盖规则：默认自动判断，仅对异常上游配置例外
+    # 示例：{"provider": "skk", "model_pattern": "claude-*", "protocol": "openai_chat"}
+    "provider_model_compat_overrides": [],
+    # 透传错误码：命中这些状态码时直接返回上游响应，不切换 Key、不冷却、不重试
+    "pass_through_error_codes": [],
+    # 模型种子回填开关：关闭后 list_models 不再用 DEFAULT_MODELS 种子自动插入/更新模型
+    "model_seed_enabled": True,
+    # 代理调试追踪：默认关闭，只记录轻量决策信息
+    "proxy_trace_enabled": False,
+    "proxy_trace_retention_hours": 24,
+    "proxy_trace_sample_rate": 1.0,
+    "proxy_trace_only_failures": False,
+    "proxy_trace_target_provider": "",
+    "proxy_trace_target_model": "",
     # 上游内容安全防护：默认关闭，开启后扫描广告与危险代码片段
     "content_guard": {
         "enabled": False,

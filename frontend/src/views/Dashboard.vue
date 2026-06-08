@@ -345,7 +345,7 @@ import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/compon
 import VChart from 'vue-echarts'
 import { ElMessage } from 'element-plus'
 import { Refresh, View } from '@element-plus/icons-vue'
-import { adminApi, statsApi, authApi } from '../api'
+import { adminApi, statsApi, authApi, copyText } from '../api'
 import { useDisplaySettings } from '../stores/displaySettings'
 
 const { formatToken } = useDisplaySettings()
@@ -662,7 +662,7 @@ const toggleKeyDetailActive = async () => {
 const copyKeyPassword = async (password) => {
   if (!password) return
   try {
-    await navigator.clipboard.writeText(password)
+    await copyText(password)
     ElMessage.success('密码已复制')
   } catch {
     ElMessage.error('复制失败')

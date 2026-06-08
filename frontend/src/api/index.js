@@ -267,13 +267,31 @@ export const adminApi = {
   updateProviderMigrationRules: (data) => api.put('/admin/provider-migration-rules', data),
 
   listOpenAIPlusAccounts: () => api.get('/admin/openai-plus/accounts'),
-  listOpenAIPlusQuotas: () => api.get('/admin/openai-plus/quotas'),
+  listOpenAIPlusQuotas: () => api.get('/admin/openai-plus/quotas', { timeout: 180000 }),
   listOpenAIPlusUsageLogs: (params) => api.get('/admin/openai-plus/usage-logs', { params }),
-  getOpenAIPlusQuota: (id) => api.get(`/admin/openai-plus/accounts/${id}/quota`),
+  getOpenAIPlusQuota: (id) => api.get(`/admin/openai-plus/accounts/${id}/quota`, { timeout: 120000 }),
+  getOpenAIPlusQuotaRefreshConfig: () => api.get('/admin/openai-plus/quota-refresh-config'),
+  updateOpenAIPlusQuotaRefreshConfig: (data) => api.put('/admin/openai-plus/quota-refresh-config', data),
   importOpenAIPlusAccounts: (content) => api.post('/admin/openai-plus/accounts/import', { content }),
   updateOpenAIPlusAccount: (id, data) => api.put(`/admin/openai-plus/accounts/${id}`, data),
+  batchUpdateOpenAIPlusAccounts: (data) => api.put('/admin/openai-plus/accounts/batch', data),
+  batchDeleteOpenAIPlusAccounts: (data) => api.delete('/admin/openai-plus/accounts/batch', { data }),
   deleteOpenAIPlusAccount: (id) => api.delete(`/admin/openai-plus/accounts/${id}`),
   checkOpenAIPlusAccount: (id) => api.post(`/admin/openai-plus/accounts/${id}/check`),
+
+  getPassThroughErrorCodes: () => api.get('/admin/pass-through-error-codes'),
+  updatePassThroughErrorCodes: (data) => api.put('/admin/pass-through-error-codes', data),
+
+  getModelSeedConfig: () => api.get('/admin/model-seed-config'),
+  updateModelSeedConfig: (data) => api.put('/admin/model-seed-config', data),
+
+  getProxyTraceConfig: () => api.get('/admin/proxy-trace-config'),
+  updateProxyTraceConfig: (data) => api.put('/admin/proxy-trace-config', data),
+  listProxyTraces: (params) => api.get('/admin/proxy-traces', { params }),
+  getProxyTrace: (traceId) => api.get(`/admin/proxy-traces/${traceId}`),
+  cleanupProxyTraces: () => api.delete('/admin/proxy-traces/cleanup'),
+
+  factoryReset: (data) => api.post('/admin/factory-reset', data),
 }
 
 export const authApi = {
@@ -314,6 +332,23 @@ export function saveSessionUser(data) {
   if (data?.username) localStorage.setItem(SESSION_USERNAME_KEY, data.username)
   if (data?.role) localStorage.setItem(SESSION_ROLE_KEY, data.role)
   if (data?.api_key) localStorage.setItem(SESSION_API_KEY_KEY, data.api_key)
+}
+
+/**
+ * 通用复制到剪贴板，兼容非安全上下文（http 远程访问）
+ */
+export async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text)
+  } else {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    document.body.removeChild(ta)
+  }
 }
 
 export const statsApi = {

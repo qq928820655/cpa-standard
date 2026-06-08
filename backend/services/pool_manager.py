@@ -511,6 +511,7 @@ class PoolManager:
         providers: Optional[List[str]] = None,
         key_name: Optional[str] = None,
         exclude_providers: Optional[List[str]] = None,
+        trace_context: Optional[Any] = None,
     ) -> Optional[Any]:
         """
         获取下一个可用的 API Key（轮询策略）
@@ -531,8 +532,26 @@ class PoolManager:
         from models import ApiKey
 
         excluded_ids = set(exclude_key_ids or [])
+        provider_values = self._normalize_model_names(providers)
+        excluded_provider_values = set(self._normalize_model_names(exclude_providers))
+        single_filter_provider = provider or (provider_values[0] if provider_values and len(provider_values) == 1 else None)
         self._prune_expired_cooldowns()
         self._prune_expired_session_bindings()
+
+        if trace_context:
+            trace_context.set_route("key_selection", {
+                "provider": provider,
+                "providers": provider_values,
+                "key_name": key_name,
+                "model": model,
+                "exclude_key_ids": sorted(excluded_ids),
+                "exclude_providers": sorted(excluded_provider_values),
+                "candidate_count": 0,
+                "eligible_count": 0,
+                "skipped": [],
+                "selected": None,
+                "selected_reason": None,
+            })
 
         if prefer_bound_key and sticky_session_key:
             bound_key = await self.get_bound_key(
@@ -544,6 +563,13 @@ class PoolManager:
                 providers=providers,
             )
             if bound_key:
+                if trace_context:
+                    trace_context.route_summary.setdefault("key_selection", {})["selected"] = {
+                        "api_key_id": getattr(bound_key, "id", None),
+                        "provider": getattr(bound_key, "provider", None),
+                        "key_name": getattr(bound_key, "name", None),
+                    }
+                    trace_context.route_summary.setdefault("key_selection", {})["selected_reason"] = "sticky_binding"
                 return bound_key
 
         query = select(ApiKey).where(ApiKey.is_active == True)
@@ -557,7 +583,49 @@ class PoolManager:
             query = query.where(ApiKey.name == key_name)
         query = query.order_by(ApiKey.id)
 
-        plan = await self.build_model_match_plan(db, model, providers=providers or ([provider] if provider else None))
+        plan = await self.build_model_match_plan(db, model, providers=provider_values or ([provider] if provider else None))
+        if trace_context:
+            explain_query = select(ApiKey).order_by(ApiKey.id)
+            explain_result = await db.execute(explain_query)
+            explain_items = []
+            eligible_ids = set()
+            for key in explain_result.scalars().all():
+                reason = None
+                key_provider = getattr(key, "provider", None)
+                if not getattr(key, "is_active", False):
+                    reason = "inactive"
+                elif provider and key_provider != provider:
+                    reason = "provider_mismatch"
+                elif provider_values and key_provider not in provider_values:
+                    reason = "provider_mismatch"
+                elif excluded_provider_values and key_provider in excluded_provider_values:
+                    reason = "excluded_provider"
+                elif key_name and getattr(key, "name", None) != key_name:
+                    reason = "key_name_mismatch"
+                elif key.id in excluded_ids:
+                    reason = "excluded_key"
+                elif self.is_key_cooled_down(key.id):
+                    reason = "cooldown"
+                elif self._get_key_weight(key) <= 0:
+                    reason = "zero_weight"
+                elif not self.key_matches_model_plan(key, model, plan):
+                    reason = "model_not_supported"
+                else:
+                    eligible_ids.add(key.id)
+
+                if reason:
+                    explain_items.append({
+                        "api_key_id": getattr(key, "id", None),
+                        "provider": key_provider,
+                        "key_name": getattr(key, "name", None),
+                        "reason": reason,
+                    })
+
+            key_selection = trace_context.route_summary.setdefault("key_selection", {})
+            key_selection["candidate_count"] = len(eligible_ids) + len(explain_items)
+            key_selection["eligible_count"] = len(eligible_ids)
+            key_selection["skipped"] = explain_items[:80]
+            key_selection["skipped_truncated"] = len(explain_items) > 80
         result = await db.execute(query)
         keys: List[Any] = [
             key for key in result.scalars().all()
@@ -566,9 +634,13 @@ class PoolManager:
                 model,
                 plan,
                 list(excluded_ids),
-                provider=provider or (providers[0] if providers and len(providers) == 1 else None),
+                provider=single_filter_provider,
             )
         ]
+
+        if trace_context:
+            key_selection = trace_context.route_summary.setdefault("key_selection", {})
+            key_selection["eligible_count"] = len(keys)
 
         if not keys:
             return None
@@ -586,6 +658,15 @@ class PoolManager:
                 provider=getattr(selected_key, "provider", None),
                 model=model,
             )
+
+        if trace_context:
+            key_selection = trace_context.route_summary.setdefault("key_selection", {})
+            key_selection["selected"] = {
+                "api_key_id": getattr(selected_key, "id", None),
+                "provider": getattr(selected_key, "provider", None),
+                "key_name": getattr(selected_key, "name", None),
+            }
+            key_selection["selected_reason"] = "weighted_round_robin"
 
         return selected_key
 

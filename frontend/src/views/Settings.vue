@@ -339,6 +339,38 @@
       </div>
     </el-card>
 
+    <!-- OpenAI Plus 配额刷新配置 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('openAIPlusQuotaRefresh')">
+          <div class="setting-card-header-text">
+            <div class="panel-title">OpenAI Plus 配额刷新配置</div>
+            <div class="panel-subtitle">配置官方配额刷新时的账号并发数和单账号超时</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.openAIPlusQuotaRefresh }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.openAIPlusQuotaRefresh" class="setting-card-body">
+        <el-form label-width="180px" v-loading="openAIPlusQuotaRefreshLoading">
+          <el-form-item label="同时刷新账号数">
+            <el-input-number v-model="openAIPlusQuotaRefreshForm.openai_plus_quota_refresh_concurrency" :min="1" :max="20" />
+            <div class="form-tip">刷新官方配额时最多同时请求多少个 Plus 账号。</div>
+          </el-form-item>
+          <el-form-item label="配额请求超时">
+            <el-input-number v-model="openAIPlusQuotaRefreshForm.openai_plus_quota_refresh_timeout_seconds" :min="5" :max="300" />
+            <div class="form-tip">单个账号读取官方配额接口的超时时间，单位秒。</div>
+          </el-form-item>
+          <el-form-item label="Token 刷新超时">
+            <el-input-number v-model="openAIPlusQuotaRefreshForm.openai_plus_quota_token_refresh_timeout_seconds" :min="5" :max="300" />
+            <div class="form-tip">账号 access token 临近过期时，刷新 token 的超时时间，单位秒。</div>
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" :loading="openAIPlusQuotaRefreshSaving" @click="saveOpenAIPlusQuotaRefreshConfig">保存配额刷新配置</el-button>
+          </el-form-item>
+        </el-form>
+      </div>
+    </el-card>
+
     <!-- 过期任务回收配置 -->
     <el-card class="setting-card" shadow="never">
       <template #header>
@@ -435,6 +467,173 @@
           </div>
           <el-form-item>
             <el-button type="primary" :loading="keyCheckShortcutSaving" @click="saveKeyCheckShortcutModels">保存快捷模型</el-button>
+          </el-form-item>
+        </el-form>
+      </div>
+    </el-card>
+
+    <!-- 错误透传配置 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('passThroughError')">
+          <div class="setting-card-header-text">
+            <div class="panel-title">错误透传配置</div>
+            <div class="panel-subtitle">配置哪些错误码直接返回上游响应，不切换 Key、不冷却、不重试</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.passThroughError }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.passThroughError" class="setting-card-body">
+        <el-form label-width="160px" v-loading="passThroughErrorLoading">
+          <el-form-item label="透传错误码">
+            <el-select
+              v-model="passThroughErrorCodes"
+              multiple
+              filterable
+              allow-create
+              default-first-option
+              placeholder="输入错误码后回车添加"
+              style="max-width: 500px"
+            >
+              <el-option :value="429" label="429 (Rate Limit)" />
+              <el-option :value="502" label="502 (Bad Gateway)" />
+              <el-option :value="503" label="503 (Service Unavailable)" />
+              <el-option :value="504" label="504 (Gateway Timeout)" />
+            </el-select>
+            <div class="form-tip">添加后，命中这些错误码时将直接返回上游响应，不切换 Key 重试、不触发冷却。留空表示所有错误码均走默认重试逻辑。</div>
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" :loading="passThroughErrorSaving" @click="savePassThroughErrorCodes">保存透传配置</el-button>
+          </el-form-item>
+        </el-form>
+      </div>
+    </el-card>
+
+    <!-- 代理调试追踪 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('proxyTrace')">
+          <div class="setting-card-header-text">
+            <div class="panel-title">代理调试追踪</div>
+            <div class="panel-subtitle">按需记录一次请求的模型解析、Key 选择、上游耗时与重试/透传判断</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.proxyTrace }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.proxyTrace" class="setting-card-body">
+        <el-form label-width="160px" v-loading="proxyTraceLoading">
+          <el-form-item label="追踪开关">
+            <el-switch
+              v-model="proxyTraceForm.proxy_trace_enabled"
+              active-text="开启"
+              inactive-text="关闭"
+            />
+            <div class="form-tip">默认关闭。开启后仅记录路由决策摘要，不记录完整请求体、响应体、Authorization 或 API Key 明文。</div>
+          </el-form-item>
+          <el-form-item label="保留时间">
+            <el-input-number
+              v-model="proxyTraceForm.proxy_trace_retention_hours"
+              :min="1"
+              :max="168"
+              :step="1"
+              controls-position="right"
+            />
+            <span class="form-inline-unit">小时</span>
+            <div class="form-tip">超过保留时间的追踪记录可通过清理接口删除，建议日常保持较短保留期。</div>
+          </el-form-item>
+          <el-form-item label="采样率">
+            <el-input-number
+              v-model="proxyTraceForm.proxy_trace_sample_rate"
+              :min="0"
+              :max="1"
+              :step="0.1"
+              :precision="2"
+              controls-position="right"
+            />
+            <div class="form-tip">取值 0 到 1，1 表示开启后全部记录，0.1 表示约 10% 请求记录。</div>
+          </el-form-item>
+          <el-form-item label="仅失败请求">
+            <el-switch
+              v-model="proxyTraceForm.proxy_trace_only_failures"
+              active-text="开启"
+              inactive-text="关闭"
+            />
+            <div class="form-tip">开启后成功请求不会落库，只保留失败或异常请求的追踪记录。</div>
+          </el-form-item>
+          <el-form-item label="Provider 过滤">
+            <el-input
+              v-model="proxyTraceForm.proxy_trace_target_provider"
+              placeholder="留空表示不过滤，如 skk"
+              clearable
+              style="max-width: 500px"
+            />
+          </el-form-item>
+          <el-form-item label="模型过滤">
+            <el-input
+              v-model="proxyTraceForm.proxy_trace_target_model"
+              placeholder="留空表示不过滤，如 gpt-5.5"
+              clearable
+              style="max-width: 500px"
+            />
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" :loading="proxyTraceSaving" @click="saveProxyTraceConfig">保存追踪配置</el-button>
+          </el-form-item>
+        </el-form>
+      </div>
+    </el-card>
+
+    <!-- 模型种子配置 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('modelSeed')">
+          <div class="setting-card-header-text">
+            <div class="panel-title">模型种子配置</div>
+            <div class="panel-subtitle">控制模型广场是否自动填充默认模型列表，一键还原后会自动关闭</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.modelSeed }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.modelSeed" class="setting-card-body">
+        <el-form label-width="160px">
+          <el-form-item label="默认模型回填">
+            <el-switch
+              v-model="modelSeedEnabled"
+              active-text="开启"
+              inactive-text="关闭"
+              @change="handleModelSeedChange"
+            />
+            <div class="form-tip">开启后，模型广场会自动填充系统预设的默认模型；关闭后模型广场仅展示与实际 Key 关联的模型。一键还原后会自动关闭此开关。</div>
+          </el-form-item>
+        </el-form>
+      </div>
+    </el-card>
+
+    <!-- 一键还原 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('factoryReset')">
+          <div class="setting-card-header-text">
+            <div class="panel-title" style="color: #f56c6c">一键还原</div>
+            <div class="panel-subtitle">清除非保留提供商的所有数据，此操作不可逆，请谨慎使用</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.factoryReset }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.factoryReset" class="setting-card-body">
+        <el-form label-width="160px">
+          <el-form-item label="保留提供商">
+            <el-input
+              v-model="factoryResetKeepProviders"
+              placeholder="输入保留的提供商名称，逗号分隔（如 bb,bbimg）"
+              style="max-width: 500px"
+              clearable
+            />
+            <div class="form-tip">输入需要保留的提供商名称，多个用逗号分隔。这些提供商对应的 Key 及其使用记录将被保留。不输入则清空所有提供商数据。</div>
+          </el-form-item>
+          <el-form-item>
+            <el-button type="danger" :loading="factoryResetLoading" @click="handleFactoryReset">一键还原</el-button>
+            <div class="form-tip" style="color: #f56c6c">此操作将永久删除非保留提供商的所有 Key、使用记录、图片任务等数据，且不可恢复。</div>
           </el-form-item>
         </el-form>
       </div>
@@ -591,9 +790,9 @@ message = client.messages.create(
 
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown } from '@element-plus/icons-vue'
-import { adminApi, authApi } from '../api'
+import { adminApi, authApi, copyText } from '../api'
 import { useDisplaySettings } from '../stores/displaySettings'
 
 const { state: displayState, setTokenUnitAutoM } = useDisplaySettings()
@@ -626,11 +825,16 @@ const expandedCards = reactive({
   streamBuffer: savedCardState.streamBuffer ?? false,
   proxyTimeout: savedCardState.proxyTimeout !== false,
   imageAutoRefresh: savedCardState.imageAutoRefresh ?? false,   // 默认折叠
+  openAIPlusQuotaRefresh: savedCardState.openAIPlusQuotaRefresh ?? false,
   staleTaskCleanup: savedCardState.staleTaskCleanup ?? false,
   keyCheckDefault: savedCardState.keyCheckDefault !== false,
   keyCheckShortcut: savedCardState.keyCheckShortcut ?? false,
   usageGuide: savedCardState.usageGuide ?? false,
   changePassword: savedCardState.changePassword ?? false,
+  passThroughError: savedCardState.passThroughError ?? false,
+  proxyTrace: savedCardState.proxyTrace ?? false,
+  modelSeed: savedCardState.modelSeed ?? false,
+  factoryReset: savedCardState.factoryReset ?? false,
 })
 
 const toggleCard = (key) => {
@@ -651,10 +855,36 @@ const proxyTimeoutLoading = ref(false)
 const proxyTimeoutSaving = ref(false)
 const imageAutoRefreshLoading = ref(false)
 const imageAutoRefreshSaving = ref(false)
+const openAIPlusQuotaRefreshLoading = ref(false)
+const openAIPlusQuotaRefreshSaving = ref(false)
 const staleTaskCleanupLoading = ref(false)
 const staleTaskCleanupSaving = ref(false)
 const keyCheckDefaultLoading = ref(false)
 const keyCheckDefaultSaving = ref(false)
+
+// 透传错误码
+const passThroughErrorLoading = ref(false)
+const passThroughErrorSaving = ref(false)
+const passThroughErrorCodes = ref([])
+
+// 代理调试追踪
+const proxyTraceLoading = ref(false)
+const proxyTraceSaving = ref(false)
+const proxyTraceForm = reactive({
+  proxy_trace_enabled: false,
+  proxy_trace_retention_hours: 24,
+  proxy_trace_sample_rate: 1,
+  proxy_trace_only_failures: false,
+  proxy_trace_target_provider: '',
+  proxy_trace_target_model: '',
+})
+
+// 模型种子
+const modelSeedEnabled = ref(true)
+
+// 一键还原
+const factoryResetKeepProviders = ref('')
+const factoryResetLoading = ref(false)
 const keyCheckShortcutLoading = ref(false)
 const keyCheckShortcutSaving = ref(false)
 
@@ -889,6 +1119,11 @@ const passwordRules = {
 const ccSwitchForm = reactive({ name: '', model: '', haikuModel: '', sonnetModel: '', opusModel: '' })
 const proxyTimeoutForm = reactive({ proxy_request_timeout_seconds: 60, proxy_stream_connect_timeout_seconds: 15, proxy_stream_first_byte_timeout_seconds: 15, proxy_stream_read_timeout_seconds: 45 })
 const imageAutoRefreshForm = reactive({ image_auto_refresh_delay_seconds: 60, image_auto_refresh_interval_seconds: 30, image_auto_refresh_max_attempts: 10 })
+const openAIPlusQuotaRefreshForm = reactive({
+  openai_plus_quota_refresh_concurrency: 5,
+  openai_plus_quota_refresh_timeout_seconds: 30,
+  openai_plus_quota_token_refresh_timeout_seconds: 60,
+})
 const staleTaskCleanupForm = reactive({ image_stale_task_cleanup_interval_seconds: 60, image_history_refresh_interval_seconds: 5, image_result_meta_cleanup_interval_seconds: 1800 })
 const keyCheckDefaultForm = reactive({ default_key_check_model: '' })
 const keyCheckShortcutForm = reactive({ shortcut_models: ['', '', '', '', '', ''] })
@@ -980,6 +1215,11 @@ const loadImageAutoRefreshConfig = async () => {
   try { const data = await adminApi.getImageAutoRefreshConfig(); Object.assign(imageAutoRefreshForm, data) } catch (e) { ElMessage.error(e.message) } finally { imageAutoRefreshLoading.value = false }
 }
 
+const loadOpenAIPlusQuotaRefreshConfig = async () => {
+  openAIPlusQuotaRefreshLoading.value = true
+  try { const data = await adminApi.getOpenAIPlusQuotaRefreshConfig(); Object.assign(openAIPlusQuotaRefreshForm, data) } catch (e) { ElMessage.error(e.message) } finally { openAIPlusQuotaRefreshLoading.value = false }
+}
+
 const loadStaleTaskCleanupConfig = async () => {
   staleTaskCleanupLoading.value = true
   try { const data = await adminApi.getStaleTaskCleanupConfig(); Object.assign(staleTaskCleanupForm, data) } catch (e) { ElMessage.error(e.message) } finally { staleTaskCleanupLoading.value = false }
@@ -1035,6 +1275,12 @@ const saveImageAutoRefreshConfig = async () => {
   catch (e) { ElMessage.error(e.message) } finally { imageAutoRefreshSaving.value = false }
 }
 
+const saveOpenAIPlusQuotaRefreshConfig = async () => {
+  openAIPlusQuotaRefreshSaving.value = true
+  try { const data = await adminApi.updateOpenAIPlusQuotaRefreshConfig({ ...openAIPlusQuotaRefreshForm }); Object.assign(openAIPlusQuotaRefreshForm, data); ElMessage.success('OpenAI Plus 配额刷新配置已保存') }
+  catch (e) { ElMessage.error(e.message) } finally { openAIPlusQuotaRefreshSaving.value = false }
+}
+
 const saveStaleTaskCleanupConfig = async () => {
   staleTaskCleanupSaving.value = true
   try { const data = await adminApi.updateStaleTaskCleanupConfig({ ...staleTaskCleanupForm }); Object.assign(staleTaskCleanupForm, data); ElMessage.success('过期任务回收配置已保存') }
@@ -1067,7 +1313,7 @@ const saveKeyCheckShortcutModels = async () => {
   } catch (e) { ElMessage.error(e.message) } finally { keyCheckShortcutSaving.value = false }
 }
 
-const copyMasterKey = () => { navigator.clipboard.writeText(masterKey.value); ElMessage.success('已复制到剪贴板') }
+const copyMasterKey = async () => { try { await copyText(masterKey.value); ElMessage.success('已复制到剪贴板') } catch { ElMessage.error('复制失败') } }
 
 const setDefaultName = () => { if (nameTouched.value) return; ccSwitchForm.name = defaultNames.value[selectedApp.value] || `local ${selectedApp.value}` }
 
@@ -1124,21 +1370,134 @@ const loadLoginConfig = async () => {
   try { const res = await authApi.getConfig(); loginEnabled.value = !!res.login_enabled } catch { loginEnabled.value = false }
 }
 
+// ── 模型种子配置 ──────────────────────────────────────────
+const loadModelSeedConfig = async () => {
+  try {
+    const data = await adminApi.getModelSeedConfig()
+    modelSeedEnabled.value = !!data?.model_seed_enabled
+  } catch { modelSeedEnabled.value = true }
+}
+
+const handleModelSeedChange = async (val) => {
+  try {
+    const data = await adminApi.updateModelSeedConfig({ model_seed_enabled: val })
+    modelSeedEnabled.value = !!data?.model_seed_enabled
+    ElMessage.success(val ? '已开启默认模型回填' : '已关闭默认模型回填，模型广场仅展示与 Key 关联的模型')
+  } catch (e) {
+    modelSeedEnabled.value = !val
+    ElMessage.error(e.message || '更新失败')
+  }
+}
+
+// ── 透传错误码 ──────────────────────────────────────────
+const loadPassThroughErrorCodes = async () => {
+  passThroughErrorLoading.value = true
+  try {
+    const data = await adminApi.getPassThroughErrorCodes()
+    passThroughErrorCodes.value = data?.pass_through_error_codes || []
+  } catch { passThroughErrorCodes.value = [] }
+  finally { passThroughErrorLoading.value = false }
+}
+
+const savePassThroughErrorCodes = async () => {
+  passThroughErrorSaving.value = true
+  try {
+    const data = await adminApi.updatePassThroughErrorCodes({
+      pass_through_error_codes: passThroughErrorCodes.value.map(Number),
+    })
+    passThroughErrorCodes.value = data?.pass_through_error_codes || []
+    ElMessage.success('透传配置已保存')
+  } catch (e) { ElMessage.error(e.message || '保存失败') }
+  finally { passThroughErrorSaving.value = false }
+}
+
+// ── 代理调试追踪 ──────────────────────────────────────────
+const loadProxyTraceConfig = async () => {
+  proxyTraceLoading.value = true
+  try {
+    const data = await adminApi.getProxyTraceConfig()
+    Object.assign(proxyTraceForm, data || {})
+  } catch (e) {
+    ElMessage.error(e.message || '加载代理调试追踪配置失败')
+  } finally {
+    proxyTraceLoading.value = false
+  }
+}
+
+const saveProxyTraceConfig = async () => {
+  proxyTraceSaving.value = true
+  try {
+    const payload = {
+      ...proxyTraceForm,
+      proxy_trace_target_provider: (proxyTraceForm.proxy_trace_target_provider || '').trim(),
+      proxy_trace_target_model: (proxyTraceForm.proxy_trace_target_model || '').trim(),
+    }
+    const data = await adminApi.updateProxyTraceConfig(payload)
+    Object.assign(proxyTraceForm, data || {})
+    ElMessage.success('代理调试追踪配置已保存')
+  } catch (e) {
+    ElMessage.error(e.message || '保存代理调试追踪配置失败')
+  } finally {
+    proxyTraceSaving.value = false
+  }
+}
+
+// ── 一键还原 ──────────────────────────────────────────
+const handleFactoryReset = async () => {
+  const keepProvidersStr = (factoryResetKeepProviders.value || '').trim()
+  const keepProviders = keepProvidersStr
+    ? keepProvidersStr.split(/[,，]/).map(s => s.trim()).filter(Boolean)
+    : []
+
+  try {
+    await ElMessageBox.confirm(
+      '此操作将永久删除非保留提供商的所有数据（Key、使用记录、图片任务等），且不可恢复。是否继续？',
+      '危险操作确认',
+      { confirmButtonText: '我已了解风险，继续', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch { return }
+
+  try {
+    const { value } = await ElMessageBox.prompt(
+      '请输入"确认还原"以确认执行此操作',
+      '最终确认',
+      { confirmButtonText: '执行还原', cancelButtonText: '取消', inputPattern: /^确认还原$/, inputErrorMessage: '请输入"确认还原"' },
+    )
+    if (value !== '确认还原') return
+  } catch { return }
+
+  factoryResetLoading.value = true
+  try {
+    const result = await adminApi.factoryReset({
+      keep_providers: keepProviders,
+      confirmation: '确认还原',
+    })
+    ElMessage.success(result.message || '还原完成')
+  } catch (e) { ElMessage.error(e.message || '一键还原失败') }
+  finally { factoryResetLoading.value = false }
+}
+
 onMounted(async () => {
-  await loadMasterKey()
-  await loadLoginConfig()
-  await loadModels()
-  await loadProxyTimeoutConfig()
-  await loadImageAutoRefreshConfig()
-  await loadStaleTaskCleanupConfig()
-  await loadKeyCheckDefaultConfig()
-  await loadExportMeta().catch(() => false)
-  await loadKeyCheckShortcutModels()
-  await loadProviderExtConfig()
-  await loadBalanceDowngradeRules()
-  await loadShowActualModel()
-  await loadProviderMigrationRules()
-  await loadStreamBufferRules()
+  await Promise.all([
+    loadMasterKey(),
+    loadLoginConfig(),
+    loadModels(),
+    loadProxyTimeoutConfig(),
+    loadImageAutoRefreshConfig(),
+    loadOpenAIPlusQuotaRefreshConfig(),
+    loadStaleTaskCleanupConfig(),
+    loadKeyCheckDefaultConfig(),
+    loadExportMeta().catch(() => false),
+    loadKeyCheckShortcutModels(),
+    loadProviderExtConfig(),
+    loadBalanceDowngradeRules(),
+    loadShowActualModel(),
+    loadProviderMigrationRules(),
+    loadStreamBufferRules(),
+    loadPassThroughErrorCodes(),
+    loadProxyTraceConfig(),
+    loadModelSeedConfig(),
+  ])
 })
 </script>
 

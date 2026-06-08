@@ -4,8 +4,20 @@ FastAPI application entrypoint.
 
 import asyncio
 import logging
+import mimetypes
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# 强制注册关键 MIME 类型，防止某些服务器环境（尤其 Linux）返回 text/plain
+mimetypes.add_type("application/javascript", ".js")
+mimetypes.add_type("text/javascript", ".mjs")
+mimetypes.add_type("text/css", ".css")
+mimetypes.add_type("image/svg+xml", ".svg")
+mimetypes.add_type("image/webp", ".webp")
+mimetypes.add_type("font/woff2", ".woff2")
+mimetypes.add_type("font/woff", ".woff")
+mimetypes.add_type("application/json", ".json")
+mimetypes.add_type("application/wasm", ".wasm")
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -110,6 +122,15 @@ app.include_router(proxy_router, tags=["proxy"])
 app.include_router(openai_plus_router, tags=["openai-plus"])
 
 
+def _guess_media_type(filepath: Path) -> str | None:
+    """推断文件 MIME 类型，对 .js/.mjs 强制返回正确类型防止白屏。"""
+    suffix = filepath.suffix.lower()
+    if suffix in (".js", ".mjs"):
+        return "application/javascript"
+    guessed, _ = mimetypes.guess_type(str(filepath))
+    return guessed
+
+
 def _serve_frontend_file(request_path: str) -> FileResponse:
     if not FRONTEND_DIST_DIR.exists():
         raise HTTPException(status_code=404, detail="Frontend build not found")
@@ -119,7 +140,8 @@ def _serve_frontend_file(request_path: str) -> FileResponse:
         candidate = (FRONTEND_DIST_DIR / normalized_path).resolve()
         if candidate.is_file() and candidate.is_relative_to(FRONTEND_DIST_DIR):
             headers = {"Cache-Control": "no-cache"} if candidate.suffix == ".html" else {}
-            return FileResponse(candidate, headers=headers)
+            media_type = _guess_media_type(candidate)
+            return FileResponse(candidate, headers=headers, media_type=media_type)
 
     return FileResponse(FRONTEND_DIST_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 

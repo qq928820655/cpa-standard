@@ -4,6 +4,7 @@
 from typing import Optional, Any
 from datetime import datetime
 import hashlib
+import time
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy import select
@@ -13,6 +14,7 @@ from config import settings
 from database import get_db
 from services.pool_manager import pool_manager
 from services.proxy_service import proxy_service
+from services.proxy_trace_service import proxy_trace_service
 
 
 router = APIRouter()
@@ -40,7 +42,16 @@ def log_proxy_hit(path: str, body: dict):
     print(f"[CPA HIT] path={path} model={model} stream={stream}")
 
 
+def should_pass_through_error(status_code: int) -> bool:
+    """判断该状态码是否应直接透传上游响应（不换 Key、不冷却、不重试）"""
+    from config import export_config
+    codes = export_config.get("pass_through_error_codes") or []
+    return status_code in codes
+
+
 def should_cooldown_key(status_code: int) -> bool:
+    if should_pass_through_error(status_code):
+        return False
     return status_code in {401, 403, 429} or status_code >= 500
 
 
@@ -58,6 +69,8 @@ def is_nginx_error_response(response_data: Any) -> bool:
 
 def should_retry_on_status(status_code: int, response_data: Any) -> bool:
     """判断该状态码是否应该换 Key 重试（而不是直接返回）"""
+    if should_pass_through_error(status_code):
+        return False
     if status_code in {401, 403, 429} or status_code >= 500:
         return True
     # 4xx 中，如果是 nginx/代理层的错误页，也应该换 Key 重试
@@ -195,6 +208,18 @@ PERMANENT_KEY_FAILURE_KEYWORDS = [
     "invalid api key",
     "invalid_api_key",
     "incorrect api key",
+    "user has been banned",
+    "account has been banned",
+    "key has been banned",
+    "user banned",
+    "account banned",
+    "banned",
+    "账号已封禁",
+    "用户已封禁",
+    "账户已封禁",
+    "账号被封禁",
+    "用户被封禁",
+    "账户被封禁",
 ]
 
 
@@ -468,6 +493,7 @@ async def select_api_key(
     filter_providers: Optional[list[str]] = None,
     filter_key_name: Optional[str] = None,
     exclude_providers: Optional[list[str]] = None,
+    trace_ctx: Any = None,
 ):
     sticky_ttl_seconds = settings.proxy_session_sticky_ttl_seconds if sticky_session_key else 0
     return await pool_manager.get_next_key(
@@ -480,6 +506,7 @@ async def select_api_key(
         providers=filter_providers or None,
         key_name=filter_key_name,
         exclude_providers=exclude_providers or None,
+        trace_context=trace_ctx,
     )
 
 
@@ -500,6 +527,61 @@ async def build_upstream_body_for_key(
     upstream_body = dict(body)
     upstream_body["model"] = upstream_model
     return upstream_body, upstream_model
+
+
+def _trace_attempt(
+    trace_ctx,
+    *,
+    api_key: Any,
+    requested_model: Optional[str],
+    upstream_model: Optional[str],
+    status_code: Optional[int],
+    upstream_latency_ms: int,
+    action: str,
+    response_data: Any = None,
+) -> None:
+    if trace_ctx is None:
+        return
+    trace_ctx.add_attempt(
+        api_key_id=getattr(api_key, "id", None),
+        provider=getattr(api_key, "provider", None),
+        key_name=getattr(api_key, "name", None),
+        requested_model=requested_model,
+        upstream_model=upstream_model,
+        status_code=status_code,
+        upstream_latency_ms=upstream_latency_ms,
+        pass_through=bool(status_code and should_pass_through_error(status_code)),
+        retry=bool(status_code and should_retry_on_status(status_code, response_data)),
+        cooldown=bool(status_code and should_cooldown_key(status_code)),
+        permanent_failure=bool(is_permanent_key_failure(status_code, response_data)),
+        service_unavailable=bool(is_service_unavailable_error(response_data)),
+        action=action,
+    )
+
+
+async def _save_trace(
+    db: AsyncSession,
+    trace_ctx,
+    *,
+    api_key: Any = None,
+    status_code: Optional[int] = None,
+    result_status: Optional[str] = None,
+    started_at: float,
+    upstream_latency_ms: int,
+    error_summary: Any = None,
+) -> None:
+    if trace_ctx is None:
+        return
+    await proxy_trace_service.save(
+        db,
+        trace_ctx,
+        api_key=api_key,
+        status_code=status_code,
+        result_status=result_status or ("success" if status_code and status_code < 400 else "error"),
+        latency_ms=int((time.perf_counter() - started_at) * 1000),
+        upstream_latency_ms=upstream_latency_ms,
+        error_summary=error_summary,
+    )
 
 
 async def forward_stream_with_retry(
@@ -529,6 +611,27 @@ async def forward_stream_with_retry(
         if not original_model:
             original_model = actual_model
     model = body.get("model") if isinstance(body, dict) else None
+    trace_ctx = proxy_trace_service.create_context(
+        requested_model=raw_model,
+        actual_model=model,
+        provider=(filter_providers[0] if filter_providers and len(filter_providers) == 1 else None),
+        providers=filter_providers or None,
+        key_name=filter_key_name,
+        user_id=user_id,
+    )
+    if trace_ctx:
+        trace_ctx.set_route("path", path)
+        trace_ctx.set_route("method", method)
+        trace_ctx.set_route("request_type", "stream")
+        trace_ctx.set_route("directive", {
+            "raw_model": raw_model,
+            "actual_model": actual_model,
+            "providers": filter_providers,
+            "key_name": filter_key_name,
+        })
+    trace_started_at = time.perf_counter()
+    trace_upstream_ms = 0
+    trace_selected_api_key = None
     sticky_session_key = get_sticky_session_key(headers, model)
     tried_key_ids = []
     last_status_code = 503
@@ -549,6 +652,7 @@ async def forward_stream_with_retry(
             filter_providers=filter_providers or None,
             filter_key_name=filter_key_name,
             exclude_providers=service_unavailable_providers or None,
+            trace_ctx=trace_ctx,
         )
         if not api_key:
             break
@@ -565,6 +669,7 @@ async def forward_stream_with_retry(
         else:
             stream_fn = proxy_service.forward_stream
 
+        attempt_started_at = time.perf_counter()
         status_code, response_headers, stream_response, retryable = await stream_fn(
             db=db,
             api_key=api_key,
@@ -576,7 +681,20 @@ async def forward_stream_with_retry(
             user_id=user_id,
             original_model=original_model,
         )
+        attempt_ms = int((time.perf_counter() - attempt_started_at) * 1000)
+        trace_upstream_ms += attempt_ms
+        trace_selected_api_key = api_key
         if status_code < 400:
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="success",
+                response_data=stream_response,
+            )
             pool_manager.clear_key_cooldown(api_key.id)
             if sticky_session_key:
                 pool_manager.bind_session_to_key(
@@ -586,6 +704,14 @@ async def forward_stream_with_retry(
                     provider=getattr(api_key, "provider", None),
                     model=model,
                 )
+            await _save_trace(
+                db,
+                trace_ctx,
+                api_key=api_key,
+                status_code=status_code,
+                started_at=trace_started_at,
+                upstream_latency_ms=trace_upstream_ms,
+            )
             return status_code, response_headers, stream_response, api_key
 
         last_status_code = status_code
@@ -594,6 +720,16 @@ async def forward_stream_with_retry(
 
         # 服务暂不可用：切换到其他提供商的 Key，不计入重试次数，对客户端透明
         if is_service_unavailable_error(stream_response):
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="switch_provider",
+                response_data=stream_response,
+            )
             provider = getattr(api_key, "provider", None) or ""
             if provider and provider not in service_unavailable_providers:
                 service_unavailable_providers.append(provider)
@@ -613,6 +749,16 @@ async def forward_stream_with_retry(
             sticky_session_key=sticky_session_key,
         ):
             # 永久失败：禁用 Key，不消耗 retry_count，继续尝试下一个
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="disable_or_downgrade",
+                response_data=stream_response,
+            )
             disable_count += 1
             continue
 
@@ -625,10 +771,48 @@ async def forward_stream_with_retry(
             print(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
 
         if not retryable:
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="pass_through" if should_pass_through_error(status_code) else "return_error",
+                response_data=stream_response,
+            )
+            await _save_trace(
+                db,
+                trace_ctx,
+                api_key=api_key,
+                status_code=status_code,
+                started_at=trace_started_at,
+                upstream_latency_ms=trace_upstream_ms,
+                error_summary=stream_response,
+            )
             break
 
+        _trace_attempt(
+            trace_ctx,
+            api_key=api_key,
+            requested_model=model,
+            upstream_model=upstream_model,
+            status_code=status_code,
+            upstream_latency_ms=attempt_ms,
+            action="retry_next_key",
+            response_data=stream_response,
+        )
         retry_count += 1
 
+    await _save_trace(
+        db,
+        trace_ctx,
+        api_key=trace_selected_api_key,
+        status_code=last_status_code,
+        started_at=trace_started_at,
+        upstream_latency_ms=trace_upstream_ms,
+        error_summary=last_response_body,
+    )
     return last_status_code, last_response_headers, last_response_body, None
 
 
@@ -656,6 +840,26 @@ async def forward_request_with_retry(
         if not original_model:
             original_model = actual_model
     model = body.get("model") if isinstance(body, dict) else None
+    trace_ctx = proxy_trace_service.create_context(
+        requested_model=raw_model,
+        actual_model=model,
+        provider=(filter_providers[0] if filter_providers and len(filter_providers) == 1 else None),
+        providers=filter_providers or None,
+        key_name=filter_key_name,
+        user_id=user_id,
+    )
+    if trace_ctx:
+        trace_ctx.set_route("path", path)
+        trace_ctx.set_route("method", method)
+        trace_ctx.set_route("directive", {
+            "raw_model": raw_model,
+            "actual_model": actual_model,
+            "providers": filter_providers,
+            "key_name": filter_key_name,
+        })
+    trace_started_at = time.perf_counter()
+    trace_upstream_ms = 0
+    trace_selected_api_key = None
     sticky_session_key = get_sticky_session_key(headers, model)
     tried_key_ids = []
     last_status_code = 503
@@ -677,6 +881,7 @@ async def forward_request_with_retry(
             filter_providers=filter_providers or None,
             filter_key_name=filter_key_name,
             exclude_providers=service_unavailable_providers or None,
+            trace_ctx=trace_ctx,
         )
         if not api_key:
             break
@@ -684,6 +889,7 @@ async def forward_request_with_retry(
         tried_key_ids.append(api_key.id)
         print(f"[CPA REQUEST RETRY] retry={retry_count} disable={disable_count} api_key_id={api_key.id} model={model} path={path}")
         upstream_body, upstream_model = await build_upstream_body_for_key(db, api_key, body, model, filter_providers or None)
+        attempt_started_at = time.perf_counter()
         status_code, response_headers, response_data = await proxy_service.forward_request(
             db=db,
             api_key=api_key,
@@ -694,7 +900,20 @@ async def forward_request_with_retry(
             user_id=user_id,
             original_model=original_model,
         )
+        attempt_ms = int((time.perf_counter() - attempt_started_at) * 1000)
+        trace_upstream_ms += attempt_ms
+        trace_selected_api_key = api_key
         if status_code < 400:
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="success",
+                response_data=response_data,
+            )
             pool_manager.clear_key_cooldown(api_key.id)
             if sticky_session_key:
                 pool_manager.bind_session_to_key(
@@ -704,6 +923,14 @@ async def forward_request_with_retry(
                     provider=getattr(api_key, "provider", None),
                     model=model,
                 )
+            await _save_trace(
+                db,
+                trace_ctx,
+                api_key=api_key,
+                status_code=status_code,
+                started_at=trace_started_at,
+                upstream_latency_ms=trace_upstream_ms,
+            )
             return status_code, response_headers, response_data, api_key
 
         last_status_code = status_code
@@ -712,6 +939,16 @@ async def forward_request_with_retry(
 
         # 服务暂不可用：切换到其他提供商的 Key，不计入重试次数，对客户端透明
         if is_service_unavailable_error(response_data):
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="switch_provider",
+                response_data=response_data,
+            )
             provider = getattr(api_key, "provider", None) or ""
             if provider and provider not in service_unavailable_providers:
                 service_unavailable_providers.append(provider)
@@ -730,6 +967,16 @@ async def forward_request_with_retry(
             response_data=response_data,
             sticky_session_key=sticky_session_key,
         ):
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="disable_or_downgrade",
+                response_data=response_data,
+            )
             # 永久失败：禁用 Key，不消耗 retry_count，继续尝试下一个
             disable_count += 1
             continue
@@ -742,6 +989,16 @@ async def forward_request_with_retry(
             and is_cloudflare_524_response(status_code, response_data)
             and pool_manager.is_cloudflare_524_auto_continue_enabled(getattr(api_key, "provider", None))
         ):
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="auto_continue",
+                response_data=response_data,
+            )
             auto_continue_body = append_continue_message(body)
             auto_continue_upstream_body, _auto_continue_upstream_model = await build_upstream_body_for_key(
                 db,
@@ -752,6 +1009,7 @@ async def forward_request_with_retry(
             )
             auto_continue_used = True
             print(f"[CPA CLOUDFLARE 524 AUTO CONTINUE] api_key_id={api_key.id} provider={getattr(api_key, 'provider', None)} model={model} path={path}")
+            auto_continue_attempt_started_at = time.perf_counter()
             status_code, response_headers, response_data = await proxy_service.forward_request(
                 db=db,
                 api_key=api_key,
@@ -762,7 +1020,19 @@ async def forward_request_with_retry(
                 user_id=user_id,
                 original_model=original_model,
             )
+            auto_continue_attempt_ms = int((time.perf_counter() - auto_continue_attempt_started_at) * 1000)
+            trace_upstream_ms += auto_continue_attempt_ms
             if status_code < 400:
+                _trace_attempt(
+                    trace_ctx,
+                    api_key=api_key,
+                    requested_model=model,
+                    upstream_model=_auto_continue_upstream_model,
+                    status_code=status_code,
+                    upstream_latency_ms=auto_continue_attempt_ms,
+                    action="auto_continue_success",
+                    response_data=response_data,
+                )
                 pool_manager.clear_key_cooldown(api_key.id)
                 if sticky_session_key:
                     pool_manager.bind_session_to_key(
@@ -772,7 +1042,25 @@ async def forward_request_with_retry(
                         provider=getattr(api_key, "provider", None),
                         model=model,
                     )
+                await _save_trace(
+                    db,
+                    trace_ctx,
+                    api_key=api_key,
+                    status_code=status_code,
+                    started_at=trace_started_at,
+                    upstream_latency_ms=trace_upstream_ms,
+                )
                 return status_code, response_headers, response_data, api_key
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=_auto_continue_upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=auto_continue_attempt_ms,
+                action="auto_continue_failed",
+                response_data=response_data,
+            )
             last_status_code = status_code
             last_response_headers = response_headers
             last_response_body = response_data
@@ -782,11 +1070,72 @@ async def forward_request_with_retry(
             pool_manager.mark_key_cooldown(api_key.id, cooldown_seconds)
             print(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
 
-        if not should_retry_on_status(status_code, response_data):
+        # 透传错误：不重试，直接返回上游响应
+        if should_pass_through_error(status_code):
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="pass_through",
+                response_data=response_data,
+            )
+            await _save_trace(
+                db,
+                trace_ctx,
+                api_key=api_key,
+                status_code=status_code,
+                started_at=trace_started_at,
+                upstream_latency_ms=trace_upstream_ms,
+                error_summary=" | ".join(collect_upstream_error_texts(response_data)),
+            )
             return status_code, response_headers, response_data, api_key
 
+        if not should_retry_on_status(status_code, response_data):
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="return_error",
+                response_data=response_data,
+            )
+            await _save_trace(
+                db,
+                trace_ctx,
+                api_key=api_key,
+                status_code=status_code,
+                started_at=trace_started_at,
+                upstream_latency_ms=trace_upstream_ms,
+                error_summary=" | ".join(collect_upstream_error_texts(response_data)),
+            )
+            return status_code, response_headers, response_data, api_key
+
+        _trace_attempt(
+            trace_ctx,
+            api_key=api_key,
+            requested_model=model,
+            upstream_model=upstream_model,
+            status_code=status_code,
+            upstream_latency_ms=attempt_ms,
+            action="retry_next_key",
+            response_data=response_data,
+        )
         retry_count += 1
 
+    await _save_trace(
+        db,
+        trace_ctx,
+        api_key=trace_selected_api_key,
+        status_code=last_status_code,
+        started_at=trace_started_at,
+        upstream_latency_ms=trace_upstream_ms,
+        error_summary=" | ".join(collect_upstream_error_texts(last_response_body)),
+    )
     return last_status_code, last_response_headers, last_response_body, None
 
 
@@ -809,6 +1158,18 @@ async def forward_image_request_with_retry(
             model = model_value[0] if model_value else None
         else:
             model = model_value
+    trace_ctx = proxy_trace_service.create_context(
+        requested_model=model,
+        actual_model=model,
+        user_id=user_id,
+    )
+    if trace_ctx:
+        trace_ctx.set_route("path", path)
+        trace_ctx.set_route("method", method)
+        trace_ctx.set_route("request_type", "image")
+    trace_started_at = time.perf_counter()
+    trace_upstream_ms = 0
+    trace_selected_api_key = None
 
     sticky_session_key = get_sticky_session_key(headers, model)
     tried_key_ids = []
@@ -822,12 +1183,14 @@ async def forward_image_request_with_retry(
             model=model,
             sticky_session_key=sticky_session_key,
             tried_key_ids=tried_key_ids,
+            trace_ctx=trace_ctx,
         )
         if not api_key:
             break
 
         tried_key_ids.append(api_key.id)
         print(f"[CPA IMAGE RETRY] attempt={attempt + 1} api_key_id={api_key.id} model={model} path={path}")
+        attempt_started_at = time.perf_counter()
         status_code, response_headers, response_data = await proxy_service.forward_image_request(
             db=db,
             api_key=api_key,
@@ -839,7 +1202,20 @@ async def forward_image_request_with_retry(
             files=files,
             user_id=user_id,
         )
+        attempt_ms = int((time.perf_counter() - attempt_started_at) * 1000)
+        trace_upstream_ms += attempt_ms
+        trace_selected_api_key = api_key
         if status_code < 400:
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="success",
+                response_data=response_data,
+            )
             pool_manager.clear_key_cooldown(api_key.id)
             if sticky_session_key:
                 pool_manager.bind_session_to_key(
@@ -849,6 +1225,14 @@ async def forward_image_request_with_retry(
                     provider=getattr(api_key, "provider", None),
                     model=model,
                 )
+            await _save_trace(
+                db,
+                trace_ctx,
+                api_key=api_key,
+                status_code=status_code,
+                started_at=trace_started_at,
+                upstream_latency_ms=trace_upstream_ms,
+            )
             return status_code, response_headers, response_data
 
         last_status_code = status_code
@@ -862,6 +1246,16 @@ async def forward_image_request_with_retry(
             response_data=response_data,
             sticky_session_key=sticky_session_key,
         ):
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="disable_or_downgrade",
+                response_data=response_data,
+            )
             continue
 
         if sticky_session_key:
@@ -871,9 +1265,72 @@ async def forward_image_request_with_retry(
             cooldown_seconds = pool_manager.get_cooldown_seconds_for_status(status_code)
             pool_manager.mark_key_cooldown(api_key.id, cooldown_seconds)
             print(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
-        if status_code not in {401, 403, 429} and status_code < 500:
+
+        # 透传错误：不重试，直接返回上游响应
+        if should_pass_through_error(status_code):
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="pass_through",
+                response_data=response_data,
+            )
+            await _save_trace(
+                db,
+                trace_ctx,
+                api_key=api_key,
+                status_code=status_code,
+                started_at=trace_started_at,
+                upstream_latency_ms=trace_upstream_ms,
+                error_summary=" | ".join(collect_upstream_error_texts(response_data)),
+            )
             return status_code, response_headers, response_data
 
+        if status_code not in {401, 403, 429} and status_code < 500:
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="return_error",
+                response_data=response_data,
+            )
+            await _save_trace(
+                db,
+                trace_ctx,
+                api_key=api_key,
+                status_code=status_code,
+                started_at=trace_started_at,
+                upstream_latency_ms=trace_upstream_ms,
+                error_summary=" | ".join(collect_upstream_error_texts(response_data)),
+            )
+            return status_code, response_headers, response_data
+
+        _trace_attempt(
+            trace_ctx,
+            api_key=api_key,
+            requested_model=model,
+            upstream_model=model,
+            status_code=status_code,
+            upstream_latency_ms=attempt_ms,
+            action="retry_next_key",
+            response_data=response_data,
+        )
+
+    await _save_trace(
+        db,
+        trace_ctx,
+        api_key=trace_selected_api_key,
+        status_code=last_status_code,
+        started_at=trace_started_at,
+        upstream_latency_ms=trace_upstream_ms,
+        error_summary=" | ".join(collect_upstream_error_texts(last_response_body)),
+    )
     return last_status_code, last_response_headers, last_response_body
 
 
@@ -1315,17 +1772,16 @@ async def openai_chat_completions(
     body, original_model, _mapped_providers, _mapped_key = await _apply_model_mapping_async(body, auth_info, db)
 
     # 确定最终的 provider/key 过滤：
-    # - 触发了映射且映射目标有 {provider} 前缀 → 用映射目标的过滤
-    # - 触发了映射但目标无前缀 → 清空过滤（在所有供应商里找）
-    # - 未触发映射 → 用原始请求的 {provider} 过滤
+    # - 映射目标显式带 {provider} 前缀 → 使用映射目标的过滤
+    # - 原始请求显式带 {provider} 前缀 → 即使模型映射触发，也继续保留原始过滤
+    # - 未显式指定 provider 且触发模型映射 → 清空过滤，在所有供应商里找
     if _mapped_providers or _mapped_key:
         _dir_providers = _mapped_providers
         _dir_key = _mapped_key
-    elif body.get("model") != _clean_model:
-        # 触发了映射（body 里的 model 已变化），清空原始 provider 过滤
+    elif body.get("model") != _clean_model and not (_dir_providers or _dir_key):
         _dir_providers = []
         _dir_key = None
-    # 否则未触发映射，保留 _dir_providers 和 _dir_key
+    # 否则未触发映射，或原始请求显式指定 provider/key，保留 _dir_providers 和 _dir_key
 
     is_stream = body.get("stream", False)
     user_id = auth_info.get("user_id")
@@ -1397,7 +1853,7 @@ async def openai_completions(
     if _mapped_providers or _mapped_key:
         _dir_providers = _mapped_providers
         _dir_key = _mapped_key
-    elif body.get("model") != _clean_model:
+    elif body.get("model") != _clean_model and not (_dir_providers or _dir_key):
         _dir_providers = []
         _dir_key = None
 
@@ -1580,7 +2036,7 @@ async def openai_embeddings(
     if _mapped_providers or _mapped_key:
         _dir_providers = _mapped_providers
         _dir_key = _mapped_key
-    elif body.get("model") != _clean_model:
+    elif body.get("model") != _clean_model and not (_dir_providers or _dir_key):
         _dir_providers = []
         _dir_key = None
 
@@ -1630,7 +2086,7 @@ async def openai_responses(
     if _mapped_providers or _mapped_key:
         _dir_providers = _mapped_providers
         _dir_key = _mapped_key
-    elif body.get("model") != _clean_model:
+    elif body.get("model") != _clean_model and not (_dir_providers or _dir_key):
         _dir_providers = []
         _dir_key = None
 
@@ -1715,7 +2171,7 @@ async def claude_messages(
     if _mapped_providers or _mapped_key:
         _dir_providers = _mapped_providers
         _dir_key = _mapped_key
-    elif body.get("model") != _clean_model:
+    elif body.get("model") != _clean_model and not (_dir_providers or _dir_key):
         _dir_providers = []
         _dir_key = None
 

@@ -165,7 +165,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { adminApi } from '../api'
+import { adminApi, copyText } from '../api'
 
 const loading = ref(false)
 const events = ref([])
@@ -304,7 +304,7 @@ const copyDetail = async () => {
     `说明: ${item.explanation || '-'}`,
     `可疑内容: ${item.snippet || '-'}`,
   ].join('\n')
-  await navigator.clipboard.writeText(text)
+  await copyText(text)
   ElMessage.success('已复制事件详情')
 }
 

@@ -124,7 +124,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
-import { adminApi } from '../api'
+import { adminApi, copyText as copyTextUtil } from '../api'
 
 const loading = ref(false)
 const submitting = ref(false)
@@ -343,18 +343,7 @@ const submitAndContinue = async () => {
 }
 
 const copyText = async (text) => {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text)
-    return
-  }
-  const textarea = document.createElement('textarea')
-  textarea.value = text
-  textarea.style.position = 'fixed'
-  textarea.style.opacity = '0'
-  document.body.appendChild(textarea)
-  textarea.select()
-  document.execCommand('copy')
-  document.body.removeChild(textarea)
+  await copyTextUtil(text)
 }
 
 const copyMapping = async (row) => {

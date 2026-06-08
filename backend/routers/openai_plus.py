@@ -9,12 +9,12 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import get_db
+from database import async_session_maker, get_db
 from models import OpenAIPlusAccount, OpenAIPlusUsageLog
-from routers.admin import verify_admin_key
+from routers.admin import normalize_openai_plus_quota_refresh_config, verify_admin_key
 from services import openai_plus_service
 
 router = APIRouter()
@@ -27,6 +27,15 @@ class OpenAIPlusImportRequest(BaseModel):
 class OpenAIPlusUpdateRequest(BaseModel):
     name: Optional[str] = None
     disabled: Optional[bool] = None
+
+
+class OpenAIPlusBatchUpdateRequest(BaseModel):
+    account_ids: list[int]
+    disabled: Optional[bool] = None
+
+
+class OpenAIPlusBatchDeleteRequest(BaseModel):
+    account_ids: list[int]
 
 
 def _extract_proxy_key(authorization: Optional[str], x_api_key: Optional[str]) -> str:
@@ -93,6 +102,52 @@ async def import_accounts(
     return await openai_plus_service.import_accounts(db, data.content)
 
 
+def _normalize_account_ids(account_ids: list[int]) -> list[int]:
+    ids = sorted({int(item) for item in account_ids if int(item) > 0})
+    if not ids:
+        raise HTTPException(status_code=400, detail="请选择账号")
+    if len(ids) > 500:
+        raise HTTPException(status_code=400, detail="单次最多操作 500 个账号")
+    return ids
+
+
+@router.put("/api/admin/openai-plus/accounts/batch")
+async def batch_update_accounts(
+    data: OpenAIPlusBatchUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    account_ids = _normalize_account_ids(data.account_ids)
+    if data.disabled is None:
+        raise HTTPException(status_code=400, detail="缺少批量修改内容")
+    result = await db.execute(select(OpenAIPlusAccount).where(OpenAIPlusAccount.id.in_(account_ids)))
+    accounts = result.scalars().all()
+    now = datetime.utcnow()
+    for account in accounts:
+        account.disabled = bool(data.disabled)
+        account.updated_at = now
+    await db.commit()
+    return {"updated": len(accounts), "requested": len(account_ids)}
+
+
+@router.delete("/api/admin/openai-plus/accounts/batch")
+async def batch_delete_accounts(
+    data: OpenAIPlusBatchDeleteRequest,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    account_ids = _normalize_account_ids(data.account_ids)
+    result = await db.execute(select(OpenAIPlusAccount).where(OpenAIPlusAccount.id.in_(account_ids)))
+    accounts = result.scalars().all()
+    found_ids = [account.id for account in accounts]
+    if found_ids:
+        await db.execute(delete(OpenAIPlusUsageLog).where(OpenAIPlusUsageLog.account_id.in_(found_ids)))
+        for account in accounts:
+            await db.delete(account)
+    await db.commit()
+    return {"deleted": len(found_ids), "requested": len(account_ids)}
+
+
 @router.put("/api/admin/openai-plus/accounts/{account_id}")
 async def update_account(
     account_id: int,
@@ -145,22 +200,39 @@ async def list_account_quotas(
     db: AsyncSession = Depends(get_db),
     _: bool = Depends(verify_admin_key),
 ):
-    result = await db.execute(select(OpenAIPlusAccount).order_by(OpenAIPlusAccount.id.desc()))
-    accounts = result.scalars().all()
+    result = await db.execute(select(OpenAIPlusAccount.id).order_by(OpenAIPlusAccount.id.desc()))
+    account_ids = [int(item) for item in result.scalars().all()]
+    config = normalize_openai_plus_quota_refresh_config()
+    semaphore = asyncio.Semaphore(config["openai_plus_quota_refresh_concurrency"])
 
-    async def load_quota(account: OpenAIPlusAccount):
-        if account.disabled:
-            return {"account_id": account.id, "available": False, "message": "account disabled"}
-        refreshed = await openai_plus_service.refresh_account_if_needed(db, account)
-        quota = await openai_plus_service.fetch_account_quota(refreshed)
-        if quota.get("plan_type") and quota.get("plan_type") != account.plan_type:
-            account.plan_type = str(quota["plan_type"])
-            account.updated_at = datetime.utcnow()
-            await db.commit()
-        quota["account_id"] = account.id
-        return quota
+    async def load_quota(account_id: int):
+        async with semaphore:
+            try:
+                async with async_session_maker() as account_db:
+                    account = await account_db.get(OpenAIPlusAccount, account_id)
+                    if not account:
+                        return {"account_id": account_id, "available": False, "message": "account not found"}
+                    if account.disabled:
+                        return {"account_id": account.id, "available": False, "message": "account disabled"}
+                    refreshed = await openai_plus_service.refresh_account_if_needed(
+                        account_db,
+                        account,
+                        config["openai_plus_quota_token_refresh_timeout_seconds"],
+                    )
+                    quota = await openai_plus_service.fetch_account_quota(
+                        refreshed,
+                        config["openai_plus_quota_refresh_timeout_seconds"],
+                    )
+                    if quota.get("plan_type") and quota.get("plan_type") != refreshed.plan_type:
+                        refreshed.plan_type = str(quota["plan_type"])
+                        refreshed.updated_at = datetime.utcnow()
+                        await account_db.commit()
+                    quota["account_id"] = refreshed.id
+                    return quota
+            except Exception as exc:
+                return {"account_id": account_id, "available": False, "message": str(exc)}
 
-    quotas = await asyncio.gather(*(load_quota(account) for account in accounts))
+    quotas = await asyncio.gather(*(load_quota(account_id) for account_id in account_ids))
     return {"items": quotas}
 
 

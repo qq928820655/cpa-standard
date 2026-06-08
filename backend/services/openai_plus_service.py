@@ -2,13 +2,14 @@
 OpenAI Plus account service
 """
 import base64
+import hashlib
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import async_session_maker
@@ -134,6 +135,68 @@ def get_nested(data: dict, *paths: list[str]) -> Any:
     return None
 
 
+def token_fingerprint(value: Optional[str]) -> str:
+    token = (value or "").strip()
+    if not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def build_import_identities(
+    *,
+    chatgpt_user_id: str,
+    email: str,
+    refresh_token: str,
+    access_token: str,
+    account_id: str,
+) -> list[tuple[str, str]]:
+    identities: list[tuple[str, str]] = []
+    if chatgpt_user_id:
+        identities.append(("chatgpt_user_id", chatgpt_user_id.lower()))
+    if email:
+        identities.append(("email", email.lower()))
+    refresh_fp = token_fingerprint(refresh_token)
+    if refresh_fp:
+        identities.append(("refresh_token", refresh_fp))
+    access_fp = token_fingerprint(access_token)
+    if access_fp:
+        identities.append(("access_token", access_fp))
+    if account_id and not identities:
+        identities.append(("account_id", account_id.lower()))
+    return identities
+
+
+async def find_existing_import_account(
+    db: AsyncSession,
+    *,
+    identities: list[tuple[str, str]],
+    account_id: str,
+) -> Optional[OpenAIPlusAccount]:
+    for kind, value in identities:
+        if kind == "chatgpt_user_id":
+            result = await db.execute(select(OpenAIPlusAccount).where(func.lower(OpenAIPlusAccount.chatgpt_user_id) == value))
+            account = result.scalars().first()
+            if account:
+                return account
+        elif kind == "email":
+            result = await db.execute(select(OpenAIPlusAccount).where(func.lower(OpenAIPlusAccount.email) == value))
+            account = result.scalars().first()
+            if account:
+                return account
+        elif kind in {"refresh_token", "access_token"}:
+            result = await db.execute(select(OpenAIPlusAccount))
+            for account in result.scalars().all():
+                token_value = account.refresh_token if kind == "refresh_token" else account.access_token
+                if token_fingerprint(token_value) == value:
+                    return account
+        elif kind == "account_id" and account_id:
+            result = await db.execute(select(OpenAIPlusAccount).where(OpenAIPlusAccount.account_id == account_id))
+            account = result.scalars().first()
+            if account:
+                return account
+    return None
+
+
 def build_headers(account: OpenAIPlusAccount, stream: bool = False) -> dict:
     headers = {
         "content-type": "application/json",
@@ -213,6 +276,7 @@ async def import_accounts(db: AsyncSession, content: str) -> dict:
     updated = 0
     failed = 0
     items = []
+    batch_seen: set[tuple[str, str]] = set()
 
     for index, payload in enumerate(payloads, start=1):
         try:
@@ -232,13 +296,23 @@ async def import_accounts(db: AsyncSession, content: str) -> dict:
             if not expires_at and jwt_payload.get("exp"):
                 expires_at = datetime.fromtimestamp(int(jwt_payload["exp"]), tz=timezone.utc).replace(tzinfo=None)
 
-            existing = None
-            if account_id:
-                result = await db.execute(select(OpenAIPlusAccount).where(OpenAIPlusAccount.account_id == account_id))
-                existing = result.scalar_one_or_none()
-            if not existing and email:
-                result = await db.execute(select(OpenAIPlusAccount).where(OpenAIPlusAccount.email == email))
-                existing = result.scalar_one_or_none()
+            identities = build_import_identities(
+                chatgpt_user_id=chatgpt_user_id,
+                email=email,
+                refresh_token=refresh_token,
+                access_token=access_token,
+                account_id=account_id,
+            )
+            if not identities:
+                raise ValueError("缺少可识别账号身份")
+
+            primary_identity = identities[0]
+            if primary_identity in batch_seen:
+                items.append({"index": index, "action": "skipped", "email": email, "account_id": account_id, "message": "本批次重复账号"})
+                continue
+            batch_seen.add(primary_identity)
+
+            existing = await find_existing_import_account(db, identities=identities, account_id=account_id)
 
             if existing:
                 account = existing
@@ -288,6 +362,22 @@ def _normalize_rate_limit_window(window: Any) -> Optional[dict]:
 def normalize_quota_payload(payload: Any) -> dict:
     if not isinstance(payload, dict):
         return {"available": False, "message": "invalid quota payload"}
+    error_payload = payload.get("error") if isinstance(payload.get("error"), dict) else None
+    if error_payload:
+        reset_at = error_payload.get("reset_at") or error_payload.get("resets_at")
+        return {
+            "available": False,
+            "message": error_payload.get("message") or error_payload.get("type") or "quota unavailable",
+            "plan_type": error_payload.get("plan_type"),
+            "primary": _normalize_rate_limit_window({
+                "used_percent": 100,
+                "resets_at": reset_at,
+            }) if reset_at else None,
+            "secondary": None,
+            "credits": None,
+            "additional_rate_limits": [],
+            "rate_limit_reached_type": error_payload.get("type"),
+        }
     rate_limit = payload.get("rate_limit") if isinstance(payload.get("rate_limit"), dict) else {}
     credits = payload.get("credits") if isinstance(payload.get("credits"), dict) else None
     additional = payload.get("additional_rate_limits") if isinstance(payload.get("additional_rate_limits"), list) else []
@@ -302,12 +392,21 @@ def normalize_quota_payload(payload: Any) -> dict:
     }
 
 
-async def fetch_account_quota(account: OpenAIPlusAccount) -> dict:
+async def fetch_account_quota(account: OpenAIPlusAccount, timeout_seconds: int = 30) -> dict:
     url = f"{CODEX_WHAM_BASE_URL}/usage"
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
+        timeout_seconds = max(5, min(int(timeout_seconds or 30), 300))
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
             response = await client.get(url, headers=build_headers(account))
         if response.status_code >= 400:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                quota = normalize_quota_payload(payload)
+                quota["message"] = f"HTTP {response.status_code}: {quota.get('message') or response.text[:300]}"
+                return quota
             return {"available": False, "message": f"HTTP {response.status_code}: {response.text[:300]}"}
         return normalize_quota_payload(response.json())
     except Exception as exc:
@@ -339,7 +438,7 @@ async def check_account(account: OpenAIPlusAccount) -> tuple[str, str]:
 
 
 
-async def refresh_account_if_needed(db: AsyncSession, account: OpenAIPlusAccount) -> OpenAIPlusAccount:
+async def refresh_account_if_needed(db: AsyncSession, account: OpenAIPlusAccount, timeout_seconds: int = 60) -> OpenAIPlusAccount:
     """有 refresh_token 时在过期前刷新 access token"""
     if not account.refresh_token or not account.expires_at:
         return account
@@ -352,7 +451,8 @@ async def refresh_account_if_needed(db: AsyncSession, account: OpenAIPlusAccount
         "client_id": CODEX_CLIENT_ID,
         "scope": "openid profile email",
     }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as client:
+    timeout_seconds = max(5, min(int(timeout_seconds or 60), 300))
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds)) as client:
         response = await client.post(OPENAI_TOKEN_URL, data=data, headers={"content-type": "application/x-www-form-urlencoded"})
     if response.status_code >= 400:
         account.last_check_status = "error"

@@ -387,7 +387,7 @@ import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/compon
 import VChart from 'vue-echarts'
 import { ElMessage } from 'element-plus'
 import { View } from '@element-plus/icons-vue'
-import { statsApi, adminApi, authApi } from '../api'
+import { statsApi, adminApi, authApi, copyText } from '../api'
 import { useDisplaySettings } from '../stores/displaySettings'
 
 const { formatToken, formatTokenCompact } = useDisplaySettings()
@@ -585,7 +585,7 @@ const toggleKeyDetailActive = async () => {
 const copyKeyPassword = async (password) => {
   if (!password) return
   try {
-    await navigator.clipboard.writeText(password)
+    await copyText(password)
     ElMessage.success('密码已复制')
   } catch {
     ElMessage.error('复制失败')
@@ -845,15 +845,14 @@ const loadSummaryAndDaily = async () => {
 }
 
 const loadData = async ({ resetLogsPage = false } = {}) => {
-  try {
-    await loadSummaryAndDaily()
-  } catch (e) {
-    ElMessage.error(e.message || '加载统计数据失败')
-  }
   if (resetLogsPage) {
     resetToFirstPage()
   }
-  loadLogs()
+  try {
+    await Promise.all([loadSummaryAndDaily(), loadLogs()])
+  } catch (e) {
+    ElMessage.error(e.message || '加载统计数据失败')
+  }
 }
 
 const loadLogs = async () => {
@@ -884,7 +883,7 @@ const loadLogs = async () => {
 
 const loadKeyOptions = async () => {
   try {
-    const result = await adminApi.listKeys({ page: 1, limit: 500 })
+    const result = await adminApi.listKeys({ page: 1, limit: 200 })
     const items = Array.isArray(result) ? result : (result.items || [])
     keyOptions.value = items.map((item) => ({
       id: item.id,
@@ -939,8 +938,7 @@ const stopAutoRefresh = () => {
 const refreshDataSilently = async () => {
   if (document.hidden || loadingLogs.value) return
   try {
-    await loadSummaryAndDaily()
-    await loadLogs()
+    await Promise.all([loadSummaryAndDaily(), loadLogs()])
   } catch {
     // ignore background refresh errors
   }
@@ -986,9 +984,8 @@ watch(
   }
 )
 
-onMounted(() => {
-  loadKeyOptions()
-  loadUserOptions()
+onMounted(async () => {
+  await Promise.all([loadKeyOptions(), loadUserOptions()])
   loadData()
   document.addEventListener('visibilitychange', handleVisibilityChange)
   startAutoRefresh()

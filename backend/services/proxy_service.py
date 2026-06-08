@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import binascii
+import fnmatch
 import ipaddress
 import json
 import logging
@@ -17,7 +18,7 @@ import httpx
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import settings
+from config import settings, export_config
 
 logger = logging.getLogger("cpa.image")
 
@@ -202,32 +203,76 @@ class ProxyService:
         except Exception as exc:
             print(f"[CPA UPSTREAM DEBUG DUMP ERROR] {exc}")
 
-    # ============ OpenAI Chat <-> Anthropic Messages 双向转换（用于升级普通客户端请求以命中缓存） ============
+    # ============ 协议与兼容策略 ============
+
+    _OPENAI_MODEL_PREFIXES: tuple = (
+        "gpt-", "o1", "o3", "o4", "qwen", "kimi", "glm", "deepseek", "minimax", "doubao",
+    )
+
+    _CLAUDE_MODEL_KEYWORDS: tuple = ("claude-opus", "claude-sonnet", "claude-haiku", "claude-3-", "claude-3.", "claude-4")
+
+    @staticmethod
+    def _normalize_model_name_for_family(model: str) -> str:
+        return re.sub(r"\[.*?\]", "", (model or "").strip()).lower()
+
+    @classmethod
+    def _is_openai_family_model(cls, model: str) -> bool:
+        m = cls._normalize_model_name_for_family(model)
+        return any(m.startswith(prefix) for prefix in cls._OPENAI_MODEL_PREFIXES)
+
+    @classmethod
+    def _is_claude_family_model(cls, model: str) -> bool:
+        m = cls._normalize_model_name_for_family(model)
+        return any(kw in m for kw in cls._CLAUDE_MODEL_KEYWORDS)
+
+    def _get_provider_model_compat_override(self, api_key: Any, model: str) -> dict[str, Any]:
+        provider = (getattr(api_key, "provider", "") or "").strip().lower()
+        normalized_model = self._normalize_model_name_for_family(model)
+        overrides = export_config.get("provider_model_compat_overrides", []) or []
+        for rule in overrides:
+            if not isinstance(rule, dict):
+                continue
+            rule_provider = (rule.get("provider") or "").strip().lower()
+            if rule_provider and rule_provider != provider:
+                continue
+            pattern = (rule.get("model_pattern") or rule.get("model") or "*").strip().lower()
+            if fnmatch.fnmatch(normalized_model, pattern):
+                return rule
+        return {}
+
+    def _select_upstream_protocol(self, api_key: Any, path: str, body: Optional[dict]) -> str:
+        """选择上游协议。默认按模型族判断，provider/model 覆盖只处理例外。"""
+        normalized_path = (path or "").lstrip("/")
+        if normalized_path == "v1/messages":
+            return "anthropic_messages_native"
+        if normalized_path != "v1/chat/completions" or not isinstance(body, dict):
+            return "passthrough"
+
+        model = body.get("model") or ""
+        override = self._get_provider_model_compat_override(api_key, model)
+        protocol = (override.get("protocol") or "").strip().lower()
+        if protocol:
+            return protocol
+
+        if self._is_openai_family_model(model):
+            return "openai_chat"
+        if self._is_claude_family_model(model):
+            provider = (getattr(api_key, "provider", "") or "").strip().lower()
+            if provider in self._CLAUDE_MESSAGES_UPGRADE_EXCLUDED_PROVIDERS:
+                return "openai_chat"
+            return "anthropic_messages"
+        return "openai_chat"
+
+
 
     # 使用 OpenAI 兼容格式但实际是 Claude 模型的请求，经 CPA 自动升级为 Anthropic Messages 格式，
     # 注入 cache_control，并在响应时转回 OpenAI 格式，对下游客户端透明。
     # 此列表中的 provider 不支持原生 Anthropic 格式，不做升级。
     _CLAUDE_MESSAGES_UPGRADE_EXCLUDED_PROVIDERS: frozenset = frozenset(["skk"])
 
-    _CLAUDE_MODEL_KEYWORDS: tuple = ("claude-opus", "claude-sonnet", "claude-haiku", "claude-3-", "claude-3.", "claude-4")
-
-    @staticmethod
-    def _is_claude_family_model(model: str) -> bool:
-        m = (model or "").lower()
-        return any(kw in m for kw in ("claude-opus", "claude-sonnet", "claude-haiku", "claude-3-", "claude-3.", "claude-4"))
-
     def _should_upgrade_chat_to_claude_messages(self, api_key: Any, path: str, body: Optional[dict]) -> bool:
         """检测是否需自动升级 OpenAI Chat 请求为 Anthropic Messages 格式以支持 prompt cache。"""
-        if (path or "").lstrip("/") != "v1/chat/completions":
-            return False
-        if not isinstance(body, dict):
-            return False
-        if not self._is_claude_family_model(body.get("model") or ""):
-            return False
-        provider = (getattr(api_key, "provider", "") or "").strip().lower()
-        if provider in self._CLAUDE_MESSAGES_UPGRADE_EXCLUDED_PROVIDERS:
-            return False
-        return True
+        return self._select_upstream_protocol(api_key, path, body) == "anthropic_messages"
 
     def _adapt_chat_tools_to_claude_tools(self, tools: Any) -> list:
         """OpenAI function tools → Anthropic tools"""
@@ -2254,8 +2299,10 @@ class ProxyService:
         if not isinstance(usage, dict) or not usage:
             return 0, 0, 0, 0
 
-        prompt_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
-        completion_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+        explicit_prompt_tokens = "prompt_tokens" in usage
+        input_tokens = int(usage.get("input_tokens") or 0)
+        prompt_tokens = int(usage.get("prompt_tokens") or input_tokens or 0)
+        completion_tokens = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
 
         output_tokens_details = usage.get("output_tokens_details") or {}
         if isinstance(output_tokens_details, dict):
@@ -2264,22 +2311,22 @@ class ProxyService:
                 (output_tokens_details.get("reasoning_tokens") or 0) + (output_tokens_details.get("text_tokens") or 0),
             )
 
-        total_tokens = usage.get("total_tokens") or (prompt_tokens + completion_tokens)
-
         # 缓存 token：OpenAI 格式在 prompt_tokens_details.cached_tokens
         # Claude 格式在 cache_read_input_tokens / cache_creation_input_tokens
-        cache_tokens = 0
         prompt_tokens_details = usage.get("prompt_tokens_details") or {}
+        openai_cached_tokens = 0
         if isinstance(prompt_tokens_details, dict):
-            cache_tokens = int(prompt_tokens_details.get("cached_tokens") or 0)
-        if not cache_tokens:
-            cache_tokens = int(
-                usage.get("cache_read_input_tokens")
-                or usage.get("cache_creation_input_tokens")
-                or usage.get("cached_tokens")
-                or usage.get("cache_tokens")
-                or 0
-            )
+            openai_cached_tokens = int(prompt_tokens_details.get("cached_tokens") or 0)
+        cache_read_tokens = int(usage.get("cache_read_input_tokens") or 0)
+        cache_creation_tokens = int(usage.get("cache_creation_input_tokens") or 0)
+        cache_tokens = openai_cached_tokens or cache_read_tokens or cache_creation_tokens or int(
+            usage.get("cached_tokens") or usage.get("cache_tokens") or 0
+        )
+
+        if not explicit_prompt_tokens and (cache_read_tokens or cache_creation_tokens):
+            prompt_tokens = input_tokens + cache_read_tokens + cache_creation_tokens
+
+        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
 
         return int(prompt_tokens), int(completion_tokens), int(total_tokens), int(cache_tokens)
 

@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import select, func, or_, and_
+from sqlalchemy import select, func, or_, and_, delete as sql_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings, export_config, DATA_DIR
@@ -32,6 +32,7 @@ from routers.models_seed import DEFAULT_MODELS
 from services.pool_manager import pool_manager
 from services.proxy_service import proxy_service
 from services.key_check_task_service import key_check_task_service
+from services.proxy_trace_service import proxy_trace_service, normalize_trace_config
 
 
 router = APIRouter()
@@ -515,6 +516,18 @@ class ImageCapabilityResponse(BaseModel):
 
 class ImageStorageConfigUpdate(BaseModel):
     storage_dir: str
+
+
+class OpenAIPlusQuotaRefreshConfigResponse(BaseModel):
+    openai_plus_quota_refresh_concurrency: int
+    openai_plus_quota_refresh_timeout_seconds: int
+    openai_plus_quota_token_refresh_timeout_seconds: int
+
+
+class OpenAIPlusQuotaRefreshConfigUpdate(BaseModel):
+    openai_plus_quota_refresh_concurrency: int = Field(ge=1, le=20)
+    openai_plus_quota_refresh_timeout_seconds: int = Field(ge=5, le=300)
+    openai_plus_quota_token_refresh_timeout_seconds: int = Field(ge=5, le=300)
 
 
 class ImageAutoRefreshConfigResponse(BaseModel):
@@ -1457,6 +1470,35 @@ def apply_rule_fields(model: Any, model_name: str):
     model.supports_codex = True
     model.supports_claudecode = True
     model.supports_gemini = True
+
+
+async def prune_model_catalog_to_key_support(db: AsyncSession) -> int:
+    """按当前 Key 支持模型修剪模型广场"""
+    from models import ApiKey, ModelCatalog
+
+    keys_result = await db.execute(select(ApiKey.supported_models))
+    supported_model_ids: set[str] = set()
+    has_wildcard_key = False
+    for value in keys_result.scalars().all():
+        key_model_ids = loads_json_list(value)
+        if not key_model_ids:
+            has_wildcard_key = True
+            continue
+        supported_model_ids.update(key_model_ids)
+
+    export_config["model_seed_enabled"] = False
+    persist_export_config()
+
+    if has_wildcard_key:
+        return 0
+    if not supported_model_ids:
+        result = await db.execute(sql_delete(ModelCatalog))
+        return int(result.rowcount or 0)
+
+    result = await db.execute(
+        sql_delete(ModelCatalog).where(ModelCatalog.model_id.notin_(supported_model_ids))
+    )
+    return int(result.rowcount or 0)
 
 
 async def ensure_models_exist(db: AsyncSession, model_names: Optional[List[str]]) -> tuple[List[str], List[str]]:
@@ -5232,6 +5274,36 @@ async def list_content_guard_events(
     )
 
 
+def normalize_openai_plus_quota_refresh_config(data: Optional[dict] = None) -> dict:
+    """归一化 OpenAI Plus 配额刷新配置"""
+    source = data if isinstance(data, dict) else export_config.get("openai_plus_quota_refresh") or {}
+    return {
+        "openai_plus_quota_refresh_concurrency": max(1, min(int(source.get("openai_plus_quota_refresh_concurrency") or 5), 20)),
+        "openai_plus_quota_refresh_timeout_seconds": max(5, min(int(source.get("openai_plus_quota_refresh_timeout_seconds") or 30), 300)),
+        "openai_plus_quota_token_refresh_timeout_seconds": max(5, min(int(source.get("openai_plus_quota_token_refresh_timeout_seconds") or 60), 300)),
+    }
+
+
+@router.get("/openai-plus/quota-refresh-config", response_model=OpenAIPlusQuotaRefreshConfigResponse)
+async def get_openai_plus_quota_refresh_config(
+    _: bool = Depends(verify_admin_key),
+):
+    """获取 OpenAI Plus 配额刷新配置"""
+    return OpenAIPlusQuotaRefreshConfigResponse(**normalize_openai_plus_quota_refresh_config())
+
+
+@router.put("/openai-plus/quota-refresh-config", response_model=OpenAIPlusQuotaRefreshConfigResponse)
+async def update_openai_plus_quota_refresh_config(
+    data: OpenAIPlusQuotaRefreshConfigUpdate,
+    _: bool = Depends(verify_admin_key),
+):
+    """更新 OpenAI Plus 配额刷新配置"""
+    payload = normalize_openai_plus_quota_refresh_config(data.model_dump())
+    export_config["openai_plus_quota_refresh"] = payload
+    persist_export_config()
+    return OpenAIPlusQuotaRefreshConfigResponse(**payload)
+
+
 @router.get("/key-check-default-config", response_model=KeyCheckDefaultConfigResponse)
 async def get_key_check_default_config(
     _: bool = Depends(verify_admin_key),
@@ -5433,6 +5505,8 @@ async def create_key(
     db.add(key)
     await db.commit()
     await db.refresh(key)
+    await prune_model_catalog_to_key_support(db)
+    await db.commit()
 
     # 重置轮询索引
     pool_manager.reset_index(data.provider)
@@ -5533,6 +5607,8 @@ async def import_keys(
         created_count += 1
 
     await db.commit()
+    await prune_model_catalog_to_key_support(db)
+    await db.commit()
     for key in processed_items:
         await db.refresh(key)
     for provider in touched_providers:
@@ -5630,6 +5706,9 @@ async def batch_update_key_models(
         touched_providers.add(key.provider)
 
     await db.commit()
+    if should_update_supported_models:
+        await prune_model_catalog_to_key_support(db)
+        await db.commit()
     for provider in touched_providers:
         pool_manager.reset_index(provider)
 
@@ -5869,6 +5948,8 @@ async def batch_delete_keys(
         await db.delete(key)
 
     await db.commit()
+    await prune_model_catalog_to_key_support(db)
+    await db.commit()
 
     for provider in touched_providers:
         pool_manager.reset_index(provider)
@@ -5967,10 +6048,12 @@ async def update_key(
             update_data.pop(field, None)
         update_data.update(fake_ip_payload)
 
+    should_prune_models = False
     for field, value in update_data.items():
         if field == "supported_models":
             normalized_models, _ = await ensure_models_exist(db, value)
             setattr(key, field, dumps_json_list(normalized_models))
+            should_prune_models = True
             continue
         if field == "api_type":
             setattr(key, field, normalize_api_type(value))
@@ -5980,6 +6063,9 @@ async def update_key(
     key.updated_at = datetime.utcnow()
     await db.commit()
     await db.refresh(key)
+    if should_prune_models:
+        await prune_model_catalog_to_key_support(db)
+        await db.commit()
 
     # 重置轮询索引
     pool_manager.reset_index(original_provider)
@@ -6002,6 +6088,8 @@ async def delete_key(
 
     provider = key.provider
     await db.delete(key)
+    await db.commit()
+    await prune_model_catalog_to_key_support(db)
     await db.commit()
 
     # 重置轮询索引
@@ -6389,39 +6477,42 @@ async def list_models(
     existing_result = await db.execute(select(ModelCatalog))
     existing_models = {item.model_id: item for item in existing_result.scalars().all()}
 
+    # 种子回填开关：一键还原后关闭，避免已删除的模型被种子数据重新插入
+    seed_enabled = export_config.get("model_seed_enabled", True)
     changed = False
-    for item in DEFAULT_MODELS:
-        existing_model = existing_models.get(item["model_id"])
-        if not existing_model:
-            model = ModelCatalog(
-                model_id=item["model_id"],
-                display_name=item["display_name"],
-                provider=item["provider"],
-                protocol=item["protocol"],
-                input_price=item["input_price"],
-                output_price=item["output_price"],
-                is_active=item["is_active"],
-                is_recommended=item["is_recommended"],
-                supports_codex=item["supports_codex"],
-                supports_claudecode=item["supports_claudecode"],
-                supports_gemini=item.get("supports_gemini", False),
-                aliases=dumps_json_list(item.get("aliases")),
-                remark=item.get("remark"),
-            )
-            apply_rule_fields(model, model.model_id)
-            db.add(model)
-            changed = True
-            continue
+    if seed_enabled:
+        for item in DEFAULT_MODELS:
+            existing_model = existing_models.get(item["model_id"])
+            if not existing_model:
+                model = ModelCatalog(
+                    model_id=item["model_id"],
+                    display_name=item["display_name"],
+                    provider=item["provider"],
+                    protocol=item["protocol"],
+                    input_price=item["input_price"],
+                    output_price=item["output_price"],
+                    is_active=item["is_active"],
+                    is_recommended=item["is_recommended"],
+                    supports_codex=item["supports_codex"],
+                    supports_claudecode=item["supports_claudecode"],
+                    supports_gemini=item.get("supports_gemini", False),
+                    aliases=dumps_json_list(item.get("aliases")),
+                    remark=item.get("remark"),
+                )
+                apply_rule_fields(model, model.model_id)
+                db.add(model)
+                changed = True
+                continue
 
-        existing_model.display_name = item["display_name"]
-        existing_model.input_price = item["input_price"]
-        existing_model.output_price = item["output_price"]
-        existing_model.is_recommended = item["is_recommended"]
-        existing_model.aliases = dumps_json_list(item.get("aliases"))
-        existing_model.remark = item.get("remark")
-        apply_rule_fields(existing_model, existing_model.model_id)
-        existing_model.updated_at = datetime.utcnow()
-        changed = True
+            existing_model.display_name = item["display_name"]
+            existing_model.input_price = item["input_price"]
+            existing_model.output_price = item["output_price"]
+            existing_model.is_recommended = item["is_recommended"]
+            existing_model.aliases = dumps_json_list(item.get("aliases"))
+            existing_model.remark = item.get("remark")
+            apply_rule_fields(existing_model, existing_model.model_id)
+            existing_model.updated_at = datetime.utcnow()
+            changed = True
 
     if changed:
         await db.commit()
@@ -7142,3 +7233,371 @@ async def update_provider_migration_rules(
     export_config["provider_migration_rules"] = rules
     persist_export_config()
     return ProviderMigrationRulesResponse(rules=data.rules)
+
+
+# ============ 透传错误码配置 ============
+
+class PassThroughErrorCodesResponse(BaseModel):
+    pass_through_error_codes: List[int]
+
+
+class PassThroughErrorCodesUpdate(BaseModel):
+    pass_through_error_codes: List[int]
+
+
+@router.get("/pass-through-error-codes", response_model=PassThroughErrorCodesResponse)
+async def get_pass_through_error_codes(
+    _: bool = Depends(verify_admin_key),
+):
+    """获取透传错误码配置"""
+    codes = export_config.get("pass_through_error_codes") or []
+    return PassThroughErrorCodesResponse(pass_through_error_codes=[int(c) for c in codes])
+
+
+@router.put("/pass-through-error-codes", response_model=PassThroughErrorCodesResponse)
+async def update_pass_through_error_codes(
+    data: PassThroughErrorCodesUpdate,
+    _: bool = Depends(verify_admin_key),
+):
+    """更新透传错误码配置"""
+    valid_codes = [int(c) for c in data.pass_through_error_codes if 400 <= int(c) < 600]
+    export_config["pass_through_error_codes"] = valid_codes
+    persist_export_config()
+    return PassThroughErrorCodesResponse(pass_through_error_codes=valid_codes)
+
+
+# ============ 模型种子配置 ============
+
+class ModelSeedConfigResponse(BaseModel):
+    model_seed_enabled: bool
+
+
+class ModelSeedConfigUpdate(BaseModel):
+    model_seed_enabled: bool
+
+
+@router.get("/model-seed-config", response_model=ModelSeedConfigResponse)
+async def get_model_seed_config(
+    _: bool = Depends(verify_admin_key),
+):
+    """获取模型种子回填配置"""
+    return ModelSeedConfigResponse(model_seed_enabled=bool(export_config.get("model_seed_enabled", True)))
+
+
+@router.put("/model-seed-config", response_model=ModelSeedConfigResponse)
+async def update_model_seed_config(
+    data: ModelSeedConfigUpdate,
+    _: bool = Depends(verify_admin_key),
+):
+    """更新模型种子回填配置"""
+    export_config["model_seed_enabled"] = bool(data.model_seed_enabled)
+    persist_export_config()
+    return ModelSeedConfigResponse(model_seed_enabled=bool(data.model_seed_enabled))
+
+
+
+
+# ============ 代理调试追踪配置 ============
+
+class ProxyTraceConfigResponse(BaseModel):
+    proxy_trace_enabled: bool
+    proxy_trace_retention_hours: int
+    proxy_trace_sample_rate: float
+    proxy_trace_only_failures: bool
+    proxy_trace_target_provider: str
+    proxy_trace_target_model: str
+
+
+class ProxyTraceConfigUpdate(BaseModel):
+    proxy_trace_enabled: bool
+    proxy_trace_retention_hours: int = Field(24, ge=1, le=168)
+    proxy_trace_sample_rate: float = Field(1.0, ge=0.0, le=1.0)
+    proxy_trace_only_failures: bool = False
+    proxy_trace_target_provider: str = ""
+    proxy_trace_target_model: str = ""
+
+
+class ProxyTraceSummaryResponse(BaseModel):
+    trace_id: str
+    created_at: datetime
+    user_id: Optional[int]
+    api_key_id: Optional[int]
+    provider: Optional[str]
+    key_name: Optional[str]
+    requested_model: Optional[str]
+    actual_model: Optional[str]
+    status_code: Optional[int]
+    result_status: str
+    latency_ms: int
+    upstream_latency_ms: int
+    error_summary: Optional[str]
+
+
+class ProxyTraceListResponse(BaseModel):
+    items: List[ProxyTraceSummaryResponse]
+
+
+class ProxyTraceDetailResponse(ProxyTraceSummaryResponse):
+    route_summary: Any
+    attempts: Any
+
+
+class ProxyTraceCleanupResponse(BaseModel):
+    deleted_count: int
+
+
+def _parse_trace_json(value: Optional[str]) -> Any:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _to_trace_summary(item) -> ProxyTraceSummaryResponse:
+    return ProxyTraceSummaryResponse(
+        trace_id=item.trace_id,
+        created_at=item.created_at,
+        user_id=item.user_id,
+        api_key_id=item.api_key_id,
+        provider=item.provider,
+        key_name=item.key_name,
+        requested_model=item.requested_model,
+        actual_model=item.actual_model,
+        status_code=item.status_code,
+        result_status=item.result_status,
+        latency_ms=item.latency_ms,
+        upstream_latency_ms=item.upstream_latency_ms,
+        error_summary=item.error_summary,
+    )
+
+
+@router.get("/proxy-trace-config", response_model=ProxyTraceConfigResponse)
+async def get_proxy_trace_config(
+    _: bool = Depends(verify_admin_key),
+):
+    """获取代理调试追踪配置"""
+    return ProxyTraceConfigResponse(**normalize_trace_config())
+
+
+@router.put("/proxy-trace-config", response_model=ProxyTraceConfigResponse)
+async def update_proxy_trace_config(
+    data: ProxyTraceConfigUpdate,
+    _: bool = Depends(verify_admin_key),
+):
+    """更新代理调试追踪配置"""
+    normalized = normalize_trace_config(data.model_dump())
+    export_config.update(normalized)
+    persist_export_config()
+    return ProxyTraceConfigResponse(**normalized)
+
+
+@router.get("/proxy-traces", response_model=ProxyTraceListResponse)
+async def list_proxy_traces(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """获取代理调试追踪列表"""
+    items = await proxy_trace_service.list_traces(db, limit=limit, offset=offset)
+    return ProxyTraceListResponse(items=[_to_trace_summary(item) for item in items])
+
+
+@router.get("/proxy-traces/{trace_id}", response_model=ProxyTraceDetailResponse)
+async def get_proxy_trace(
+    trace_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """获取代理调试追踪详情"""
+    item = await proxy_trace_service.get_trace(db, trace_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="追踪记录不存在")
+    summary = _to_trace_summary(item).model_dump()
+    return ProxyTraceDetailResponse(
+        **summary,
+        route_summary=_parse_trace_json(item.route_summary),
+        attempts=_parse_trace_json(item.attempts),
+    )
+
+
+@router.delete("/proxy-traces/cleanup", response_model=ProxyTraceCleanupResponse)
+async def cleanup_proxy_traces(
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """清理过期代理调试追踪"""
+    deleted_count = await proxy_trace_service.cleanup_expired(db)
+    return ProxyTraceCleanupResponse(deleted_count=deleted_count)
+
+
+class FactoryResetRequest(BaseModel):
+    keep_providers: List[str]
+    confirmation: str
+
+
+class FactoryResetResponse(BaseModel):
+    deleted_keys: int
+    deleted_models: int
+    deleted_usage_logs: int
+    deleted_usage_summaries: int
+    deleted_image_tasks: int
+    deleted_image_task_results: int
+    deleted_image_key_model_stats: int
+    deleted_content_guard_events: int
+    deleted_provider_model_priorities: int
+    deleted_provider_model_mappings: int
+    message: str
+
+
+@router.post("/factory-reset", response_model=FactoryResetResponse)
+async def factory_reset(
+    data: FactoryResetRequest,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """一键还原：清除非保留提供商的数据，保留用户信息和指定提供商"""
+    if data.confirmation != "确认还原":
+        raise HTTPException(status_code=400, detail="确认文本不匹配")
+
+    # 规范化保留提供商列表
+    keep_providers = {p.strip().lower() for p in data.keep_providers if p.strip()}
+
+    # 收集要删除的 Key IDs
+    from models import ApiKey
+    if keep_providers:
+        keys_result = await db.execute(
+            select(ApiKey.id).where(ApiKey.provider.notin_(keep_providers))
+        )
+    else:
+        keys_result = await db.execute(select(ApiKey.id))
+    delete_key_ids = [row[0] for row in keys_result.all()]
+
+    # 按外键依赖顺序删除关联数据
+    counts = {
+        "content_guard_events": 0,
+        "provider_model_priorities": 0,
+        "provider_model_mappings": 0,
+        "image_key_model_stats": 0,
+        "image_task_results": 0,
+        "image_tasks": 0,
+        "usage_summaries": 0,
+        "usage_logs": 0,
+        "keys": 0,
+        "models": 0,
+    }
+
+    # 1. content_guard_events
+    from models import ContentGuardEvent
+    result = await db.execute(
+        sql_delete(ContentGuardEvent).where(ContentGuardEvent.api_key_id.in_(delete_key_ids))
+    )
+    counts["content_guard_events"] = result.rowcount
+
+    # 2. provider_model_priorities
+    from models import ProviderModelPriority
+    result = await db.execute(
+        sql_delete(ProviderModelPriority).where(ProviderModelPriority.key_id.in_(delete_key_ids))
+    )
+    counts["provider_model_priorities"] = result.rowcount
+
+    # 3. provider_model_mappings（按 provider 过滤）
+    from models import ProviderModelMapping
+    if keep_providers:
+        result = await db.execute(
+            sql_delete(ProviderModelMapping).where(ProviderModelMapping.provider.notin_(keep_providers))
+        )
+    else:
+        result = await db.execute(sql_delete(ProviderModelMapping))
+    counts["provider_model_mappings"] = result.rowcount
+
+    # 4. image_key_model_stats
+    from models import ImageKeyModelStats
+    result = await db.execute(
+        sql_delete(ImageKeyModelStats).where(ImageKeyModelStats.api_key_id.in_(delete_key_ids))
+    )
+    counts["image_key_model_stats"] = result.rowcount
+
+    # 5. 查询要删除的图片任务 IDs
+    from models import ImageGenerationTask, ImageGenerationTaskResult
+    tasks_result = await db.execute(
+        select(ImageGenerationTask.id).where(ImageGenerationTask.api_key_id.in_(delete_key_ids))
+    )
+    delete_task_ids = [row[0] for row in tasks_result.all()]
+
+    # 6. image_generation_task_results
+    if delete_task_ids:
+        result = await db.execute(
+            sql_delete(ImageGenerationTaskResult).where(ImageGenerationTaskResult.task_id.in_(delete_task_ids))
+        )
+        counts["image_task_results"] = result.rowcount
+
+    # 7. image_generation_tasks
+    result = await db.execute(
+        sql_delete(ImageGenerationTask).where(ImageGenerationTask.api_key_id.in_(delete_key_ids))
+    )
+    counts["image_tasks"] = result.rowcount
+
+    # 8. usage_daily_summaries
+    from models import UsageDailySummary
+    result = await db.execute(
+        sql_delete(UsageDailySummary).where(UsageDailySummary.api_key_id.in_(delete_key_ids))
+    )
+    counts["usage_summaries"] = result.rowcount
+
+    # 9. usage_logs
+    from models import UsageLog
+    result = await db.execute(
+        sql_delete(UsageLog).where(UsageLog.api_key_id.in_(delete_key_ids))
+    )
+    counts["usage_logs"] = result.rowcount
+
+    # 10. 删除非保留提供商的 Key
+    result = await db.execute(
+        sql_delete(ApiKey).where(ApiKey.id.in_(delete_key_ids))
+    )
+    counts["keys"] = result.rowcount
+
+    # 11. 整理模型广场：只保留 keep_providers 对应的模型，其余全部删除
+    from models import ModelCatalog
+    if keep_providers:
+        result = await db.execute(
+            sql_delete(ModelCatalog).where(ModelCatalog.provider.notin_(keep_providers))
+        )
+    else:
+        result = await db.execute(sql_delete(ModelCatalog))
+    counts["models"] = result.rowcount
+
+    # 关闭模型种子自动回填，避免 DEFAULT_MODELS 再次插入已删除的模型
+    export_config["model_seed_enabled"] = False
+    persist_export_config()
+
+    # 12. 重置 pool_manager
+    for key_id in delete_key_ids:
+        pool_manager.clear_key_cooldown(key_id)
+    pool_manager.reset_index()
+
+    await db.commit()
+
+    print(
+        f"[CPA FACTORY RESET] deleted_keys={counts['keys']} "
+        f"deleted_models={counts['models']} "
+        f"deleted_usage_logs={counts['usage_logs']} "
+        f"kept_providers={keep_providers}"
+    )
+
+    return FactoryResetResponse(
+        deleted_keys=counts["keys"],
+        deleted_models=counts["models"],
+        deleted_usage_logs=counts["usage_logs"],
+        deleted_usage_summaries=counts["usage_summaries"],
+        deleted_image_tasks=counts["image_tasks"],
+        deleted_image_task_results=counts["image_task_results"],
+        deleted_image_key_model_stats=counts["image_key_model_stats"],
+        deleted_content_guard_events=counts["content_guard_events"],
+        deleted_provider_model_priorities=counts["provider_model_priorities"],
+        deleted_provider_model_mappings=counts["provider_model_mappings"],
+        message=f"还原完成：删除 {counts['keys']} 个 Key，{counts['models']} 个模型，{counts['usage_logs']} 条使用记录",
+    )

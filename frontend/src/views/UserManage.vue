@@ -294,7 +294,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { authApi, adminApi } from '../api'
+import { authApi, adminApi, copyText } from '../api'
 
 const users = ref([])
 const availableModels = ref([])
@@ -376,7 +376,7 @@ const formatShortTime = (t) => {
 
 const copyApiKey = async (key) => {
   try {
-    await navigator.clipboard.writeText(key)
+    await copyText(key)
     ElMessage.success('已复制')
   } catch {
     ElMessage.error('复制失败')

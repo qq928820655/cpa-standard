@@ -64,6 +64,7 @@ async def init_db():
         ContentGuardEvent,
         OpenAIPlusAccount,
         OpenAIPlusUsageLog,
+        ProxyTrace,
     )
 
     async with engine.begin() as conn:
@@ -293,6 +294,10 @@ async def init_db():
         await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_usage_logs_request_time_api_key_id ON usage_logs(request_time, api_key_id)")
         await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_usage_logs_api_key_id_status_request_time ON usage_logs(api_key_id, status, request_time)")
         await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_image_generation_tasks_is_deleted_created_at ON image_generation_tasks(is_deleted, created_at)")
+        await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_proxy_traces_trace_id ON proxy_traces(trace_id)")
+        await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_proxy_traces_created_at ON proxy_traces(created_at)")
+        await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_proxy_traces_api_key_id_created_at ON proxy_traces(api_key_id, created_at)")
+        await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_proxy_traces_provider_created_at ON proxy_traces(provider, created_at)")
 
         # 用户角色与 API Key 字段迁移
         if not await conn.run_sync(has_admin_user_role):

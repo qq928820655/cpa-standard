@@ -14,12 +14,12 @@
         <div class="unified-item">
           <span class="unified-label">统一地址</span>
           <span class="unified-value">{{ buildBaseUrl() }}</span>
-          <el-button link type="primary" @click="copyText(buildBaseUrl())">复制</el-button>
+          <el-button link type="primary" @click="copyToClipboard(buildBaseUrl())">复制</el-button>
         </div>
         <div class="unified-item">
           <span class="unified-label">统一 API Key</span>
           <span class="unified-value">{{ unifiedApiKey }}</span>
-          <el-button link type="primary" @click="copyText(unifiedApiKey)">复制</el-button>
+          <el-button link type="primary" @click="copyToClipboard(unifiedApiKey)">复制</el-button>
         </div>
         <div class="unified-stats">
           <span>启用 {{ summary.enabled_count || 0 }}/{{ summary.account_count || 0 }}</span>
@@ -39,18 +39,26 @@
               <div class="quota-card__header" @click="toggleQuotaCard(account.id)">
                 <span class="quota-card__name">{{ account.email || account.name || `#${account.id}` }}</span>
                 <div class="quota-card__header-actions">
+                  <el-button
+                    size="small"
+                    link
+                    type="primary"
+                    :loading="quotaRefreshingId === account.id"
+                    @click.stop="refreshAccountQuota(account)"
+                  >刷新配额</el-button>
                   <el-tag :type="account.disabled ? 'danger' : 'success'" size="small">{{ account.disabled ? '禁用' : '启用' }}</el-tag>
                   <span class="quota-card__toggle">{{ isQuotaCardCollapsed(account.id) ? '展开' : '折叠' }}</span>
                 </div>
               </div>
               <div class="quota-card__meta">套餐：{{ getDisplayPlan(account) }} / 过期：{{ formatTime(account.expires_at) }}</div>
               <div v-if="quotaLoading" class="quota-card__quota">官方配额加载中...</div>
-              <div v-else-if="quotas?.[account.id]?.available" class="quota-card__quota">
+              <div v-else-if="hasQuotaDetail(account)" class="quota-card__quota">
                 <span>支持模型：{{ formatSupportedModels(account) }}</span>
                 <span>5h：{{ formatPercent(quotas[account.id].primary?.used_percent) }} / {{ formatResetTime(quotas[account.id].primary?.reset_at) }}</span>
                 <template v-if="!isQuotaCardCollapsed(account.id)">
                   <span>7d：{{ formatPercent(quotas[account.id].secondary?.used_percent) }} / {{ formatResetTime(quotas[account.id].secondary?.reset_at) }}</span>
                   <span>Credits：{{ formatCredits(quotas[account.id].credits) }}</span>
+                  <span v-if="!quotas[account.id].available" class="quota-card__warning">状态：{{ quotas[account.id].message || '不可用' }}</span>
                   <div v-if="getAdditionalLimits(account).length" class="model-limits">
                     <div class="model-limits__title">模型/功能限额</div>
                     <div v-for="limit in getAdditionalLimits(account)" :key="`${limit.metered_feature || ''}-${limit.limit_name || ''}`" class="model-limits__item">
@@ -80,10 +88,16 @@
             <template #header>
               <div class="panel-header">
                 <div class="panel-title">OpenAI 账号列表</div>
-                <el-button type="primary" :loading="importing" @click="openImportDialog">导入账号</el-button>
+                <div class="account-actions">
+                  <el-button size="small" :disabled="!selectedAccounts.length" @click="batchSetAccountsDisabled(false)">批量启用</el-button>
+                  <el-button size="small" :disabled="!selectedAccounts.length" @click="batchSetAccountsDisabled(true)">批量禁用</el-button>
+                  <el-button size="small" type="danger" :disabled="!selectedAccounts.length" @click="batchDeleteAccounts">批量删除</el-button>
+                  <el-button type="primary" :loading="importing" @click="openImportDialog">导入账号</el-button>
+                </div>
               </div>
             </template>
-            <el-table :data="accounts" stripe border v-loading="loading" size="small">
+            <el-table :data="accounts" stripe border v-loading="loading" size="small" @selection-change="handleAccountSelectionChange">
+              <el-table-column type="selection" width="42" />
               <el-table-column prop="id" label="ID" width="54" />
               <el-table-column prop="name" label="名称" width="152" />
               <el-table-column prop="email" label="邮箱" width="143" />
@@ -102,7 +116,7 @@
                 <template #default="{ row }">
                   <div class="key-row">
                     <span>{{ row.proxy_key }}</span>
-                    <el-button link type="primary" @click="copyText(row.proxy_key)">复制</el-button>
+                    <el-button link type="primary" @click="copyToClipboard(row.proxy_key)">复制</el-button>
                   </div>
                 </template>
               </el-table-column>
@@ -157,7 +171,21 @@
       </el-tabs>
     </el-card>
 
-      <el-dialog v-model="importDialogVisible" title="导入 OpenAI 账号" width="640px">
+      <el-dialog v-model="importDialogVisible" title="导入 OpenAI 账号" width="680px">
+        <div class="import-file-box">
+          <input
+            ref="importFileInput"
+            class="import-file-input"
+            type="file"
+            accept=".json,application/json"
+            multiple
+            @change="handleImportFilesChange"
+          />
+          <div class="form-tip">可同时选择多个 cpatoken JSON 文件；也可继续在下方粘贴单个对象或数组。</div>
+          <div v-if="importFiles.length" class="import-file-list">
+            <span v-for="file in importFiles" :key="file.name">{{ file.name }}</span>
+          </div>
+        </div>
         <el-input
           v-model="importContent"
           type="textarea"
@@ -175,11 +203,12 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { adminApi } from '../api'
+import { adminApi, copyText } from '../api'
 
 const accounts = ref([])
 const quotas = ref(null)
 const quotaLoading = ref(false)
+const quotaRefreshingId = ref(null)
 const summary = ref({})
 const unifiedApiKey = ref('cpa-plus-unified')
 const allCardsExpanded = ref(false)
@@ -188,6 +217,9 @@ const importing = ref(false)
 const checkingId = ref(null)
 const importDialogVisible = ref(false)
 const importContent = ref('')
+const importFiles = ref([])
+const importFileInput = ref(null)
+const selectedAccounts = ref([])
 const activeTab = ref('accounts')
 const usageLoading = ref(false)
 const usageLogs = ref([])
@@ -232,6 +264,26 @@ const loadQuotas = async () => {
   }
 }
 
+const refreshAccountQuota = async (account) => {
+  quotaRefreshingId.value = account.id
+  try {
+    const quota = await adminApi.getOpenAIPlusQuota(account.id)
+    quotas.value = {
+      ...(quotas.value || {}),
+      [String(account.id)]: { ...quota, account_id: account.id },
+    }
+    ElMessage.success('配额已刷新')
+  } catch (error) {
+    quotas.value = {
+      ...(quotas.value || {}),
+      [String(account.id)]: { account_id: account.id, available: false, message: error.message || '配额刷新失败' },
+    }
+    ElMessage.warning(error.message || '配额刷新失败')
+  } finally {
+    quotaRefreshingId.value = null
+  }
+}
+
 const loadUsageLogs = async () => {
   usageLoading.value = true
   try {
@@ -272,19 +324,70 @@ const moveUsageRow = (direction) => {
 
 const openImportDialog = () => {
   importContent.value = ''
+  importFiles.value = []
+  if (importFileInput.value) {
+    importFileInput.value.value = ''
+  }
   importDialogVisible.value = true
 }
 
-const handleImport = async () => {
-  if (!importContent.value.trim()) {
-    ElMessage.warning('请先粘贴 JSON')
-    return
+const handleImportFilesChange = (event) => {
+  importFiles.value = Array.from(event.target.files || [])
+}
+
+const normalizeImportPayload = (payload) => {
+  if (Array.isArray(payload)) return payload.filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+  if (payload && typeof payload === 'object') return [payload]
+  return []
+}
+
+const readImportFile = (file) => new Promise((resolve, reject) => {
+  const reader = new FileReader()
+  reader.onload = () => {
+    try {
+      resolve(normalizeImportPayload(JSON.parse(String(reader.result || ''))))
+    } catch {
+      reject(new Error(`${file.name} 不是有效 JSON`))
+    }
   }
+  reader.onerror = () => reject(new Error(`${file.name} 读取失败`))
+  reader.readAsText(file)
+})
+
+const buildImportContent = async () => {
+  const payloads = []
+  const text = importContent.value.trim()
+
+  if (text) {
+    try {
+      payloads.push(...normalizeImportPayload(JSON.parse(text)))
+    } catch {
+      throw new Error('粘贴内容不是有效 JSON')
+    }
+  }
+
+  for (const file of importFiles.value) {
+    payloads.push(...await readImportFile(file))
+  }
+
+  if (!payloads.length) {
+    throw new Error('请先选择 JSON 文件或粘贴 JSON')
+  }
+
+  return JSON.stringify(payloads)
+}
+
+const handleImport = async () => {
   importing.value = true
   try {
-    const res = await adminApi.importOpenAIPlusAccounts(importContent.value)
+    const content = await buildImportContent()
+    const res = await adminApi.importOpenAIPlusAccounts(content)
     ElMessage.success(`导入完成：新增 ${res.created || 0}，更新 ${res.updated || 0}，失败 ${res.failed || 0}`)
     importContent.value = ''
+    importFiles.value = []
+    if (importFileInput.value) {
+      importFileInput.value.value = ''
+    }
     importDialogVisible.value = false
     await loadAccounts()
   } catch (error) {
@@ -292,6 +395,36 @@ const handleImport = async () => {
   } finally {
     importing.value = false
   }
+}
+
+const handleAccountSelectionChange = (rows) => {
+  selectedAccounts.value = rows || []
+}
+
+const batchSetAccountsDisabled = async (disabled) => {
+  if (!selectedAccounts.value.length) {
+    ElMessage.warning('请先选择账号')
+    return
+  }
+  await adminApi.batchUpdateOpenAIPlusAccounts({
+    account_ids: selectedAccounts.value.map((item) => item.id),
+    disabled,
+  })
+  ElMessage.success(disabled ? '已批量禁用' : '已批量启用')
+  selectedAccounts.value = []
+  await loadAccounts()
+}
+
+const batchDeleteAccounts = async () => {
+  if (!selectedAccounts.value.length) {
+    ElMessage.warning('请先选择账号')
+    return
+  }
+  await ElMessageBox.confirm(`确认删除选中的 ${selectedAccounts.value.length} 个 Plus 账号？`, '批量删除 Plus 账号', { type: 'warning' })
+  await adminApi.batchDeleteOpenAIPlusAccounts({ account_ids: selectedAccounts.value.map((item) => item.id) })
+  ElMessage.success('已批量删除')
+  selectedAccounts.value = []
+  await loadAccounts()
 }
 
 const checkAccount = async (row) => {
@@ -319,8 +452,8 @@ const deleteAccount = async (row) => {
   await loadAccounts()
 }
 
-const copyText = async (text) => {
-  await navigator.clipboard.writeText(text)
+const copyToClipboard = async (text) => {
+  await copyText(text)
   ElMessage.success('已复制')
 }
 
@@ -351,6 +484,11 @@ const toggleQuotaCard = () => {
 
 const getDisplayPlan = (account) => {
   return quotas.value?.[account.id]?.plan_type || account.plan_type || '-'
+}
+
+const hasQuotaDetail = (account) => {
+  const quota = quotas.value?.[account.id]
+  return !!(quota?.available || quota?.primary || quota?.secondary || quota?.credits || getAdditionalLimits(account).length)
 }
 
 const getAdditionalLimits = (account) => {
@@ -561,6 +699,10 @@ onMounted(() => {
   font-size: 12px;
   line-height: 18px;
 }
+
+.quota-card__warning {
+  color: #d97706;
+}
 .model-limits {
   display: flex;
   flex-direction: column;
@@ -611,6 +753,48 @@ onMounted(() => {
 
 .account-list-card {
   margin-top: 12px;
+}
+
+.account-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.import-file-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.import-file-input {
+  width: 100%;
+}
+
+.import-file-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.import-file-list span {
+  max-width: 220px;
+  padding: 3px 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(37, 99, 235, 0.08);
+  color: #1f3b5d;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.form-tip {
+  color: #6b7c93;
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .table-actions-row {

@@ -325,7 +325,7 @@
                 <span class="image-card-meta">{{ imageSizeText(item) }}</span>
               </div>
               <div class="image-actions">
-                <el-button v-if="item.image_url" link type="primary" @click="copyText(item.image_url)">复制 URL</el-button>
+                <el-button v-if="item.image_url" link type="primary" @click="copyToClipboard(item.image_url)">复制 URL</el-button>
                 <el-button
                   link
                   type="primary"
@@ -589,7 +589,7 @@
         </div>
         <div class="prompt-example-content">{{ selectedPromptExample.prompt }}</div>
         <div class="prompt-example-actions">
-          <el-button @click="copyText(selectedPromptExample.prompt)">复制样例</el-button>
+          <el-button @click="copyToClipboard(selectedPromptExample.prompt)">复制样例</el-button>
           <el-button type="primary" @click="insertPromptExample">插入到提示词</el-button>
         </div>
       </div>
@@ -912,7 +912,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { View } from '@element-plus/icons-vue'
-import { adminApi, authApi } from '../api'
+import { adminApi, authApi, copyText } from '../api'
 
 const imageModels = ref([])
 const keyStats = ref([])
@@ -2191,7 +2191,7 @@ const toggleImageKeyDetailActive = async () => {
 const copyKeyPassword = async (password) => {
   if (!password) return
   try {
-    await navigator.clipboard.writeText(password)
+    await copyText(password)
     ElMessage.success('密码已复制')
   } catch {
     ElMessage.error('复制失败')
@@ -2476,8 +2476,8 @@ const revealResultFile = async (item) => {
   }
 }
 
-const copyText = async (value) => {
-  await navigator.clipboard.writeText(value)
+const copyToClipboard = async (value) => {
+  await copyText(value)
   ElMessage.success('已复制')
 }
 

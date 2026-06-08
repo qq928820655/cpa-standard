@@ -938,7 +938,7 @@
 import { computed, ref, reactive, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import { View } from '@element-plus/icons-vue'
-import { adminApi, statsApi } from '../api'
+import { adminApi, statsApi, copyText as copyTextUtil } from '../api'
 
 const KEY_MANAGE_STATE_STORAGE_KEY = 'keyManageViewState'
 const FILTERS_COLLAPSED_KEY = 'keyManageFiltersCollapsed'
@@ -1777,21 +1777,7 @@ const copyText = async (text) => {
   if (!text) {
     throw new Error('没有可复制的内容')
   }
-
-  if (navigator?.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text)
-    return
-  }
-
-  const textarea = document.createElement('textarea')
-  textarea.value = text
-  textarea.setAttribute('readonly', 'readonly')
-  textarea.style.position = 'fixed'
-  textarea.style.opacity = '0'
-  document.body.appendChild(textarea)
-  textarea.select()
-  document.execCommand('copy')
-  document.body.removeChild(textarea)
+  await copyTextUtil(text)
 }
 
 const downloadTextFile = (filename, text) => {
