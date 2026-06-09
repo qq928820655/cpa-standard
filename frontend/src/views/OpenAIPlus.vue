@@ -30,12 +30,27 @@
 
       <el-tabs v-model="activeTab" class="openai-tabs">
         <el-tab-pane label="账号管理" name="accounts">
+          <div class="account-filter-bar">
+            <el-input v-model="accountKeyword" size="small" clearable placeholder="搜索 ID / 名称 / 邮箱 / Account ID / Proxy Key" @clear="accountPage = 1" @input="accountPage = 1" />
+            <el-select v-model="accountStatusFilter" size="small" class="account-status-filter" @change="accountPage = 1">
+              <el-option label="全部状态" value="all" />
+              <el-option label="仅启用" value="enabled" />
+              <el-option label="仅禁用" value="disabled" />
+            </el-select>
+            <el-select v-model="accountPageSize" size="small" class="account-page-size" @change="accountPage = 1">
+              <el-option :label="'60 条/页'" :value="60" />
+              <el-option :label="'100 条/页'" :value="100" />
+              <el-option :label="'200 条/页'" :value="200" />
+            </el-select>
+          </div>
           <div class="quota-actions">
+            <span v-if="batchRefreshing" class="batch-refresh-progress">刷新中 {{ batchRefreshProgress.done }}/{{ batchRefreshProgress.total }}</span>
             <el-button size="small" @click="toggleAllCards">{{ allCardsExpanded ? '一键折叠' : '一键展开' }}</el-button>
-            <el-button size="small" type="primary" :loading="quotaLoading" @click="loadQuotas">刷新配额</el-button>
+            <el-button size="small" :loading="batchRefreshing" @click="refreshCurrentPageAccounts">刷新本页</el-button>
+            <el-button size="small" type="primary" :loading="batchRefreshing" @click="refreshSelectedOrFilteredAccounts">{{ selectedAccounts.length ? '刷新勾选' : '刷新全部' }}</el-button>
           </div>
           <div class="quota-grid">
-            <div v-for="account in accounts" :key="account.id" class="quota-card">
+            <div v-for="account in pagedAccounts" :key="account.id" class="quota-card" :class="{ 'is-selected': selectedAccountIds.has(account.id) }">
               <div class="quota-card__header" @click="toggleQuotaCard(account.id)">
                 <span class="quota-card__name">{{ account.email || account.name || `#${account.id}` }}</span>
                 <div class="quota-card__header-actions">
@@ -43,7 +58,7 @@
                     size="small"
                     link
                     type="primary"
-                    :loading="quotaRefreshingId === account.id"
+                    :loading="quotaRefreshingIds.has(account.id) || quotaRefreshingId === account.id"
                     @click.stop="refreshAccountQuota(account)"
                   >刷新配额</el-button>
                   <el-tag :type="account.disabled ? 'danger' : 'success'" size="small">{{ account.disabled ? '禁用' : '启用' }}</el-tag>
@@ -96,7 +111,7 @@
                 </div>
               </div>
             </template>
-            <el-table :data="accounts" stripe border v-loading="loading" size="small" @selection-change="handleAccountSelectionChange">
+            <el-table :data="pagedAccounts" stripe border v-loading="loading" size="small" @selection-change="handleAccountSelectionChange">
               <el-table-column type="selection" width="42" />
               <el-table-column prop="id" label="ID" width="54" />
               <el-table-column prop="name" label="名称" width="152" />
@@ -139,6 +154,17 @@
                 </template>
               </el-table-column>
             </el-table>
+            <div class="account-pagination">
+              <span>共 {{ filteredAccounts.length }} 个账号，当前 {{ pagedAccounts.length }} 个</span>
+              <el-pagination
+                v-model:current-page="accountPage"
+                v-model:page-size="accountPageSize"
+                :page-sizes="[60, 100, 200]"
+                :total="filteredAccounts.length"
+                layout="sizes, prev, pager, next, jumper"
+                small
+              />
+            </div>
           </el-card>
         </el-tab-pane>
 
@@ -201,7 +227,7 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { adminApi, copyText } from '../api'
 
@@ -209,6 +235,13 @@ const accounts = ref([])
 const quotas = ref(null)
 const quotaLoading = ref(false)
 const quotaRefreshingId = ref(null)
+const quotaRefreshingIds = ref(new Set())
+const batchRefreshing = ref(false)
+const batchRefreshProgress = ref({ done: 0, total: 0 })
+const accountKeyword = ref('')
+const accountStatusFilter = ref('all')
+const accountPage = ref(1)
+const accountPageSize = ref(60)
 const summary = ref({})
 const unifiedApiKey = ref('cpa-plus-unified')
 const allCardsExpanded = ref(false)
@@ -224,6 +257,24 @@ const activeTab = ref('accounts')
 const usageLoading = ref(false)
 const usageLogs = ref([])
 const selectedUsageRow = ref(null)
+const filteredAccounts = computed(() => {
+  const keyword = accountKeyword.value.trim().toLowerCase()
+  return accounts.value.filter((account) => {
+    if (accountStatusFilter.value === 'enabled' && account.disabled) return false
+    if (accountStatusFilter.value === 'disabled' && !account.disabled) return false
+    if (!keyword) return true
+    return [account.id, account.name, account.email, account.account_id, account.proxy_key]
+      .some((value) => String(value || '').toLowerCase().includes(keyword))
+  })
+})
+
+const pagedAccounts = computed(() => {
+  const start = (accountPage.value - 1) * accountPageSize.value
+  return filteredAccounts.value.slice(start, start + accountPageSize.value)
+})
+
+const selectedAccountIds = computed(() => new Set(selectedAccounts.value.map((item) => item.id)))
+
 const usageColumns = ref([
   { prop: 'id', label: 'ID', width: 70 },
   { prop: 'account_email', label: '账号', width: 210 },
@@ -252,37 +303,74 @@ const loadAccounts = async () => {
   }
 }
 
-const loadQuotas = async () => {
-  quotaLoading.value = true
-  try {
-    const res = await adminApi.listOpenAIPlusQuotas()
-    quotas.value = Object.fromEntries((res.items || []).map((item) => [String(item.account_id), item]))
-  } catch (error) {
-    ElMessage.warning(error.message || '用量配额加载失败')
-  } finally {
-    quotaLoading.value = false
-  }
+const updateAccountRow = (nextAccount) => {
+  accounts.value = accounts.value.map((item) => (item.id === nextAccount.id ? { ...item, ...nextAccount } : item))
 }
 
-const refreshAccountQuota = async (account) => {
+const refreshSingleAccountStatus = async (account, silent = false) => {
   quotaRefreshingId.value = account.id
+  quotaRefreshingIds.value = new Set([...quotaRefreshingIds.value, account.id])
   try {
     const quota = await adminApi.getOpenAIPlusQuota(account.id)
     quotas.value = {
       ...(quotas.value || {}),
       [String(account.id)]: { ...quota, account_id: account.id },
     }
-    ElMessage.success('配额已刷新')
+    const checked = await adminApi.checkOpenAIPlusAccount(account.id)
+    updateAccountRow(checked)
+    if (!silent) ElMessage.success('刷新完成')
   } catch (error) {
     quotas.value = {
       ...(quotas.value || {}),
-      [String(account.id)]: { account_id: account.id, available: false, message: error.message || '配额刷新失败' },
+      [String(account.id)]: { account_id: account.id, available: false, message: error.message || '刷新失败' },
     }
-    ElMessage.warning(error.message || '配额刷新失败')
+    if (!silent) ElMessage.warning(error.message || '刷新失败')
   } finally {
+    const nextIds = new Set(quotaRefreshingIds.value)
+    nextIds.delete(account.id)
+    quotaRefreshingIds.value = nextIds
     quotaRefreshingId.value = null
   }
 }
+
+const runRefreshQueue = async (targetAccounts) => {
+  if (!targetAccounts.length) {
+    ElMessage.warning('没有可刷新的账号')
+    return
+  }
+  batchRefreshing.value = true
+  batchRefreshProgress.value = { done: 0, total: targetAccounts.length }
+  const concurrency = 5
+  let cursor = 0
+  const workers = Array.from({ length: Math.min(concurrency, targetAccounts.length) }, async () => {
+    while (cursor < targetAccounts.length) {
+      const current = targetAccounts[cursor]
+      cursor += 1
+      await refreshSingleAccountStatus(current, true)
+      batchRefreshProgress.value = {
+        ...batchRefreshProgress.value,
+        done: batchRefreshProgress.value.done + 1,
+      }
+    }
+  })
+  try {
+    await Promise.all(workers)
+    ElMessage.success(`刷新完成：${targetAccounts.length} 个账号`)
+  } finally {
+    batchRefreshing.value = false
+  }
+}
+
+const refreshCurrentPageAccounts = () => runRefreshQueue([...pagedAccounts.value])
+
+const refreshSelectedOrFilteredAccounts = () => {
+  const targets = selectedAccounts.value.length ? selectedAccounts.value : filteredAccounts.value
+  return runRefreshQueue([...targets])
+}
+
+const loadQuotas = async () => refreshSelectedOrFilteredAccounts()
+
+const refreshAccountQuota = async (account) => refreshSingleAccountStatus(account)
 
 const loadUsageLogs = async () => {
   usageLoading.value = true
@@ -440,9 +528,9 @@ const batchDeleteAccounts = async () => {
 const checkAccount = async (row) => {
   checkingId.value = row.id
   try {
-    await adminApi.checkOpenAIPlusAccount(row.id)
+    const checked = await adminApi.checkOpenAIPlusAccount(row.id)
+    updateAccountRow(checked)
     ElMessage.success('检测完成')
-    await loadAccounts()
   } catch (error) {
     ElMessage.error(error.message || '检测失败')
   } finally {
@@ -638,6 +726,39 @@ onMounted(() => {
   gap: 10px;
   color: #40566f;
   font-size: 12px;
+}
+
+.account-filter-bar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) 120px 120px;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.account-status-filter,
+.account-page-size {
+  width: 120px;
+}
+
+.batch-refresh-progress {
+  color: #2563eb;
+  font-size: 12px;
+  line-height: 24px;
+}
+
+.account-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  color: #6b7c93;
+  font-size: 12px;
+}
+
+.quota-card.is-selected {
+  border-color: rgba(37, 99, 235, 0.55);
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.12);
 }
 
 .quota-actions {
