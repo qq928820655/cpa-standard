@@ -90,12 +90,38 @@ def is_cloudflare_524_response(status_code: int, response_data: Any) -> bool:
     )
 
 
-def append_continue_message(body: Optional[dict]) -> dict:
+def append_continue_message(body: Optional[dict], content: str = "继续") -> dict:
     next_body = dict(body or {})
     messages = list(next_body.get("messages") or [])
-    messages.append({"role": "user", "content": "继续"})
+    messages.append({"role": "user", "content": content})
     next_body["messages"] = messages
     return next_body
+
+
+def get_provider_continue_prompt(provider: Optional[str]) -> str:
+    from config import export_config
+    prompts = export_config.get("provider_continue_prompts") or {}
+    provider_key = (provider or "").strip()
+    if isinstance(prompts, dict):
+        value = prompts.get(provider_key) or prompts.get(provider_key.lower()) or prompts.get("default")
+        if value:
+            return str(value)
+    return "继续处理用户原始请求。如果当前分组不支持图片生成，请不要再次调用图片生成能力，改用文本方式完成或说明可执行的替代方案。"
+
+
+def should_continue_with_same_key(status_code: int, response_data: Any) -> bool:
+    if status_code not in {400, 403}:
+        return False
+    message = "\n".join(collect_upstream_error_texts(response_data)).lower()
+    if not message:
+        return False
+    keywords = (
+        "不支持生成图片",
+        "请切换分组",
+        "does not support image generation",
+        "image generation is not supported",
+    )
+    return any(keyword in message for keyword in keywords)
 
 
 def get_sticky_session_key(headers: dict, model: Optional[str] = None) -> Optional[str]:
@@ -983,6 +1009,84 @@ async def forward_request_with_retry(
 
         if sticky_session_key:
             pool_manager.clear_session_binding(sticky_session_key)
+
+        if not auto_continue_used and should_continue_with_same_key(status_code, response_data):
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="same_key_continue",
+                response_data=response_data,
+            )
+            continue_prompt = get_provider_continue_prompt(getattr(api_key, "provider", None))
+            auto_continue_body = append_continue_message(body, continue_prompt)
+            auto_continue_upstream_body, _auto_continue_upstream_model = await build_upstream_body_for_key(
+                db,
+                api_key,
+                auto_continue_body,
+                model,
+                filter_providers or None,
+            )
+            auto_continue_used = True
+            print(f"[CPA SAME KEY CONTINUE] api_key_id={api_key.id} provider={getattr(api_key, 'provider', None)} model={model} path={path}")
+            auto_continue_attempt_started_at = time.perf_counter()
+            status_code, response_headers, response_data = await proxy_service.forward_request(
+                db=db,
+                api_key=api_key,
+                method=method,
+                path=path,
+                headers=headers,
+                body=auto_continue_upstream_body,
+                user_id=user_id,
+                original_model=original_model,
+            )
+            auto_continue_attempt_ms = int((time.perf_counter() - auto_continue_attempt_started_at) * 1000)
+            trace_upstream_ms += auto_continue_attempt_ms
+            if status_code < 400:
+                _trace_attempt(
+                    trace_ctx,
+                    api_key=api_key,
+                    requested_model=model,
+                    upstream_model=_auto_continue_upstream_model,
+                    status_code=status_code,
+                    upstream_latency_ms=auto_continue_attempt_ms,
+                    action="same_key_continue_success",
+                    response_data=response_data,
+                )
+                pool_manager.clear_key_cooldown(api_key.id)
+                if sticky_session_key:
+                    pool_manager.bind_session_to_key(
+                        sticky_session_key,
+                        api_key.id,
+                        settings.proxy_session_sticky_ttl_seconds,
+                        provider=getattr(api_key, "provider", None),
+                        model=model,
+                    )
+                await _save_trace(
+                    db,
+                    trace_ctx,
+                    api_key=api_key,
+                    status_code=status_code,
+                    started_at=trace_started_at,
+                    upstream_latency_ms=trace_upstream_ms,
+                )
+                return status_code, response_headers, response_data, api_key
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=_auto_continue_upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=auto_continue_attempt_ms,
+                action="same_key_continue_failed",
+                response_data=response_data,
+            )
+            last_status_code = status_code
+            last_response_headers = response_headers
+            last_response_body = response_data
 
         if (
             not auto_continue_used
