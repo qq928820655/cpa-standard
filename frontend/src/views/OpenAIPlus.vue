@@ -104,6 +104,7 @@
               <div class="panel-header">
                 <div class="panel-title">OpenAI 账号列表</div>
                 <div class="account-actions">
+                  <el-button size="small" :disabled="!pagedAccounts.length" @click="selectCurrentPage401Accounts">勾选401异常</el-button>
                   <el-button size="small" :disabled="!selectedAccounts.length" @click="batchSetAccountsDisabled(false)">批量启用</el-button>
                   <el-button size="small" :disabled="!selectedAccounts.length" @click="batchSetAccountsDisabled(true)">批量禁用</el-button>
                   <el-button size="small" type="danger" :disabled="!selectedAccounts.length" @click="batchDeleteAccounts">批量删除</el-button>
@@ -111,7 +112,7 @@
                 </div>
               </div>
             </template>
-            <el-table :data="pagedAccounts" stripe border v-loading="loading" size="small" @selection-change="handleAccountSelectionChange">
+            <el-table ref="accountTableRef" :data="pagedAccounts" stripe border v-loading="loading" size="small" @selection-change="handleAccountSelectionChange">
               <el-table-column type="selection" width="42" />
               <el-table-column prop="id" label="ID" width="54" />
               <el-table-column prop="name" label="名称" width="152" />
@@ -252,6 +253,7 @@ const importDialogVisible = ref(false)
 const importContent = ref('')
 const importFiles = ref([])
 const importFileInput = ref(null)
+const accountTableRef = ref(null)
 const selectedAccounts = ref([])
 const activeTab = ref('accounts')
 const usageLoading = ref(false)
@@ -497,6 +499,29 @@ const handleImport = async () => {
 
 const handleAccountSelectionChange = (rows) => {
   selectedAccounts.value = rows || []
+}
+
+const isAccount401Error = (account) => {
+  const quota = quotas.value?.[account.id]
+  const text = [
+    quota?.message,
+    quota?.error_message,
+    account.last_check_message,
+    account.last_check_status,
+  ].filter(Boolean).join(' ').toLowerCase()
+  return text.includes('401') || text.includes('unauthorized') || text.includes('invalid token') || text.includes('invalid api key')
+}
+
+const selectCurrentPage401Accounts = () => {
+  if (!accountTableRef.value) return
+  accountTableRef.value.clearSelection()
+  const rows = pagedAccounts.value.filter(isAccount401Error)
+  rows.forEach((row) => accountTableRef.value.toggleRowSelection(row, true))
+  if (!rows.length) {
+    ElMessage.warning('当前页没有 401 异常账号')
+    return
+  }
+  ElMessage.success(`已勾选当前页 ${rows.length} 个 401 异常账号`)
 }
 
 const batchSetAccountsDisabled = async (disabled) => {
