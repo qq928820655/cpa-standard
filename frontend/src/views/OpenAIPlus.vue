@@ -354,7 +354,7 @@ const readImportFile = (file) => new Promise((resolve, reject) => {
   reader.readAsText(file)
 })
 
-const buildImportContent = async () => {
+const buildImportPayloads = async () => {
   const payloads = []
   const text = importContent.value.trim()
 
@@ -374,15 +374,25 @@ const buildImportContent = async () => {
     throw new Error('请先选择 JSON 文件或粘贴 JSON')
   }
 
-  return JSON.stringify(payloads)
+  return payloads
 }
 
 const handleImport = async () => {
   importing.value = true
   try {
-    const content = await buildImportContent()
-    const res = await adminApi.importOpenAIPlusAccounts(content)
-    ElMessage.success(`导入完成：新增 ${res.created || 0}，更新 ${res.updated || 0}，失败 ${res.failed || 0}`)
+    const payloads = await buildImportPayloads()
+    const batchSize = 500
+    const summary = { created: 0, updated: 0, failed: 0, skipped: 0 }
+    for (let start = 0; start < payloads.length; start += batchSize) {
+      const batch = payloads.slice(start, start + batchSize)
+      const res = await adminApi.importOpenAIPlusAccounts(JSON.stringify(batch))
+      summary.created += res.created || 0
+      summary.updated += res.updated || 0
+      summary.failed += res.failed || 0
+      summary.skipped += res.skipped || 0
+      ElMessage.info(`正在导入：${Math.min(start + batch.length, payloads.length)}/${payloads.length}`)
+    }
+    ElMessage.success(`导入完成：新增 ${summary.created}，更新 ${summary.updated}，跳过 ${summary.skipped}，失败 ${summary.failed}`)
     importContent.value = ''
     importFiles.value = []
     if (importFileInput.value) {

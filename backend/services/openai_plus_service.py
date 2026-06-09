@@ -23,6 +23,8 @@ CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 OPENAI_TOKEN_URL = "https://auth.openai.com/oauth/token"
 DEFAULT_CODEX_INSTRUCTIONS = "You are ChatGPT, a helpful assistant."
 PLUS_UNIFIED_API_KEY = "cpa-plus-unified"
+IMPORT_COMMIT_BATCH_SIZE = 500
+IMPORT_RETURN_ITEM_LIMIT = 1000
 
 PLUS_SESSION_STICKY_ENABLED = True
 PLUS_SESSION_STICKY_TTL_SECONDS = 6 * 3600
@@ -270,52 +272,117 @@ def is_unified_proxy_key(proxy_key: str) -> bool:
     return (proxy_key or "").strip() == PLUS_UNIFIED_API_KEY
 
 
+def parse_import_account_payload(payload: dict, index: int) -> dict:
+    access_token = str(get_nested(payload, ["tokens", "access_token"], ["tokens", "accessToken"], ["access_token"], ["accessToken"], ["token"]) or "").strip()
+    if not access_token:
+        raise ValueError("缺少 access_token")
+    refresh_token = str(get_nested(payload, ["tokens", "refresh_token"], ["tokens", "refreshToken"], ["refresh_token"], ["refreshToken"]) or "").strip()
+    id_token = str(get_nested(payload, ["tokens", "id_token"], ["tokens", "idToken"], ["id_token"], ["idToken"]) or "").strip()
+    jwt_payload = decode_jwt_payload(access_token)
+    openai_auth = jwt_payload.get("https://api.openai.com/auth") if isinstance(jwt_payload.get("https://api.openai.com/auth"), dict) else {}
+    profile = jwt_payload.get("https://api.openai.com/profile") if isinstance(jwt_payload.get("https://api.openai.com/profile"), dict) else {}
+    account_id = str(get_nested(payload, ["account_id"], ["accountId"], ["chatgpt_account_id"]) or openai_auth.get("chatgpt_account_id") or "").strip()
+    email = str(get_nested(payload, ["email"], ["user", "email"]) or profile.get("email") or "").strip()
+    chatgpt_user_id = str(get_nested(payload, ["chatgpt_user_id"], ["user_id"], ["user", "id"]) or openai_auth.get("chatgpt_user_id") or openai_auth.get("user_id") or "").strip()
+    plan_type = str(get_nested(payload, ["plan_type"], ["planType"], ["account", "plan_type"]) or openai_auth.get("chatgpt_plan_type") or "").strip()
+    expires_at = parse_json_datetime(get_nested(payload, ["expired"], ["expires_at"], ["expiresAt"]))
+    if not expires_at and jwt_payload.get("exp"):
+        expires_at = datetime.fromtimestamp(int(jwt_payload["exp"]), tz=timezone.utc).replace(tzinfo=None)
+    identities = build_import_identities(
+        chatgpt_user_id=chatgpt_user_id,
+        email=email,
+        refresh_token=refresh_token,
+        access_token=access_token,
+        account_id=account_id,
+    )
+    if not identities:
+        raise ValueError("缺少可识别账号身份")
+    return {
+        "index": index,
+        "name": str(payload.get("name") or email or account_id or f"Plus-{index}"),
+        "email": email,
+        "account_id": account_id,
+        "chatgpt_user_id": chatgpt_user_id,
+        "plan_type": plan_type,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+        "expires_at": expires_at,
+        "disabled": bool(payload.get("disabled", False)),
+        "websockets": bool(payload.get("websockets", False)),
+        "identities": identities,
+    }
+
+
+async def build_existing_account_indexes(db: AsyncSession) -> dict[str, dict[str, OpenAIPlusAccount]]:
+    indexes: dict[str, dict[str, OpenAIPlusAccount]] = {
+        "chatgpt_user_id": {},
+        "email": {},
+        "refresh_token": {},
+        "access_token": {},
+        "account_id": {},
+    }
+    result = await db.execute(select(OpenAIPlusAccount))
+    for account in result.scalars().all():
+        if account.chatgpt_user_id:
+            indexes["chatgpt_user_id"][account.chatgpt_user_id.lower()] = account
+        if account.email:
+            indexes["email"][account.email.lower()] = account
+        refresh_fp = token_fingerprint(account.refresh_token)
+        if refresh_fp:
+            indexes["refresh_token"][refresh_fp] = account
+        access_fp = token_fingerprint(account.access_token)
+        if access_fp:
+            indexes["access_token"][access_fp] = account
+        if account.account_id:
+            indexes["account_id"][account.account_id.lower()] = account
+    return indexes
+
+
+def find_indexed_import_account(indexes: dict[str, dict[str, OpenAIPlusAccount]], identities: list[tuple[str, str]]) -> Optional[OpenAIPlusAccount]:
+    for kind, value in identities:
+        account = indexes.get(kind, {}).get(value)
+        if account:
+            return account
+    return None
+
+
+def put_account_indexes(indexes: dict[str, dict[str, OpenAIPlusAccount]], account: OpenAIPlusAccount, identities: list[tuple[str, str]]):
+    for kind, value in identities:
+        indexes.setdefault(kind, {})[value] = account
+
+
 async def import_accounts(db: AsyncSession, content: str) -> dict:
     payloads = normalize_import_payload(content)
     created = 0
     updated = 0
     failed = 0
+    skipped = 0
     items = []
+    omitted_items = 0
     batch_seen: set[tuple[str, str]] = set()
+    indexes = await build_existing_account_indexes(db)
+
+    def add_item(item: dict):
+        nonlocal omitted_items
+        if len(items) < IMPORT_RETURN_ITEM_LIMIT:
+            items.append(item)
+        else:
+            omitted_items += 1
 
     for index, payload in enumerate(payloads, start=1):
         try:
-            access_token = str(get_nested(payload, ["tokens", "access_token"], ["tokens", "accessToken"], ["access_token"], ["accessToken"], ["token"]) or "").strip()
-            if not access_token:
-                raise ValueError("缺少 access_token")
-            refresh_token = str(get_nested(payload, ["tokens", "refresh_token"], ["tokens", "refreshToken"], ["refresh_token"], ["refreshToken"]) or "").strip()
-            id_token = str(get_nested(payload, ["tokens", "id_token"], ["tokens", "idToken"], ["id_token"], ["idToken"]) or "").strip()
-            jwt_payload = decode_jwt_payload(access_token)
-            openai_auth = jwt_payload.get("https://api.openai.com/auth") if isinstance(jwt_payload.get("https://api.openai.com/auth"), dict) else {}
-            profile = jwt_payload.get("https://api.openai.com/profile") if isinstance(jwt_payload.get("https://api.openai.com/profile"), dict) else {}
-            account_id = str(get_nested(payload, ["account_id"], ["accountId"], ["chatgpt_account_id"]) or openai_auth.get("chatgpt_account_id") or "").strip()
-            email = str(get_nested(payload, ["email"], ["user", "email"]) or profile.get("email") or "").strip()
-            chatgpt_user_id = str(get_nested(payload, ["chatgpt_user_id"], ["user_id"], ["user", "id"]) or openai_auth.get("chatgpt_user_id") or openai_auth.get("user_id") or "").strip()
-            plan_type = str(get_nested(payload, ["plan_type"], ["planType"], ["account", "plan_type"]) or openai_auth.get("chatgpt_plan_type") or "").strip()
-            expires_at = parse_json_datetime(get_nested(payload, ["expired"], ["expires_at"], ["expiresAt"]))
-            if not expires_at and jwt_payload.get("exp"):
-                expires_at = datetime.fromtimestamp(int(jwt_payload["exp"]), tz=timezone.utc).replace(tzinfo=None)
-
-            identities = build_import_identities(
-                chatgpt_user_id=chatgpt_user_id,
-                email=email,
-                refresh_token=refresh_token,
-                access_token=access_token,
-                account_id=account_id,
-            )
-            if not identities:
-                raise ValueError("缺少可识别账号身份")
-
-            primary_identity = identities[0]
-            if primary_identity in batch_seen:
-                items.append({"index": index, "action": "skipped", "email": email, "account_id": account_id, "message": "本批次重复账号"})
+            parsed = parse_import_account_payload(payload, index)
+            identities = parsed["identities"]
+            duplicate_identity = next((identity for identity in identities if identity in batch_seen), None)
+            if duplicate_identity:
+                skipped += 1
+                add_item({"index": index, "action": "skipped", "email": parsed["email"], "account_id": parsed["account_id"], "message": "本批次重复账号"})
                 continue
-            batch_seen.add(primary_identity)
+            batch_seen.update(identities)
 
-            existing = await find_existing_import_account(db, identities=identities, account_id=account_id)
-
-            if existing:
-                account = existing
+            account = find_indexed_import_account(indexes, identities)
+            if account:
                 updated += 1
                 action = "updated"
             else:
@@ -324,25 +391,38 @@ async def import_accounts(db: AsyncSession, content: str) -> dict:
                 created += 1
                 action = "created"
 
-            account.name = str(payload.get("name") or email or account_id or f"Plus-{index}")
-            account.email = email or None
-            account.account_id = account_id or None
-            account.chatgpt_user_id = chatgpt_user_id or None
-            account.plan_type = plan_type or None
-            account.access_token = access_token
-            account.refresh_token = refresh_token or None
-            account.id_token = id_token or None
-            account.expires_at = expires_at
-            account.disabled = bool(payload.get("disabled", False))
-            account.websockets = bool(payload.get("websockets", False))
+            account.name = parsed["name"]
+            account.email = parsed["email"] or None
+            account.account_id = parsed["account_id"] or None
+            account.chatgpt_user_id = parsed["chatgpt_user_id"] or None
+            account.plan_type = parsed["plan_type"] or None
+            account.access_token = parsed["access_token"]
+            account.refresh_token = parsed["refresh_token"] or None
+            account.id_token = parsed["id_token"] or None
+            account.expires_at = parsed["expires_at"]
+            account.disabled = parsed["disabled"]
+            account.websockets = parsed["websockets"]
             account.updated_at = datetime.utcnow()
-            items.append({"index": index, "action": action, "email": email, "account_id": account_id})
+            put_account_indexes(indexes, account, identities)
+            add_item({"index": index, "action": action, "email": parsed["email"], "account_id": parsed["account_id"]})
+
+            if (created + updated) % IMPORT_COMMIT_BATCH_SIZE == 0:
+                await db.commit()
         except Exception as exc:
             failed += 1
-            items.append({"index": index, "action": "failed", "message": str(exc)})
+            add_item({"index": index, "action": "failed", "message": str(exc)})
 
     await db.commit()
-    return {"total": len(payloads), "created": created, "updated": updated, "failed": failed, "items": items}
+    return {
+        "total": len(payloads),
+        "created": created,
+        "updated": updated,
+        "failed": failed,
+        "skipped": skipped,
+        "items": items,
+        "omitted_items": omitted_items,
+        "batch_size": IMPORT_COMMIT_BATCH_SIZE,
+    }
 
 
 

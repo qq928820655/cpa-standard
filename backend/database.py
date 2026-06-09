@@ -1,7 +1,7 @@
 """
 数据库连接和会话管理
 """
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from config import settings
@@ -25,8 +25,19 @@ def normalize_image_model_name(model: str | None) -> str:
 engine = create_async_engine(
     settings.database_url,
     echo=False,
-    connect_args={"timeout": 30},
+    connect_args={"timeout": 120},
 )
+
+
+@event.listens_for(engine.sync_engine, "connect")
+def configure_sqlite_connection(dbapi_connection, _connection_record):
+    if not settings.database_url.startswith("sqlite"):
+        return
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=120000")
+    cursor.close()
+
 
 async_session_maker = async_sessionmaker(
     engine,
