@@ -3450,6 +3450,23 @@ class ProxyService:
             user_id=user_id,
         )
 
+        def _extract_window_api_error(events: list[bytes]) -> Optional[dict]:
+            text = b"".join(events).decode("utf-8", "ignore")
+            lowered = text.lower()
+            if "api error:" not in lowered and "please run /login" not in lowered:
+                return None
+            status_code = None
+            for code in (400, 401, 403, 429, 500, 502, 503, 504):
+                if f"api error: {code}" in lowered or f"http {code}" in lowered:
+                    status_code = code
+                    break
+            if not status_code:
+                return None
+            return {
+                "status_code": status_code,
+                "body": {"error": {"message": text[:1000], "type": "stream_api_error"}},
+            }
+
         # 阶段一：缓冲窗口内收集事件，同时检测截流
         window_events: list[bytes] = []
         window_done = False        # 窗口内已收到终止事件（短响应直接结束）
@@ -3515,6 +3532,19 @@ class ProxyService:
         except Exception as e:
             window_error = self._safe_error_message("缓冲窗口读取失败: ", e)
             window_cut = True
+
+        # 窗口内流式内容包含 API Error 时，转成错误对象交给上层重试/继续规则处理
+        window_api_error = _extract_window_api_error(window_events)
+        if window_api_error:
+            latency_ms = int((time.perf_counter() - total_start) * 1000)
+            await response.aclose()
+            await client.aclose()
+            await usage_tracker.record(
+                db=db, api_key_id=api_key.id, model=original_model or model,
+                latency_ms=latency_ms, upstream_latency_ms=int(upstream_wait_seconds * 1000),
+                status="error", error_message=window_api_error["body"]["error"]["message"][:300], user_id=user_id,
+            )
+            return window_api_error["status_code"], {}, window_api_error["body"], True
 
         # 窗口内断流（未到时间就结束且没有终止事件）
         if not window_exited and not window_done and not window_error:

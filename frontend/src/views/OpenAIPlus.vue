@@ -115,7 +115,6 @@
             <el-table ref="accountTableRef" :data="pagedAccounts" stripe border v-loading="loading" size="small" @selection-change="handleAccountSelectionChange">
               <el-table-column type="selection" width="42" />
               <el-table-column prop="id" label="ID" width="54" />
-              <el-table-column prop="name" label="名称" width="152" />
               <el-table-column prop="email" label="邮箱" width="143" />
               <el-table-column prop="plan_type" label="套餐" width="49">
                 <template #default="{ row }">{{ row.plan_type || '-' }}</template>
@@ -309,6 +308,23 @@ const updateAccountRow = (nextAccount) => {
   accounts.value = accounts.value.map((item) => (item.id === nextAccount.id ? { ...item, ...nextAccount } : item))
 }
 
+const removeAccountRow = (accountId) => {
+  accounts.value = accounts.value.filter((item) => item.id !== accountId)
+  selectedAccounts.value = selectedAccounts.value.filter((item) => item.id !== accountId)
+  const nextQuotas = { ...(quotas.value || {}) }
+  delete nextQuotas[String(accountId)]
+  quotas.value = nextQuotas
+}
+
+const applyCheckResult = (checked) => {
+  if (checked?.deleted) {
+    removeAccountRow(checked.id)
+    return true
+  }
+  updateAccountRow(checked)
+  return false
+}
+
 const refreshSingleAccountStatus = async (account, silent = false) => {
   quotaRefreshingId.value = account.id
   quotaRefreshingIds.value = new Set([...quotaRefreshingIds.value, account.id])
@@ -319,8 +335,8 @@ const refreshSingleAccountStatus = async (account, silent = false) => {
       [String(account.id)]: { ...quota, account_id: account.id },
     }
     const checked = await adminApi.checkOpenAIPlusAccount(account.id)
-    updateAccountRow(checked)
-    if (!silent) ElMessage.success('刷新完成')
+    const deleted = applyCheckResult(checked)
+    if (!silent) ElMessage.success(deleted ? '检测到 401，账号已删除' : '刷新完成')
   } catch (error) {
     quotas.value = {
       ...(quotas.value || {}),
@@ -342,7 +358,7 @@ const runRefreshQueue = async (targetAccounts) => {
   }
   batchRefreshing.value = true
   batchRefreshProgress.value = { done: 0, total: targetAccounts.length }
-  const concurrency = 5
+  const concurrency = 2
   let cursor = 0
   const workers = Array.from({ length: Math.min(concurrency, targetAccounts.length) }, async () => {
     while (cursor < targetAccounts.length) {
@@ -473,6 +489,7 @@ const handleImport = async () => {
     const payloads = await buildImportPayloads()
     const batchSize = 500
     const summary = { created: 0, updated: 0, failed: 0, skipped: 0 }
+    const detailItems = []
     for (let start = 0; start < payloads.length; start += batchSize) {
       const batch = payloads.slice(start, start + batchSize)
       const res = await adminApi.importOpenAIPlusAccounts(JSON.stringify(batch))
@@ -480,9 +497,19 @@ const handleImport = async () => {
       summary.updated += res.updated || 0
       summary.failed += res.failed || 0
       summary.skipped += res.skipped || 0
+      ;(res.items || []).forEach((item) => {
+        if (item.action === 'failed' || item.action === 'skipped') {
+          detailItems.push({ batchStart: start + 1, ...item })
+        }
+      })
       ElMessage.info(`正在导入：${Math.min(start + batch.length, payloads.length)}/${payloads.length}`)
     }
-    ElMessage.success(`导入完成：新增 ${summary.created}，更新 ${summary.updated}，跳过 ${summary.skipped}，失败 ${summary.failed}`)
+    if (detailItems.length) {
+      console.group('OpenAI 账号导入失败/跳过详情')
+      console.table(detailItems)
+      console.groupEnd()
+    }
+    ElMessage.success(`导入完成：新增 ${summary.created}，更新 ${summary.updated}，跳过 ${summary.skipped}，失败 ${summary.failed}；详情见浏览器控制台`)
     importContent.value = ''
     importFiles.value = []
     if (importFileInput.value) {
@@ -554,8 +581,8 @@ const checkAccount = async (row) => {
   checkingId.value = row.id
   try {
     const checked = await adminApi.checkOpenAIPlusAccount(row.id)
-    updateAccountRow(checked)
-    ElMessage.success('检测完成')
+    const deleted = applyCheckResult(checked)
+    ElMessage.success(deleted ? '检测到 401，账号已删除' : '检测完成')
   } catch (error) {
     ElMessage.error(error.message || '检测失败')
   } finally {

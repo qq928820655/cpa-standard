@@ -236,6 +236,11 @@ async def list_account_quotas(
     return {"items": quotas}
 
 
+def _is_unauthorized_check(status: str, message: str) -> bool:
+    text = f"{status or ''} {message or ''}".lower()
+    return "http 401" in text or "unauthorized" in text or "invalid token" in text or "invalid api key" in text
+
+
 @router.post("/api/admin/openai-plus/accounts/{account_id}/check")
 async def check_account(
     account_id: int,
@@ -246,6 +251,19 @@ async def check_account(
     if not account:
         raise HTTPException(status_code=404, detail="Plus 账号不存在")
     status, message = await openai_plus_service.check_account(account)
+    if _is_unauthorized_check(status, message):
+        email = account.email
+        await db.execute(delete(OpenAIPlusUsageLog).where(OpenAIPlusUsageLog.account_id == account.id))
+        await db.delete(account)
+        await db.commit()
+        return {
+            "id": account_id,
+            "email": email,
+            "deleted": True,
+            "last_check_status": status,
+            "last_check_message": message,
+            "message": "检测到 401，账号已删除",
+        }
     account.last_check_status = status
     account.last_check_message = message
     account.last_check_at = datetime.utcnow()

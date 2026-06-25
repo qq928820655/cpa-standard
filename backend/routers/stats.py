@@ -199,6 +199,21 @@ def _resolve_user_id(auth_info: dict, user_id: Optional[int]) -> Optional[int]:
     return auth_info.get("user_id")
 
 
+def _normalize_filter_values(values: Optional[List[str]]) -> List[str]:
+    return [value.strip() for value in (values or []) if isinstance(value, str) and value.strip()]
+
+
+def _apply_usage_log_model_filter(query, UsageLog, models: Optional[List[str]]):
+    model_values = _normalize_filter_values(models)
+    if not model_values:
+        return query
+    normalized_values = [value.lower() for value in model_values]
+    return query.where(
+        func.lower(func.coalesce(UsageLog.actual_model, UsageLog.model, "")).in_(normalized_values)
+        | func.lower(func.coalesce(UsageLog.model, "")).in_(normalized_values)
+    )
+
+
 async def _get_summary_metrics(
     db: AsyncSession,
     days: int,
@@ -206,13 +221,24 @@ async def _get_summary_metrics(
     end_time: Optional[datetime],
     api_key_id: Optional[int] = None,
     user_id: Optional[int] = None,
+    providers: Optional[List[str]] = None,
+    models: Optional[List[str]] = None,
 ) -> dict:
-    from models import UsageDailySummary, UsageLog
+    from models import ApiKey, UsageDailySummary, UsageLog
+
+    provider_values = _normalize_filter_values(providers)
+    model_values = _normalize_filter_values(models)
 
     window = usage_rollup_service.split_time_range(days, start_time, end_time)
+    if model_values:
+        normalized_start, normalized_end = usage_rollup_service.normalize_time_range(days, start_time, end_time)
+        window.summary_start = None
+        window.summary_end = None
+        window.realtime_start = usage_rollup_service.clamp_logs_start(normalized_start)
+        window.realtime_end = normalized_end
     metrics = _empty_metrics()
 
-    if window.summary_start and window.summary_end:
+    if window.summary_start and window.summary_end and not model_values:
         summary_query = select(
             func.coalesce(func.sum(UsageDailySummary.total_requests), 0).label("total_requests"),
             func.coalesce(func.sum(UsageDailySummary.success_requests), 0).label("success_requests"),
@@ -234,6 +260,8 @@ async def _get_summary_metrics(
         )
         if api_key_id:
             summary_query = summary_query.where(UsageDailySummary.api_key_id == api_key_id)
+        if provider_values:
+            summary_query = summary_query.join(ApiKey, ApiKey.id == UsageDailySummary.api_key_id).where(ApiKey.provider.in_(provider_values))
         if user_id:
             summary_query = summary_query.where(UsageDailySummary.user_id == user_id)
         summary_row = (await db.execute(summary_query)).one()
@@ -261,6 +289,14 @@ async def _get_summary_metrics(
         )
         if api_key_id:
             realtime_query = realtime_query.where(UsageLog.api_key_id == api_key_id)
+        if provider_values:
+            realtime_query = realtime_query.join(ApiKey, ApiKey.id == UsageLog.api_key_id).where(ApiKey.provider.in_(provider_values))
+        if model_values:
+            normalized_model_values = [value.lower() for value in model_values]
+            realtime_query = realtime_query.where(
+                func.lower(func.coalesce(UsageLog.actual_model, UsageLog.model, "")).in_(normalized_model_values)
+                | func.lower(func.coalesce(UsageLog.model, "")).in_(normalized_model_values)
+            )
         if user_id:
             realtime_query = realtime_query.where(UsageLog.user_id == user_id)
         realtime_row = (await db.execute(realtime_query)).one()
@@ -275,12 +311,14 @@ async def get_usage_summary(
     start_time: Optional[datetime] = Query(default=None),
     end_time: Optional[datetime] = Query(default=None),
     api_key_id: Optional[int] = None,
+    providers: Optional[List[str]] = Query(default=None),
+    models: Optional[List[str]] = Query(default=None),
     user_id: Optional[int] = Query(default=None),
     db: AsyncSession = Depends(get_db),
     auth_info: dict = Depends(verify_admin_key),
 ):
     effective_user_id = _resolve_user_id(auth_info, user_id)
-    metrics = await _get_summary_metrics(db, days, start_time, end_time, api_key_id, effective_user_id)
+    metrics = await _get_summary_metrics(db, days, start_time, end_time, api_key_id, effective_user_id, providers, models)
     return _format_summary(metrics)
 
 
@@ -416,17 +454,28 @@ async def get_daily_usage(
     start_time: Optional[datetime] = Query(default=None),
     end_time: Optional[datetime] = Query(default=None),
     api_key_id: Optional[int] = None,
+    providers: Optional[List[str]] = Query(default=None),
+    models: Optional[List[str]] = Query(default=None),
     user_id: Optional[int] = Query(default=None),
     db: AsyncSession = Depends(get_db),
     auth_info: dict = Depends(verify_admin_key),
 ):
-    from models import UsageDailySummary, UsageLog
+    from models import ApiKey, UsageDailySummary, UsageLog
+
+    provider_values = _normalize_filter_values(providers)
+    model_values = _normalize_filter_values(models)
 
     effective_user_id = _resolve_user_id(auth_info, user_id)
     window = usage_rollup_service.split_time_range(days, start_time, end_time)
+    if model_values:
+        normalized_start, normalized_end = usage_rollup_service.normalize_time_range(days, start_time, end_time)
+        window.summary_start = None
+        window.summary_end = None
+        window.realtime_start = usage_rollup_service.clamp_logs_start(normalized_start)
+        window.realtime_end = normalized_end
     daily_map: dict[str, dict] = {}
 
-    if window.summary_start and window.summary_end:
+    if window.summary_start and window.summary_end and not model_values:
         summary_query = (
             select(
                 UsageDailySummary.summary_date.label("date"),
@@ -442,6 +491,8 @@ async def get_daily_usage(
         )
         if api_key_id:
             summary_query = summary_query.where(UsageDailySummary.api_key_id == api_key_id)
+        if provider_values:
+            summary_query = summary_query.join(ApiKey, ApiKey.id == UsageDailySummary.api_key_id).where(ApiKey.provider.in_(provider_values))
         if effective_user_id:
             summary_query = summary_query.where(UsageDailySummary.user_id == effective_user_id)
         for row in (await db.execute(summary_query)).all():
@@ -467,6 +518,14 @@ async def get_daily_usage(
         )
         if api_key_id:
             realtime_query = realtime_query.where(UsageLog.api_key_id == api_key_id)
+        if provider_values:
+            realtime_query = realtime_query.join(ApiKey, ApiKey.id == UsageLog.api_key_id).where(ApiKey.provider.in_(provider_values))
+        if model_values:
+            normalized_model_values = [value.lower() for value in model_values]
+            realtime_query = realtime_query.where(
+                func.lower(func.coalesce(UsageLog.actual_model, UsageLog.model, "")).in_(normalized_model_values)
+                | func.lower(func.coalesce(UsageLog.model, "")).in_(normalized_model_values)
+            )
         if effective_user_id:
             realtime_query = realtime_query.where(UsageLog.user_id == effective_user_id)
         for row in (await db.execute(realtime_query)).all():
@@ -488,6 +547,8 @@ async def get_usage_logs(
     start_time: Optional[datetime] = Query(default=None),
     end_time: Optional[datetime] = Query(default=None),
     api_key_id: Optional[int] = Query(default=None),
+    providers: Optional[List[str]] = Query(default=None),
+    models: Optional[List[str]] = Query(default=None),
     status: Optional[str] = Query(default=None),
     user_id: Optional[int] = Query(default=None),
     db: AsyncSession = Depends(get_db),
@@ -497,6 +558,8 @@ async def get_usage_logs(
     from models import ApiKey, UsageLog
 
     effective_user_id = _resolve_user_id(auth_info, user_id)
+    provider_values = _normalize_filter_values(providers)
+    model_values = _normalize_filter_values(models)
     normalized_start, normalized_end = usage_rollup_service.normalize_time_range(days, start_time, end_time)
     clamped_start = usage_rollup_service.clamp_logs_start(normalized_start)
     page_value, limit_value, offset_value = parse_pagination(page, limit, offset)
@@ -507,6 +570,9 @@ async def get_usage_logs(
     )
     if api_key_id:
         count_query = count_query.where(UsageLog.api_key_id == api_key_id)
+    if provider_values:
+        count_query = count_query.join(ApiKey, ApiKey.id == UsageLog.api_key_id).where(ApiKey.provider.in_(provider_values))
+    count_query = _apply_usage_log_model_filter(count_query, UsageLog, model_values)
     if status:
         count_query = count_query.where(UsageLog.status == status)
     if effective_user_id:
@@ -520,6 +586,9 @@ async def get_usage_logs(
     )
     if api_key_id:
         query = query.where(UsageLog.api_key_id == api_key_id)
+    if provider_values:
+        query = query.join(ApiKey, ApiKey.id == UsageLog.api_key_id).where(ApiKey.provider.in_(provider_values))
+    query = _apply_usage_log_model_filter(query, UsageLog, model_values)
     if status:
         query = query.where(UsageLog.status == status)
     if effective_user_id:

@@ -210,6 +210,7 @@ export const adminApi = {
   importProviderModelMappings: (items) => api.post('/admin/provider-model-mappings/import', { items }),
   createProviderModelMapping: (data) => api.post('/admin/provider-model-mappings', data),
   updateProviderModelMapping: (id, data) => api.put(`/admin/provider-model-mappings/${id}`, data),
+  batchSetProviderModelMappingsEnabled: (data) => api.post('/admin/provider-model-mappings/batch/enabled', data),
   deleteProviderModelMapping: (id) => api.delete(`/admin/provider-model-mappings/${id}`),
 
   listModels: (provider, params) => api.get('/admin/models', { params: { provider, ...(params || {}) } }),
@@ -281,6 +282,8 @@ export const adminApi = {
 
   getPassThroughErrorCodes: () => api.get('/admin/pass-through-error-codes'),
   updatePassThroughErrorCodes: (data) => api.put('/admin/pass-through-error-codes', data),
+  getProviderContinueErrorRules: () => api.get('/admin/provider-continue-error-rules'),
+  updateProviderContinueErrorRules: (data) => api.put('/admin/provider-continue-error-rules', data),
 
   getModelSeedConfig: () => api.get('/admin/model-seed-config'),
   updateModelSeedConfig: (data) => api.put('/admin/model-seed-config', data),
@@ -352,10 +355,10 @@ export async function copyText(text) {
 }
 
 export const statsApi = {
-  getSummary: (params = {}) => api.get('/stats/summary', { params }),
+  getSummary: (params = {}) => api.get('/stats/summary', { params, paramsSerializer: { serialize: serializeParams } }),
   getByKey: (params = {}) => api.get('/stats/by-key', { params, paramsSerializer: { serialize: serializeParams } }),
-  getDaily: (params = {}) => api.get('/stats/daily', { params }),
-  getLogs: (params) => api.get('/stats/logs', { params }),
+  getDaily: (params = {}) => api.get('/stats/daily', { params, paramsSerializer: { serialize: serializeParams } }),
+  getLogs: (params) => api.get('/stats/logs', { params, paramsSerializer: { serialize: serializeParams } }),
 }
 
 export default api

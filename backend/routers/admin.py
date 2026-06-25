@@ -219,6 +219,7 @@ class ApiKeyBatchUpdateModelsRequest(BaseModel):
     base_url: Optional[str] = None
     weight: Optional[int] = Field(default=None, ge=0)
     supported_models: Optional[List[str]] = None
+    supported_models_mode: str = "replace"
     new_provider: Optional[str] = None  # 批量变更提供商
     api_type: Optional[str] = None
 
@@ -869,6 +870,16 @@ class ProviderModelMappingUpdate(BaseModel):
     real_model: str
     enabled: bool = True
     remark: Optional[str] = None
+
+
+class ProviderModelMappingBatchEnabledRequest(BaseModel):
+    mapping_ids: List[int]
+    enabled: bool
+
+
+class ProviderModelMappingBatchEnabledResponse(BaseModel):
+    count: int
+    enabled: bool
 
 
 class ProviderModelMappingMutationResponse(BaseModel):
@@ -5684,9 +5695,17 @@ async def batch_update_key_models(
     supported_models = []
     created_models = []
     serialized_models = None
+    supported_models_mode = (data.supported_models_mode or "replace").strip().lower()
+    if supported_models_mode not in {"replace", "append", "clear"}:
+        raise HTTPException(status_code=400, detail="无效的模型调整方式")
     if should_update_supported_models:
-        supported_models, created_models = await ensure_models_exist(db, data.supported_models)
-        serialized_models = dumps_json_list(supported_models)
+        if data.supported_models is None:
+            supported_models_mode = "clear"
+        elif supported_models_mode == "clear":
+            raise HTTPException(status_code=400, detail="清空模型时 supported_models 应为空")
+        else:
+            supported_models, created_models = await ensure_models_exist(db, data.supported_models)
+            serialized_models = dumps_json_list(supported_models)
 
     touched_providers = set()
     new_provider_value = data.new_provider.strip() if should_update_provider else None
@@ -5696,7 +5715,10 @@ async def batch_update_key_models(
         if should_update_weight:
             key.weight = data.weight
         if should_update_supported_models:
-            key.supported_models = serialized_models
+            if supported_models_mode == "append":
+                key.supported_models = dumps_json_list(loads_json_list(key.supported_models) + supported_models)
+            else:
+                key.supported_models = serialized_models
         if should_update_provider:
             touched_providers.add(key.provider)  # 旧 provider 也要重置
             key.provider = new_provider_value
@@ -6363,6 +6385,32 @@ async def update_provider_model_mapping(
     await db.commit()
     await db.refresh(mapping)
     return ProviderModelMappingMutationResponse(item=to_provider_model_mapping_item(mapping))
+
+
+@router.post("/provider-model-mappings/batch/enabled", response_model=ProviderModelMappingBatchEnabledResponse)
+async def batch_set_provider_model_mappings_enabled(
+    data: ProviderModelMappingBatchEnabledRequest,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(verify_admin_key),
+):
+    """批量设置提供商模型映射启用状态"""
+    from models import ProviderModelMapping
+
+    mapping_ids = data.mapping_ids or []
+    if not mapping_ids:
+        raise HTTPException(status_code=400, detail="mapping_ids 不能为空")
+
+    result = await db.execute(select(ProviderModelMapping).where(ProviderModelMapping.id.in_(mapping_ids)))
+    mappings = list(result.scalars().all())
+    if not mappings:
+        raise HTTPException(status_code=404, detail="未找到可更新的模型映射")
+
+    for mapping in mappings:
+        mapping.enabled = data.enabled
+        mapping.updated_at = datetime.utcnow()
+
+    await db.commit()
+    return ProviderModelMappingBatchEnabledResponse(count=len(mappings), enabled=data.enabled)
 
 
 @router.delete("/provider-model-mappings/{mapping_id}", response_model=dict)
@@ -7264,6 +7312,84 @@ async def update_pass_through_error_codes(
     export_config["pass_through_error_codes"] = valid_codes
     persist_export_config()
     return PassThroughErrorCodesResponse(pass_through_error_codes=valid_codes)
+
+
+# ============ 同 Key 继续错误配置 ============
+
+class ProviderContinueErrorRule(BaseModel):
+    provider: str = "*"
+    keywords: List[str] = Field(default_factory=list)
+    prompt: str
+    status_codes: List[int] = Field(default_factory=lambda: [400, 403])
+    enabled: bool = True
+
+
+class ProviderContinueErrorRulesResponse(BaseModel):
+    rules: List[ProviderContinueErrorRule]
+
+
+class ProviderContinueErrorRulesUpdate(BaseModel):
+    rules: List[ProviderContinueErrorRule]
+
+
+def normalize_provider_continue_error_rules(rules: Optional[list] = None) -> list[dict]:
+    source = rules if isinstance(rules, list) else export_config.get("provider_continue_error_rules") or []
+    if not source:
+        source = [{
+            "provider": "*",
+            "keywords": ["不支持生成图片", "请切换分组", "does not support image generation", "image generation is not supported"],
+            "prompt": "继续处理用户原始请求。如果当前分组不支持图片生成，请不要再次调用图片生成能力，改用文本方式完成或说明可执行的替代方案。",
+            "status_codes": [400, 403],
+            "enabled": True,
+        }]
+    normalized = []
+    for rule in source:
+        if not isinstance(rule, dict):
+            continue
+        prompt = str(rule.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        keywords = [str(item).strip() for item in (rule.get("keywords") or []) if str(item).strip()]
+        if not keywords:
+            continue
+        status_codes = []
+        for code in rule.get("status_codes") or [400, 403]:
+            try:
+                int_code = int(code)
+            except (TypeError, ValueError):
+                continue
+            if 400 <= int_code < 600:
+                status_codes.append(int_code)
+        if not status_codes:
+            status_codes = [400, 403]
+        normalized.append({
+            "provider": str(rule.get("provider") or "*").strip() or "*",
+            "keywords": keywords,
+            "prompt": prompt,
+            "status_codes": sorted(set(status_codes)),
+            "enabled": bool(rule.get("enabled", True)),
+        })
+    return normalized
+
+
+@router.get("/provider-continue-error-rules", response_model=ProviderContinueErrorRulesResponse)
+async def get_provider_continue_error_rules(
+    _: bool = Depends(verify_admin_key),
+):
+    """获取同 Key 继续错误规则"""
+    return ProviderContinueErrorRulesResponse(rules=[ProviderContinueErrorRule(**item) for item in normalize_provider_continue_error_rules()])
+
+
+@router.put("/provider-continue-error-rules", response_model=ProviderContinueErrorRulesResponse)
+async def update_provider_continue_error_rules(
+    data: ProviderContinueErrorRulesUpdate,
+    _: bool = Depends(verify_admin_key),
+):
+    """更新同 Key 继续错误规则"""
+    payload = normalize_provider_continue_error_rules([item.model_dump() for item in data.rules])
+    export_config["provider_continue_error_rules"] = payload
+    persist_export_config()
+    return ProviderContinueErrorRulesResponse(rules=[ProviderContinueErrorRule(**item) for item in payload])
 
 
 # ============ 模型种子配置 ============

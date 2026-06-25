@@ -25,6 +25,7 @@ DEFAULT_CODEX_INSTRUCTIONS = "You are ChatGPT, a helpful assistant."
 PLUS_UNIFIED_API_KEY = "cpa-plus-unified"
 IMPORT_COMMIT_BATCH_SIZE = 500
 IMPORT_RETURN_ITEM_LIMIT = 1000
+IMPORT_AUTH_CHECK_TIMEOUT_SECONDS = 12
 
 PLUS_SESSION_STICKY_ENABLED = True
 PLUS_SESSION_STICKY_TTL_SECONDS = 6 * 3600
@@ -352,6 +353,33 @@ def put_account_indexes(indexes: dict[str, dict[str, OpenAIPlusAccount]], accoun
         indexes.setdefault(kind, {})[value] = account
 
 
+def build_temp_import_account(parsed: dict) -> OpenAIPlusAccount:
+    account = OpenAIPlusAccount(proxy_key="import-check")
+    account.name = parsed["name"]
+    account.email = parsed["email"] or None
+    account.account_id = parsed["account_id"] or None
+    account.chatgpt_user_id = parsed["chatgpt_user_id"] or None
+    account.plan_type = parsed["plan_type"] or None
+    account.access_token = parsed["access_token"]
+    account.refresh_token = parsed["refresh_token"] or None
+    account.id_token = parsed["id_token"] or None
+    account.expires_at = parsed["expires_at"]
+    return account
+
+
+async def is_import_account_unauthorized(parsed: dict) -> tuple[bool, str]:
+    account = build_temp_import_account(parsed)
+    url = f"{CODEX_WHAM_BASE_URL}/usage"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(IMPORT_AUTH_CHECK_TIMEOUT_SECONDS)) as client:
+            response = await client.get(url, headers=build_headers(account))
+        if response.status_code == 401:
+            return True, f"HTTP 401: {response.text[:200]}"
+        return False, f"HTTP {response.status_code}"
+    except Exception as exc:
+        return False, str(exc)
+
+
 async def import_accounts(db: AsyncSession, content: str) -> dict:
     payloads = normalize_import_payload(content)
     created = 0
@@ -380,6 +408,12 @@ async def import_accounts(db: AsyncSession, content: str) -> dict:
                 add_item({"index": index, "action": "skipped", "email": parsed["email"], "account_id": parsed["account_id"], "message": "本批次重复账号"})
                 continue
             batch_seen.update(identities)
+
+            unauthorized, auth_message = await is_import_account_unauthorized(parsed)
+            if unauthorized:
+                skipped += 1
+                add_item({"index": index, "action": "skipped", "email": parsed["email"], "account_id": parsed["account_id"], "message": "检测为 401，已跳过导入"})
+                continue
 
             account = find_indexed_import_account(indexes, identities)
             if account:

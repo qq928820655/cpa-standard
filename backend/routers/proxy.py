@@ -98,30 +98,81 @@ def append_continue_message(body: Optional[dict], content: str = "继续") -> di
     return next_body
 
 
-def get_provider_continue_prompt(provider: Optional[str]) -> str:
+DEFAULT_SAME_KEY_CONTINUE_PROMPT = "继续处理用户原始请求。如果当前分组不支持图片生成，请不要再次调用图片生成能力，改用文本方式完成或说明可执行的替代方案。"
+DEFAULT_SAME_KEY_CONTINUE_KEYWORDS = [
+    "不支持生成图片",
+    "请切换分组",
+    "does not support image generation",
+    "image generation is not supported",
+]
+
+
+def get_same_key_continue_rules() -> list[dict]:
     from config import export_config
+    rules = export_config.get("provider_continue_error_rules")
+    if isinstance(rules, list):
+        return [rule for rule in rules if isinstance(rule, dict) and rule.get("enabled", True)]
     prompts = export_config.get("provider_continue_prompts") or {}
-    provider_key = (provider or "").strip()
-    if isinstance(prompts, dict):
-        value = prompts.get(provider_key) or prompts.get(provider_key.lower()) or prompts.get("default")
-        if value:
-            return str(value)
-    return "继续处理用户原始请求。如果当前分组不支持图片生成，请不要再次调用图片生成能力，改用文本方式完成或说明可执行的替代方案。"
+    if isinstance(prompts, dict) and prompts:
+        return [
+            {
+                "provider": provider,
+                "keywords": DEFAULT_SAME_KEY_CONTINUE_KEYWORDS,
+                "prompt": prompt,
+                "status_codes": [400, 403],
+                "enabled": True,
+            }
+            for provider, prompt in prompts.items()
+        ]
+    return [{
+        "provider": "*",
+        "keywords": DEFAULT_SAME_KEY_CONTINUE_KEYWORDS,
+        "prompt": DEFAULT_SAME_KEY_CONTINUE_PROMPT,
+        "status_codes": [400, 403],
+        "enabled": True,
+    }]
 
 
-def should_continue_with_same_key(status_code: int, response_data: Any) -> bool:
-    if status_code not in {400, 403}:
-        return False
+def get_provider_continue_prompt(provider: Optional[str]) -> str:
+    provider_key = (provider or "").strip().lower()
+    for rule in get_same_key_continue_rules():
+        rule_provider = str(rule.get("provider") or "*").strip().lower()
+        if rule_provider in {"*", "default", provider_key}:
+            prompt = str(rule.get("prompt") or "").strip()
+            if prompt:
+                return prompt
+    return DEFAULT_SAME_KEY_CONTINUE_PROMPT
+
+
+def has_same_key_continue_rule_for_provider(provider: Optional[str]) -> bool:
+    provider_key = (provider or "").strip().lower()
+    for rule in get_same_key_continue_rules():
+        rule_provider = str(rule.get("provider") or "*").strip().lower()
+        if rule_provider in {"*", "default", provider_key}:
+            return True
+    return False
+
+
+def should_continue_with_same_key(status_code: int, response_data: Any, provider: Optional[str] = None) -> bool:
     message = "\n".join(collect_upstream_error_texts(response_data)).lower()
     if not message:
         return False
-    keywords = (
-        "不支持生成图片",
-        "请切换分组",
-        "does not support image generation",
-        "image generation is not supported",
-    )
-    return any(keyword in message for keyword in keywords)
+    provider_key = (provider or "").strip().lower()
+    for rule in get_same_key_continue_rules():
+        status_codes = rule.get("status_codes") or [400, 403]
+        try:
+            normalized_status_codes = {int(item) for item in status_codes}
+        except (TypeError, ValueError):
+            normalized_status_codes = {400, 403}
+        if status_code not in normalized_status_codes:
+            continue
+        rule_provider = str(rule.get("provider") or "*").strip().lower()
+        if rule_provider not in {"*", "default", provider_key}:
+            continue
+        keywords = rule.get("keywords") or DEFAULT_SAME_KEY_CONTINUE_KEYWORDS
+        if any(str(keyword).lower() in message for keyword in keywords if keyword):
+            return True
+    return False
 
 
 def get_sticky_session_key(headers: dict, model: Optional[str] = None) -> Optional[str]:
@@ -666,6 +717,7 @@ async def forward_stream_with_retry(
 
     retry_count = 0
     disable_count = 0
+    auto_continue_used = False
     service_unavailable_providers: list[str] = []
     SERVICE_UNAVAILABLE_BYPASS_LIMIT = 10
 
@@ -688,8 +740,8 @@ async def forward_stream_with_retry(
 
         upstream_body, upstream_model = await build_upstream_body_for_key(db, api_key, body, model, filter_providers or None)
 
-        # 判断是否命中流式缓冲规则（针对特定提供商/模型，完整缓冲后再输出，断流可重试）
-        use_buffer = proxy_service._match_stream_buffer_rule(api_key, upstream_model)
+        # 命中流式缓冲规则，或 provider 配置了错误继续规则时，先缓冲窗口以便拦截流内错误
+        use_buffer = proxy_service._match_stream_buffer_rule(api_key, upstream_model) or has_same_key_continue_rule_for_provider(getattr(api_key, "provider", None))
         if use_buffer:
             stream_fn = proxy_service.forward_stream_buffered
         else:
@@ -790,6 +842,85 @@ async def forward_stream_with_retry(
 
         if sticky_session_key:
             pool_manager.clear_session_binding(sticky_session_key)
+
+        if not auto_continue_used and should_continue_with_same_key(status_code, stream_response, getattr(api_key, "provider", None)):
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=attempt_ms,
+                action="same_key_continue",
+                response_data=stream_response,
+            )
+            continue_prompt = get_provider_continue_prompt(getattr(api_key, "provider", None))
+            auto_continue_body = append_continue_message(body, continue_prompt)
+            auto_continue_upstream_body, _auto_continue_upstream_model = await build_upstream_body_for_key(
+                db,
+                api_key,
+                auto_continue_body,
+                model,
+                filter_providers or None,
+            )
+            auto_continue_used = True
+            print(f"[CPA STREAM SAME KEY CONTINUE] api_key_id={api_key.id} provider={getattr(api_key, 'provider', None)} model={model} path={path}")
+            auto_continue_attempt_started_at = time.perf_counter()
+            status_code, response_headers, stream_response, retryable = await stream_fn(
+                db=db,
+                api_key=api_key,
+                method=method,
+                path=path,
+                headers=headers,
+                body=auto_continue_upstream_body,
+                client_request=request,
+                user_id=user_id,
+                original_model=original_model,
+            )
+            auto_continue_attempt_ms = int((time.perf_counter() - auto_continue_attempt_started_at) * 1000)
+            trace_upstream_ms += auto_continue_attempt_ms
+            if status_code < 400:
+                _trace_attempt(
+                    trace_ctx,
+                    api_key=api_key,
+                    requested_model=model,
+                    upstream_model=_auto_continue_upstream_model,
+                    status_code=status_code,
+                    upstream_latency_ms=auto_continue_attempt_ms,
+                    action="same_key_continue_success",
+                    response_data=stream_response,
+                )
+                pool_manager.clear_key_cooldown(api_key.id)
+                if sticky_session_key:
+                    pool_manager.bind_session_to_key(
+                        sticky_session_key,
+                        api_key.id,
+                        settings.proxy_session_sticky_ttl_seconds,
+                        provider=getattr(api_key, "provider", None),
+                        model=model,
+                    )
+                await _save_trace(
+                    db,
+                    trace_ctx,
+                    api_key=api_key,
+                    status_code=status_code,
+                    started_at=trace_started_at,
+                    upstream_latency_ms=trace_upstream_ms,
+                )
+                return status_code, response_headers, stream_response, api_key
+            _trace_attempt(
+                trace_ctx,
+                api_key=api_key,
+                requested_model=model,
+                upstream_model=_auto_continue_upstream_model,
+                status_code=status_code,
+                upstream_latency_ms=auto_continue_attempt_ms,
+                action="same_key_continue_failed",
+                response_data=stream_response,
+            )
+            last_status_code = status_code
+            last_response_headers = response_headers
+            last_response_body = stream_response
 
         if should_cooldown_key(status_code):
             cooldown_seconds = pool_manager.get_cooldown_seconds_for_status(status_code)
@@ -1010,7 +1141,7 @@ async def forward_request_with_retry(
         if sticky_session_key:
             pool_manager.clear_session_binding(sticky_session_key)
 
-        if not auto_continue_used and should_continue_with_same_key(status_code, response_data):
+        if not auto_continue_used and should_continue_with_same_key(status_code, response_data, getattr(api_key, "provider", None)):
             _trace_attempt(
                 trace_ctx,
                 api_key=api_key,

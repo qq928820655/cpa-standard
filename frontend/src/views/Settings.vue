@@ -509,6 +509,55 @@
       </div>
     </el-card>
 
+    <!-- 错误继续配置 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('providerContinueError')">
+          <div class="setting-card-header-text">
+            <div class="panel-title">错误继续配置</div>
+            <div class="panel-subtitle">命中指定提供商和错误关键词时，不返回前台，复用当前 Key 自动追加提示词继续</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.providerContinueError }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.providerContinueError" class="setting-card-body">
+        <el-form label-width="120px" v-loading="providerContinueErrorLoading">
+          <div v-for="(rule, index) in providerContinueErrorRules" :key="index" class="rule-card">
+            <div class="rule-card__header">
+              <span>规则 {{ index + 1 }}</span>
+              <el-button size="small" type="danger" link @click="removeProviderContinueRule(index)">删除</el-button>
+            </div>
+            <el-form-item label="启用">
+              <el-switch v-model="rule.enabled" />
+            </el-form-item>
+            <el-form-item label="提供商">
+              <el-input v-model="rule.provider" placeholder="* 表示全部，或填写 xmapi / yz 等 provider" />
+            </el-form-item>
+            <el-form-item label="状态码">
+              <el-select v-model="rule.status_codes" multiple allow-create filterable default-first-option placeholder="400 / 403">
+                <el-option :value="400" label="400" />
+                <el-option :value="403" label="403" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="错误关键词">
+              <el-select v-model="rule.keywords" multiple allow-create filterable default-first-option placeholder="命中任一关键词即自动继续">
+                <el-option value="不支持生成图片" label="不支持生成图片" />
+                <el-option value="请切换分组" label="请切换分组" />
+                <el-option value="does not support image generation" label="does not support image generation" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="继续提示词">
+              <el-input v-model="rule.prompt" type="textarea" :rows="3" placeholder="追加给模型的继续提示词" />
+            </el-form-item>
+          </div>
+          <el-form-item>
+            <el-button @click="addProviderContinueRule">新增规则</el-button>
+            <el-button type="primary" :loading="providerContinueErrorSaving" @click="saveProviderContinueErrorRules">保存错误继续配置</el-button>
+          </el-form-item>
+        </el-form>
+      </div>
+    </el-card>
+
     <!-- 代理调试追踪 -->
     <el-card class="setting-card" shadow="never">
       <template #header>
@@ -832,6 +881,7 @@ const expandedCards = reactive({
   usageGuide: savedCardState.usageGuide ?? false,
   changePassword: savedCardState.changePassword ?? false,
   passThroughError: savedCardState.passThroughError ?? false,
+  providerContinueError: savedCardState.providerContinueError ?? false,
   proxyTrace: savedCardState.proxyTrace ?? false,
   modelSeed: savedCardState.modelSeed ?? false,
   factoryReset: savedCardState.factoryReset ?? false,
@@ -866,6 +916,11 @@ const keyCheckDefaultSaving = ref(false)
 const passThroughErrorLoading = ref(false)
 const passThroughErrorSaving = ref(false)
 const passThroughErrorCodes = ref([])
+
+// 错误继续规则
+const providerContinueErrorLoading = ref(false)
+const providerContinueErrorSaving = ref(false)
+const providerContinueErrorRules = ref([])
 
 // 代理调试追踪
 const proxyTraceLoading = ref(false)
@@ -1411,6 +1466,42 @@ const savePassThroughErrorCodes = async () => {
   finally { passThroughErrorSaving.value = false }
 }
 
+const defaultProviderContinueRule = () => ({
+  provider: '*',
+  keywords: ['不支持生成图片', '请切换分组'],
+  prompt: '继续处理用户原始请求。如果当前分组不支持图片生成，请不要再次调用图片生成能力，改用文本方式完成或说明可执行的替代方案。',
+  status_codes: [400, 403],
+  enabled: true,
+})
+
+const loadProviderContinueErrorRules = async () => {
+  providerContinueErrorLoading.value = true
+  try {
+    const data = await adminApi.getProviderContinueErrorRules()
+    providerContinueErrorRules.value = data?.rules?.length ? data.rules : [defaultProviderContinueRule()]
+  } catch {
+    providerContinueErrorRules.value = [defaultProviderContinueRule()]
+  } finally { providerContinueErrorLoading.value = false }
+}
+
+const addProviderContinueRule = () => {
+  providerContinueErrorRules.value.push(defaultProviderContinueRule())
+}
+
+const removeProviderContinueRule = (index) => {
+  providerContinueErrorRules.value.splice(index, 1)
+}
+
+const saveProviderContinueErrorRules = async () => {
+  providerContinueErrorSaving.value = true
+  try {
+    const data = await adminApi.updateProviderContinueErrorRules({ rules: providerContinueErrorRules.value })
+    providerContinueErrorRules.value = data?.rules || []
+    ElMessage.success('错误继续配置已保存')
+  } catch (e) { ElMessage.error(e.message || '保存错误继续配置失败') }
+  finally { providerContinueErrorSaving.value = false }
+}
+
 // ── 代理调试追踪 ──────────────────────────────────────────
 const loadProxyTraceConfig = async () => {
   proxyTraceLoading.value = true
@@ -1495,6 +1586,7 @@ onMounted(async () => {
     loadProviderMigrationRules(),
     loadStreamBufferRules(),
     loadPassThroughErrorCodes(),
+    loadProviderContinueErrorRules(),
     loadProxyTraceConfig(),
     loadModelSeedConfig(),
   ])
@@ -1550,6 +1642,23 @@ onMounted(async () => {
   font-size: 12px;
   color: #909399;
   margin-top: 5px;
+}
+
+.rule-card {
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--cpa-panel-border-soft);
+  border-radius: 10px;
+  background: rgba(37, 99, 235, 0.03);
+}
+
+.rule-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  color: #1f3b5d;
+  font-weight: 700;
 }
 
 .cleanup-two-col {

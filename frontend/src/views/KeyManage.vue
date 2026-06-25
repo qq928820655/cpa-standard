@@ -374,6 +374,7 @@
         <el-form-item label="模型调整">
           <el-radio-group v-model="batchModelMode" class="batch-mode-group">
             <el-radio value="keep">不修改</el-radio>
+            <el-radio value="append">追加指定模型</el-radio>
             <el-radio value="replace">替换为指定模型</el-radio>
             <el-radio value="clear">清空为全部模型</el-radio>
           </el-radio-group>
@@ -399,7 +400,7 @@
           <el-input-number v-model="batchWeight" :min="0" :step="1" style="width: 100%" />
           <div class="form-tip">0 表示该 Key 保留在管理列表中，但不参与调度轮询。</div>
         </el-form-item>
-        <el-form-item v-if="batchModelMode === 'replace'" label="支持模型">
+        <el-form-item v-if="batchModelMode === 'replace' || batchModelMode === 'append'" label="支持模型">
           <div class="model-select-wrap">
             <el-input
               v-model="batchModelKeyword"
@@ -424,7 +425,7 @@
               clearable
               collapse-tags
               collapse-tags-tooltip
-              placeholder="选择要替换成的支持模型"
+              :placeholder="batchModelMode === 'append' ? '选择要追加的支持模型' : '选择要替换成的支持模型'"
               style="width: 100%"
             >
               <el-option
@@ -2367,8 +2368,8 @@ const applyQuickModels = () => {
 }
 
 const applyBatchQuickModels = () => {
-  if (batchModelMode.value !== 'replace') {
-    batchModelMode.value = 'replace'
+  if (batchModelMode.value !== 'append' && batchModelMode.value !== 'replace') {
+    batchModelMode.value = 'append'
   }
   const names = normalizeModelNames((batchQuickModelInput.value || '').split(','))
   if (!names.length) {
@@ -2561,6 +2562,12 @@ const submitBatchUpdate = async () => {
   const shouldUpdateFakeIp = hasBatchFakeIpUpdate()
   const shouldUpdateProvider = !!normalizedNewProvider
   const shouldUpdateApiType = batchApiTypeMode.value !== 'keep'
+  const modelActionLabelMap = {
+    append: '追加模型',
+    replace: '替换模型',
+    clear: '清空模型',
+  }
+  const modelActionLabel = shouldUpdateModels ? modelActionLabelMap[batchModelMode.value] : ''
   const normalizedWeight = shouldUpdateWeight ? Number(batchWeight.value) : null
 
   if (!shouldUpdateBaseUrl && !shouldUpdateModels && !shouldUpdateWeight && !shouldUpdateFakeIp && !shouldUpdateProvider && !shouldUpdateApiType) {
@@ -2568,7 +2575,7 @@ const submitBatchUpdate = async () => {
     return
   }
 
-  if (shouldUpdateModels && batchModelMode.value === 'replace' && !normalizedBatchModels.length) {
+  if (shouldUpdateModels && (batchModelMode.value === 'replace' || batchModelMode.value === 'append') && !normalizedBatchModels.length) {
     ElMessage.warning('请先选择支持模型，如需恢复全部模型请使用清空')
     return
   }
@@ -2602,10 +2609,12 @@ const submitBatchUpdate = async () => {
       if (shouldUpdateApiType) {
         payload.api_type = normalizeApiType(batchApiTypeMode.value)
       }
-      if (batchModelMode.value === 'replace') {
+      if (batchModelMode.value === 'replace' || batchModelMode.value === 'append') {
         payload.supported_models = normalizedBatchModels
+        payload.supported_models_mode = batchModelMode.value
       } else if (batchModelMode.value === 'clear') {
         payload.supported_models = null
+        payload.supported_models_mode = 'clear'
       }
       modelResult = await adminApi.batchUpdateKeyModels(payload)
     }
@@ -2616,7 +2625,8 @@ const submitBatchUpdate = async () => {
 
     const successMessages = []
     if (modelResult) {
-      successMessages.push(`已批量更新 ${modelResult.count} 个 Key${modelResult.auto_created_model_count ? `，自动创建 ${modelResult.auto_created_model_count} 个模型` : ''}`)
+      const modelActionSuffix = modelActionLabel ? `，${modelActionLabel}` : ''
+      successMessages.push(`已批量更新 ${modelResult.count} 个 Key${modelActionSuffix}${modelResult.auto_created_model_count ? `，自动创建 ${modelResult.auto_created_model_count} 个模型` : ''}`)
     }
     if (fakeIpResult) {
       successMessages.push(`已为 ${fakeIpResult.count} 个 Key${fakeIpResult.enabled ? '开启独立 fake IP' : '关闭 fake IP'}`)

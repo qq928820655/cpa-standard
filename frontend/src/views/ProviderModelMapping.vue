@@ -33,11 +33,14 @@
         </el-select>
         <el-button type="primary" @click="loadMappings">查询</el-button>
         <el-button @click="resetFilters">重置</el-button>
+        <el-button :disabled="!selectedMappings.length" :loading="batchUpdating" @click="batchSetEnabled(true)">批量启用</el-button>
+        <el-button :disabled="!selectedMappings.length" :loading="batchUpdating" @click="batchSetEnabled(false)">批量关闭</el-button>
       </div>
     </el-card>
 
     <el-card shadow="never">
-      <el-table :data="mappings" stripe border v-loading="loading" height="620" size="small" class="mapping-table">
+      <el-table :data="mappings" stripe border v-loading="loading" height="620" size="small" class="mapping-table" @selection-change="handleSelectionChange">
+        <el-table-column type="selection" width="46" align="center" />
         <el-table-column prop="provider" label="提供商" width="120" show-overflow-tooltip />
         <el-table-column prop="provider_model" label="原始模型" width="224" show-overflow-tooltip />
         <el-table-column prop="real_model" label="映射模型" width="199" show-overflow-tooltip />
@@ -130,7 +133,9 @@ const loading = ref(false)
 const submitting = ref(false)
 const importing = ref(false)
 const exporting = ref(false)
+const batchUpdating = ref(false)
 const mappings = ref([])
+const selectedMappings = ref([])
 const providerList = ref([])
 const dialogVisible = ref(false)
 const importDialogVisible = ref(false)
@@ -201,10 +206,33 @@ const loadMappings = async () => {
   try {
     const res = await adminApi.listProviderModelMappings(buildParams())
     mappings.value = res.items || []
+    selectedMappings.value = []
   } catch (error) {
     ElMessage.error(error.message || '加载模型映射失败')
   } finally {
     loading.value = false
+  }
+}
+
+const handleSelectionChange = (rows) => {
+  selectedMappings.value = rows || []
+}
+
+const batchSetEnabled = async (enabled) => {
+  const mappingIds = selectedMappings.value.map((item) => item.id).filter(Boolean)
+  if (!mappingIds.length) {
+    ElMessage.warning('请先勾选模型映射')
+    return
+  }
+  batchUpdating.value = true
+  try {
+    const result = await adminApi.batchSetProviderModelMappingsEnabled({ mapping_ids: mappingIds, enabled })
+    ElMessage.success(`已${enabled ? '启用' : '关闭'} ${result.count || 0} 条模型映射`)
+    await loadMappings()
+  } catch (error) {
+    ElMessage.error(error.message || '批量更新失败')
+  } finally {
+    batchUpdating.value = false
   }
 }
 
@@ -535,7 +563,7 @@ onMounted(() => {
 
 .filter-row {
   display: grid;
-  grid-template-columns: 180px 1fr 1fr 130px auto auto;
+  grid-template-columns: 180px 1fr 1fr 130px auto auto auto auto;
   gap: 10px;
   align-items: center;
 }

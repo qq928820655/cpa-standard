@@ -55,6 +55,48 @@
           </el-select>
         </el-col>
         <el-col :xs="24" :sm="12" :lg="4">
+          <el-select
+            v-model="filterProviders"
+            placeholder="筛选提供商"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            clearable
+            collapse-tags
+            collapse-tags-tooltip
+            @change="() => loadData({ resetLogsPage: true })"
+          >
+            <el-option
+              v-for="provider in providerOptions"
+              :key="provider"
+              :value="provider"
+              :label="provider"
+            />
+          </el-select>
+        </el-col>
+        <el-col :xs="24" :sm="12" :lg="4">
+          <el-select
+            v-model="filterModels"
+            placeholder="筛选模型"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            clearable
+            collapse-tags
+            collapse-tags-tooltip
+            @change="() => loadData({ resetLogsPage: true })"
+          >
+            <el-option
+              v-for="model in modelOptions"
+              :key="model.value"
+              :value="model.value"
+              :label="model.label"
+            />
+          </el-select>
+        </el-col>
+        <el-col :xs="24" :sm="12" :lg="4">
           <el-select v-model="filterStatus" placeholder="筛选状态" clearable @change="() => { resetToFirstPage(); loadLogs() }">
             <el-option value="success" label="成功" />
             <el-option value="error" label="失败" />
@@ -417,8 +459,12 @@ if (isCustomDateRange.value) {
   filterDateRange.value = savedState.filterDateRange
 }
 const filterKeyId = ref(savedState.filterKeyId || null)
+const filterProviders = ref(Array.isArray(savedState.filterProviders) ? savedState.filterProviders.filter(Boolean) : [])
+const filterModels = ref(Array.isArray(savedState.filterModels) ? savedState.filterModels.filter(Boolean) : [])
 const filterStatus = ref(typeof savedState.filterStatus === 'string' ? savedState.filterStatus : '')
 const keyOptions = ref([])
+const providerOptions = ref([])
+const modelOptions = ref([])
 
 const keyNameMap = computed(() => {
   const map = {}
@@ -426,6 +472,7 @@ const keyNameMap = computed(() => {
   return map
 })
 const getLogKeyName = (row) => row?.api_key_name || keyNameMap.value[row?.api_key_id] || ''
+const getLogModelName = (row) => row?.actual_model || row?.model || ''
 const userIdFilter = ref(null)
 const userOptions = ref([])
 const showUserFilter = computed(() => authApi.isAdmin() && authApi.isLoggedIn())
@@ -490,6 +537,8 @@ const buildStatsParams = () => {
   const [startTime, endTime] = filterDateRange.value || []
 
   if (normalizedKeyId) params.api_key_id = normalizedKeyId
+  if (filterProviders.value.length) params.providers = filterProviders.value
+  if (filterModels.value.length) params.models = filterModels.value
   if (filterDays.value) params.days = filterDays.value
   if (isCustomDateRange.value) {
     if (startTime) params.start_time = startTime
@@ -888,9 +937,37 @@ const loadKeyOptions = async () => {
     keyOptions.value = items.map((item) => ({
       id: item.id,
       name: item.name || `Key ${item.id}`,
+      provider: item.provider || '',
     }))
   } catch (e) {
     ElMessage.error(e.message || '加载 Key 列表失败')
+  }
+}
+
+const loadModelOptions = async () => {
+  try {
+    const result = await adminApi.listModels()
+    const items = Array.isArray(result) ? result : (result.items || [])
+    const normalized = items
+      .map((item) => {
+        const value = item?.model_id || item?.value || item?.name || ''
+        const label = item?.display_name ? `${item.display_name} (${value})` : value
+        return value ? { value, label } : null
+      })
+      .filter(Boolean)
+    modelOptions.value = Array.from(new Map(normalized.map((item) => [item.value, item])).values())
+  } catch (e) {
+    ElMessage.error(e.message || '加载模型列表失败')
+  }
+}
+
+const loadProviderOptions = async () => {
+  try {
+    const result = await adminApi.getKeyProviders()
+    const items = Array.isArray(result) ? result : (result.items || [])
+    providerOptions.value = Array.from(new Set(items.filter(Boolean))).sort()
+  } catch (e) {
+    ElMessage.error(e.message || '加载提供商列表失败')
   }
 }
 
@@ -968,13 +1045,15 @@ const saveUsageStatsState = () => {
     filterDateRange: isCustomDateRange.value ? filterDateRange.value : [],
     dateRangeMode: isCustomDateRange.value ? 'custom' : 'quick',
     filterKeyId: filterKeyId.value,
+    filterProviders: filterProviders.value,
+    filterModels: filterModels.value,
     filterStatus: filterStatus.value,
     currentPage: currentPage.value,
     pageSize: pageSize.value,
   }))
 }
 
-watch([filterDays, filterDateRange, isCustomDateRange, filterKeyId, filterStatus, currentPage, pageSize], saveUsageStatsState, { deep: true })
+watch([filterDays, filterDateRange, isCustomDateRange, filterKeyId, filterProviders, filterModels, filterStatus, currentPage, pageSize], saveUsageStatsState, { deep: true })
 watch(
   () => route.path,
   (path) => {
@@ -985,7 +1064,7 @@ watch(
 )
 
 onMounted(async () => {
-  await Promise.all([loadKeyOptions(), loadUserOptions()])
+  await Promise.all([loadKeyOptions(), loadProviderOptions(), loadModelOptions(), loadUserOptions()])
   loadData()
   document.addEventListener('visibilitychange', handleVisibilityChange)
   startAutoRefresh()
