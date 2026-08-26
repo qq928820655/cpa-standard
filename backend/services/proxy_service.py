@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings, export_config
 
-logger = logging.getLogger("cpa.image")
+logger = logging.getLogger("cpa.proxy_service")
 
 
 class ProxyService:
@@ -28,11 +28,20 @@ class ProxyService:
 
     @staticmethod
     def _safe_error_message(prefix: str, exc: BaseException) -> str:
-        """安全构造异常错误消息，避免 str(exc) 为空时显示空白"""
+        """安全构造异常错误消息，避免 str(exc) 为空时显示空白。
+        自动加 cpa_ 前缀，用于区分 CPA 自身异常与上游异常。
+        对 ConnectError 尝试附加底层原因，方便诊断 SSL / DNS / 连接拒绝等具体场景。
+        """
         text = str(exc).strip()
         if not text:
-            text = f"{type(exc).__name__}"
-        return f"{prefix}{text}"
+            text = type(exc).__name__
+        # 尝试附加 __cause__ 的具体信息（如 SSL 错误、DNS 错误、Connection refused）
+        cause = getattr(exc, "__cause__", None)
+        if cause is not None:
+            cause_text = str(cause).strip()
+            if cause_text and cause_text not in text:
+                text = f"{text} ({type(cause).__name__}: {cause_text})"
+        return f"cpa_{prefix}{text}"
 
     @staticmethod
     def _extract_model_refusal_text(response_data: Any) -> Optional[str]:
@@ -63,6 +72,23 @@ class ProxyService:
             pool=settings.proxy_stream_connect_timeout_seconds,
         )
         self.stream_first_byte_timeout_seconds = settings.proxy_stream_first_byte_timeout_seconds
+        # 连接池：key = (base_url, proxy_url)，复用 TCP/TLS 连接，减少 ConnectError
+        self._client_pool: dict[tuple, httpx.AsyncClient] = {}
+
+    def _get_pooled_client(self, api_key: Any, timeout: httpx.Timeout) -> httpx.AsyncClient:
+        """获取或创建指定 base_url + proxy 组合的共享 AsyncClient（连接池复用）。"""
+        proxy_url = self._build_proxy_url(api_key)
+        pool_key = (getattr(api_key, "base_url", "") or "", proxy_url or "")
+        client = self._client_pool.get(pool_key)
+        # 若 client 已关闭则重建
+        if client is None or client.is_closed:
+            limits = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=30)
+            client_kwargs: dict = {"timeout": timeout, "limits": limits}
+            if proxy_url:
+                client_kwargs["proxy"] = proxy_url
+            client = httpx.AsyncClient(**client_kwargs)
+            self._client_pool[pool_key] = client
+        return client
 
     def _build_image_generation_timeout(self) -> httpx.Timeout:
         request_timeout_seconds = max(int(settings.proxy_request_timeout_seconds or 60), 1)
@@ -83,7 +109,14 @@ class ProxyService:
             pool=seconds,
         )
 
-    def _build_headers(self, api_key: Any, original_headers: dict, path: Optional[str] = None) -> dict:
+    def _build_headers(
+        self,
+        api_key: Any,
+        original_headers: dict,
+        path: Optional[str] = None,
+        body: Optional[dict] = None,
+        model: Optional[str] = None,
+    ) -> dict:
         """
         构建转发请求的 Headers
 
@@ -95,6 +128,7 @@ class ProxyService:
             转发请求头
         """
         headers = {}
+        source_headers = original_headers or {}
 
         allowed_headers = [
             "accept",
@@ -107,7 +141,7 @@ class ProxyService:
             "anthropic-beta",
         ]
         for header_name in allowed_headers:
-            header_value = original_headers.get(header_name)
+            header_value = self._get_header_value(source_headers, header_name)
             if header_value:
                 headers[header_name] = header_value
 
@@ -117,10 +151,10 @@ class ProxyService:
         if api_key.provider == "claude" or is_anthropic_messages_path:
             headers.pop("Authorization", None)
             headers["x-api-key"] = api_key.api_key
-            headers["anthropic-version"] = original_headers.get(
-                "anthropic-version", headers.get("anthropic-version", "2023-06-01")
+            headers["anthropic-version"] = self._get_header_value(source_headers, "anthropic-version") or headers.get(
+                "anthropic-version", "2023-06-01"
             )
-            existing_beta = original_headers.get("anthropic-beta") or ""
+            existing_beta = self._get_header_value(source_headers, "anthropic-beta")
             if "prompt-caching" not in existing_beta.lower():
                 beta_parts = [b.strip() for b in existing_beta.split(",") if b.strip()]
                 beta_parts.append("prompt-caching-2024-07-31")
@@ -130,11 +164,98 @@ class ProxyService:
         else:
             # OpenAI 及其兼容接口
             headers["Authorization"] = f"Bearer {api_key.api_key}"
-            if original_headers.get("accept"):
-                headers["accept"] = original_headers["accept"]
+            accept_value = self._get_header_value(source_headers, "accept")
+            if accept_value:
+                headers["accept"] = accept_value
+
+        # 仅 Grok 模型透传缓存亲和请求头，避免影响 GPT / Claude
+        resolved_model = model or (body.get("model") if isinstance(body, dict) else None) or ""
+        if self._is_grok_family_model(str(resolved_model)):
+            conv_id = self._get_header_value(source_headers, "x-grok-conv-id")
+            # Responses 转 Chat 后，prompt_cache_key 会落到 body，这里回填到 chat 亲和头
+            if not conv_id and isinstance(body, dict):
+                conv_id = str(body.get("prompt_cache_key") or body.get("x_grok_conv_id") or "").strip()
+            if conv_id:
+                headers["x-grok-conv-id"] = conv_id
 
         self._apply_fake_ip_headers(api_key, headers)
         return headers
+
+    def _apply_grok_cache_affinity(
+        self,
+        body: Optional[dict],
+        headers: Optional[dict],
+        path: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        仅对 Grok 模型补齐缓存亲和参数：
+        - Chat Completions：优先 x-grok-conv-id；缺失时用 prompt_cache_key 回填
+        - Responses：优先 prompt_cache_key；缺失时用 x-grok-conv-id 回填
+        """
+        if not isinstance(body, dict):
+            return body
+
+        resolved_model = model or body.get("model") or ""
+        if not self._is_grok_family_model(str(resolved_model)):
+            return body
+
+        conv_id = self._get_header_value(headers, "x-grok-conv-id")
+        prompt_cache_key = str(body.get("prompt_cache_key") or "").strip()
+        path_norm = (path or "").lstrip("/")
+        is_responses_path = path_norm in {"v1/responses", "responses"} or path_norm.endswith("/responses")
+        is_chat_path = path_norm in {"v1/chat/completions", "chat/completions"} or path_norm.endswith("/chat/completions")
+
+        updated = dict(body)
+        changed = False
+
+        if is_responses_path and not prompt_cache_key and conv_id:
+            updated["prompt_cache_key"] = conv_id
+            changed = True
+
+        # Chat 路径保留 prompt_cache_key，供 _build_headers 回填 x-grok-conv-id
+        if is_chat_path and not prompt_cache_key and conv_id:
+            updated["prompt_cache_key"] = conv_id
+            changed = True
+
+        return updated if changed else body
+
+    def _extract_usage_details_for_responses(self, usage: Any) -> dict:
+        """把 Chat Completions usage 转成 Responses usage，保留 cached_tokens。"""
+        if not isinstance(usage, dict):
+            return {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "input_tokens_details": {"cached_tokens": 0},
+            }
+
+        prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+        completion_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens) or 0)
+
+        prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+        input_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+        cache_tokens = int(
+            prompt_details.get("cached_tokens")
+            or input_details.get("cached_tokens")
+            or usage.get("cache_read_input_tokens")
+            or usage.get("cached_tokens")
+            or usage.get("cache_tokens")
+            or 0
+        )
+
+        result = {
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "input_tokens_details": {"cached_tokens": cache_tokens},
+        }
+        if "completion_tokens_details" in usage and isinstance(usage.get("completion_tokens_details"), dict):
+            result["output_tokens_details"] = usage.get("completion_tokens_details")
+        elif "output_tokens_details" in usage and isinstance(usage.get("output_tokens_details"), dict):
+            result["output_tokens_details"] = usage.get("output_tokens_details")
+        return result
 
     def _write_upstream_request_debug_dump(
         self,
@@ -199,9 +320,9 @@ class ProxyService:
                 "body_summary": summarize_body(body),
             }
             dump_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"[CPA UPSTREAM DEBUG DUMP] {dump_path}")
+            logger.info("[CPA UPSTREAM DEBUG DUMP] %s", dump_path)
         except Exception as exc:
-            print(f"[CPA UPSTREAM DEBUG DUMP ERROR] {exc}")
+            logger.warning("[CPA UPSTREAM DEBUG DUMP ERROR] %s", exc)
 
     # ============ 协议与兼容策略 ============
 
@@ -210,6 +331,7 @@ class ProxyService:
     )
 
     _CLAUDE_MODEL_KEYWORDS: tuple = ("claude-opus", "claude-sonnet", "claude-haiku", "claude-3-", "claude-3.", "claude-4")
+    _GROK_MODEL_KEYWORDS: tuple = ("grok-", "grok_", "xai-grok", "x-ai/grok")
 
     @staticmethod
     def _normalize_model_name_for_family(model: str) -> str:
@@ -224,6 +346,26 @@ class ProxyService:
     def _is_claude_family_model(cls, model: str) -> bool:
         m = cls._normalize_model_name_for_family(model)
         return any(kw in m for kw in cls._CLAUDE_MODEL_KEYWORDS)
+
+    @classmethod
+    def _is_grok_family_model(cls, model: str) -> bool:
+        m = cls._normalize_model_name_for_family(model)
+        if not m:
+            return False
+        # 兼容 {provider}grok-4.5 指令与路径前缀
+        m = re.sub(r"^\{[^}]+\}", "", m)
+        m = m.split("/")[-1]
+        return any(m.startswith(prefix) or prefix in m for prefix in cls._GROK_MODEL_KEYWORDS)
+
+    @staticmethod
+    def _get_header_value(headers: Optional[dict], name: str) -> str:
+        if not isinstance(headers, dict) or not name:
+            return ""
+        target = name.lower()
+        for key, value in headers.items():
+            if str(key or "").lower() == target:
+                return str(value or "").strip()
+        return ""
 
     def _get_provider_model_compat_override(self, api_key: Any, model: str) -> dict[str, Any]:
         provider = (getattr(api_key, "provider", "") or "").strip().lower()
@@ -639,11 +781,17 @@ class ProxyService:
         """归一化上游请求体，兼容不支持 developer role 与空 assistant 消息的上游。"""
         if not isinstance(body, dict):
             return body
-        messages = body.get("messages")
+
+        # Chat 路径上的 prompt_cache_key 只用于 Grok 亲和头回填，不发给上游 chat schema
+        working = body
+        if "messages" in body and "prompt_cache_key" in body:
+            working = {k: v for k, v in body.items() if k != "prompt_cache_key"}
+
+        messages = working.get("messages")
         if not isinstance(messages, list):
-            return body
+            return working
         normalized = []
-        changed = False
+        changed = working is not body
         for message in messages:
             if not isinstance(message, dict):
                 normalized.append(message)
@@ -666,8 +814,225 @@ class ProxyService:
             normalized.append(message)
 
         if not changed:
+            return working
+        return {**working, "messages": normalized}
+
+    @staticmethod
+    def _sanitize_messages_for_openai_compat(body: Optional[dict]) -> Optional[dict]:
+        """清理 Claude 专属字段，避免转发到 OpenAI 兼容模型时触发验证错误。
+        - 将纯文本 content 列表合并为字符串
+        - 剥除 content block 中的 cache_control 等 Claude 专属字段
+        - 剥除 image_url 中的非标字段（OpenAI 规范只允许 url / detail）
+        """
+        if not isinstance(body, dict):
             return body
-        return {**body, "messages": normalized}
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return body
+
+        def clean_image_url(image_url: dict) -> dict:
+            result = {}
+            if "url" in image_url:
+                result["url"] = image_url["url"]
+            if "detail" in image_url:
+                result["detail"] = image_url["detail"]
+            return result
+
+        def process_content(content: Any) -> tuple:
+            """返回 (新内容, 是否发生变化)"""
+            if not isinstance(content, list):
+                return content, False
+
+            needs_clean = False
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if "cache_control" in block:
+                    needs_clean = True
+                    break
+                if block.get("type") == "image_url":
+                    img = block.get("image_url")
+                    if isinstance(img, dict) and (set(img.keys()) - {"url", "detail"}):
+                        needs_clean = True
+                        break
+
+            if not needs_clean:
+                return content, False
+
+            has_image = any(
+                isinstance(b, dict) and b.get("type") == "image_url"
+                for b in content
+            )
+
+            if not has_image:
+                # 纯文本块：合并为字符串
+                text = "\n".join(
+                    block.get("text") or ""
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+                return text, True
+
+            # 含图片：逐块清理非标字段
+            cleaned = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    cleaned.append({"type": "text", "text": block.get("text") or ""})
+                elif btype == "image_url":
+                    img = block.get("image_url")
+                    cleaned.append({
+                        "type": "image_url",
+                        "image_url": clean_image_url(img) if isinstance(img, dict) else img,
+                    })
+                else:
+                    cleaned.append(block)
+            return cleaned, True
+
+        changed = False
+        new_messages = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                new_messages.append(msg)
+                continue
+            new_content, content_changed = process_content(msg.get("content"))
+            if content_changed:
+                changed = True
+                new_messages.append({**msg, "content": new_content})
+            else:
+                new_messages.append(msg)
+
+        if not changed:
+            return body
+        return {**body, "messages": new_messages}
+
+    # 内置 DeepSeek 模型关键词，models 留空时作为默认匹配条件
+    _DEEPSEEK_MODEL_KEYWORDS: tuple = ("deepseek",)
+
+    @staticmethod
+    def _extract_effort_from_body(body: Optional[dict]) -> Optional[str]:
+        """从请求体中提取 effort 值，支持三种形式：
+        - reasoning_effort（OpenAI 格式）
+        - effort（简化 Anthropic 格式，Claude Code 常用）
+        - output_config.effort（标准 Anthropic 格式）
+        """
+        if not isinstance(body, dict):
+            return None
+        # OpenAI 格式
+        val = body.get("reasoning_effort")
+        if val:
+            return str(val).strip()
+        # 简化 Anthropic 格式
+        val = body.get("effort")
+        if val:
+            return str(val).strip()
+        # 标准 Anthropic 格式
+        output_config = body.get("output_config")
+        if isinstance(output_config, dict):
+            val = output_config.get("effort")
+            if val:
+                return str(val).strip()
+        return None
+
+    def _inject_thinking_params(self, api_key: Any, body: Optional[dict], path: Optional[str] = None) -> Optional[dict]:
+        """根据配置为模型注入思考模式参数（如 DeepSeek thinking / reasoning_effort / effort）。
+        models 留空时默认只匹配含 deepseek 关键词的模型，用户也可显式指定 models 覆盖。
+        force=False（默认）：客户端显式传入的参数优先保留，CPA 只补充缺失的。
+        force=True：CPA 配置强制覆盖客户端传入的参数。
+        """
+        if not isinstance(body, dict):
+            return body
+
+        # 从全局配置读取思考模式规则
+        rules = export_config.get("thinking_mode_rules") or []
+        if not isinstance(rules, list) or not rules:
+            return body
+
+        model = body.get("model") or ""
+        provider = (getattr(api_key, "provider", "") or "").strip().lower()
+        normalized_model = self._normalize_model_name_for_family(model)
+
+        # 按 provider + model 匹配规则
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            if not rule.get("enabled", True):
+                continue
+
+            # 提供商过滤
+            rule_providers = rule.get("providers")
+            if rule_providers and isinstance(rule_providers, list):
+                allowed = [p.strip().lower() for p in rule_providers if p.strip()]
+                if allowed and provider not in allowed:
+                    continue
+
+            # 模型过滤：留空时默认只匹配 DeepSeek 家族模型
+            rule_models = rule.get("models")
+            if rule_models and isinstance(rule_models, list) and any(m for m in rule_models if m):
+                matched = any(
+                    fnmatch.fnmatch(normalized_model, self._normalize_model_name_for_family(m))
+                    for m in rule_models
+                    if m
+                )
+                if not matched:
+                    continue
+            else:
+                if not any(kw in normalized_model for kw in self._DEEPSEEK_MODEL_KEYWORDS):
+                    continue
+
+            # 匹配成功
+            force = bool(rule.get("force", False))
+            thinking_type = (rule.get("thinking_type") or "enabled").strip()
+            rule_effort = (rule.get("reasoning_effort") or "").strip()
+
+            # 判断当前请求的协议格式，决定注入 effort 的字段名
+            is_anthropic_path = (path or "").lstrip("/").startswith("v1/messages")
+            effort_key = "reasoning_effort" if not is_anthropic_path else "effort"
+
+            if force:
+                # 强制模式：CPA 配置覆盖客户端传入
+                new_body = dict(body)
+                new_body["thinking"] = {"type": thinking_type}
+                # 清除所有形式的 effort
+                new_body.pop("reasoning_effort", None)
+                new_body.pop("effort", None)
+                output_config = new_body.get("output_config")
+                if isinstance(output_config, dict):
+                    output_config = dict(output_config)
+                    output_config.pop("effort", None)
+                    new_body["output_config"] = output_config
+                # 按协议格式注入
+                if rule_effort:
+                    if is_anthropic_path:
+                        oc = dict(new_body.get("output_config") or {})
+                        oc["effort"] = rule_effort
+                        new_body["output_config"] = oc
+                    else:
+                        new_body[effort_key] = rule_effort
+                return new_body
+
+            # 非强制模式：客户端已传入 thinking 则不干预
+            if body.get("thinking") is not None:
+                return body
+
+            new_body = dict(body)
+            new_body["thinking"] = {"type": thinking_type}
+
+            # effort：客户端已传入任一形式则保留，否则按协议格式注入
+            client_has_effort = self._extract_effort_from_body(body) is not None
+            if not client_has_effort and rule_effort:
+                if is_anthropic_path:
+                    oc = dict(new_body.get("output_config") or {})
+                    oc["effort"] = rule_effort
+                    new_body["output_config"] = oc
+                else:
+                    new_body[effort_key] = rule_effort
+
+            return new_body
+
+        return body
 
     def _apply_fake_ip_headers(self, api_key: Any, headers: dict):
         if not bool(getattr(api_key, "enable_fake_ip", False)):
@@ -873,6 +1238,46 @@ class ProxyService:
                 path=path,
                 url=url,
             )
+
+    async def probe_openai_responses_capability(self, api_key: Any, target_model: str) -> dict:
+        """探测上游是否原生支持 OpenAI Responses API。"""
+        normalized_model = (target_model or "").strip()
+        url = self._build_url(api_key, "v1/responses")
+        headers = self._build_headers(
+            api_key,
+            {"accept": "application/json", "content-type": "application/json"},
+            "v1/responses",
+            body={"model": normalized_model},
+            model=normalized_model,
+        )
+        body = {
+            "model": normalized_model,
+            "input": "Reply with exactly: responses-probe-ok",
+            "max_output_tokens": 8,
+            "stream": False,
+        }
+        try:
+            async with httpx.AsyncClient(**self._build_client_kwargs(api_key, httpx.Timeout(90))) as client:
+                response = await client.post(url, headers=headers, json=body)
+            response_data = self._parse_response_body(response)
+        except (httpx.RequestError, httpx.TimeoutException):
+            return {"supported": None, "status_code": None, "response_object": None}
+
+        response_object = response_data.get("object") if isinstance(response_data, dict) else None
+        if 200 <= response.status_code < 300:
+            return {
+                "supported": response_object == "response",
+                "status_code": response.status_code,
+                "response_object": response_object,
+            }
+        if response.status_code in {404, 405, 501}:
+            return {"supported": False, "status_code": response.status_code, "response_object": response_object}
+        if response.status_code == 400:
+            message = self._extract_error_message(response_data, "").lower()
+            unsupported_markers = ("not found", "unsupported", "unknown endpoint", "no route", "invalid path")
+            if any(marker in message for marker in unsupported_markers):
+                return {"supported": False, "status_code": response.status_code, "response_object": response_object}
+        return {"supported": None, "status_code": response.status_code, "response_object": response_object}
 
     async def check_key_endpoint(self, api_key: Any) -> dict:
         return await self._send_probe_request(
@@ -1386,7 +1791,7 @@ class ProxyService:
                             continue
                 await response.aclose()
         except httpx.TimeoutException as exc:
-            data = {"error": {"message": "流式请求超时"}}
+            data = {"error": {"message": "cpa_流式请求超时"}}
             return data, response_status_code, response_obj, False
         except httpx.RemoteProtocolError as exc:
             error_text = str(exc).lower()
@@ -1437,6 +1842,7 @@ class ProxyService:
         prompt: str,
         size: Optional[str] = None,
         quality: Optional[str] = None,
+        resolution: Optional[str] = None,
         n: int = 1,
         request_format: str = "images",
         mode: str = "text_to_image",
@@ -1454,15 +1860,40 @@ class ProxyService:
             use_streaming = False
             image_data_urls = self._get_input_image_data_urls(input_images)
             is_image_to_image = normalized_mode == "image_to_image" and bool(image_data_urls)
+            normalized_model = model.strip().lower()
+            is_grok_imagine = normalized_model in {
+                "grok-imagine-image",
+                "grok-imagine-image-quality",
+            }
+            use_grok_image_edit = normalized_format == "images" and is_image_to_image and is_grok_imagine
             use_official_image_edit = (
                 normalized_format == "images"
                 and is_image_to_image
-                and model.strip().lower() in {"gpt-image-2", "gpt-image-2-pro"}
+                and normalized_model in {"gpt-image-2", "gpt-image-2-pro"}
             )
             multipart_data = None
             multipart_files = None
 
-            if use_official_image_edit:
+            if use_grok_image_edit:
+                path = "v1/images/edits"
+                grok_images = [
+                    {"url": image_url, "type": "image_url"}
+                    for image_url in image_data_urls[:3]
+                ]
+                body = {
+                    "model": model,
+                    "prompt": prompt,
+                    "n": n,
+                }
+                if len(grok_images) == 1:
+                    body["image"] = grok_images[0]
+                else:
+                    body["images"] = grok_images
+                if size and size != "auto":
+                    body["aspect_ratio"] = size
+                if resolution in {"1k", "2k"}:
+                    body["resolution"] = resolution
+            elif use_official_image_edit:
                 path = "v1/images/edits"
                 multipart_data, multipart_files, body = self._build_official_image_edit_payload(
                     model=model,
@@ -1527,10 +1958,16 @@ class ProxyService:
                     body["image"] = image_data_urls[0]
                     body["images"] = image_data_urls
                     body["reference_images"] = image_data_urls
-                if size:
-                    body["size"] = size
-                if quality and quality != "auto":
-                    body["quality"] = quality
+                if is_grok_imagine:
+                    if size and size != "auto":
+                        body["aspect_ratio"] = size
+                    if resolution in {"1k", "2k"}:
+                        body["resolution"] = resolution
+                else:
+                    if size:
+                        body["size"] = size
+                    if quality and quality != "auto":
+                        body["quality"] = quality
 
             if upstream_tracking_id:
                 tracking_id = str(upstream_tracking_id).strip()
@@ -2151,7 +2588,7 @@ class ProxyService:
 
     def _log_stream_event(self, stage: str, **kwargs):
         details = " ".join(f"{key}={value}" for key, value in kwargs.items() if value is not None)
-        print(f"[CPA STREAM] stage={stage} {details}".strip())
+        logger.info(f"[CPA STREAM] stage={stage} {details}".strip())
 
     def _parse_response_body(self, response: httpx.Response) -> Any:
         content_type = response.headers.get("content-type", "")
@@ -2311,12 +2748,15 @@ class ProxyService:
                 (output_tokens_details.get("reasoning_tokens") or 0) + (output_tokens_details.get("text_tokens") or 0),
             )
 
-        # 缓存 token：OpenAI 格式在 prompt_tokens_details.cached_tokens
-        # Claude 格式在 cache_read_input_tokens / cache_creation_input_tokens
+        # 缓存 token：Chat Completions 使用 prompt_tokens_details，Responses 使用 input_tokens_details。
+        # Claude 格式在 cache_read_input_tokens / cache_creation_input_tokens。
         prompt_tokens_details = usage.get("prompt_tokens_details") or {}
+        input_tokens_details = usage.get("input_tokens_details") or {}
         openai_cached_tokens = 0
         if isinstance(prompt_tokens_details, dict):
             openai_cached_tokens = int(prompt_tokens_details.get("cached_tokens") or 0)
+        if not openai_cached_tokens and isinstance(input_tokens_details, dict):
+            openai_cached_tokens = int(input_tokens_details.get("cached_tokens") or 0)
         cache_read_tokens = int(usage.get("cache_read_input_tokens") or 0)
         cache_creation_tokens = int(usage.get("cache_creation_input_tokens") or 0)
         cache_tokens = openai_cached_tokens or cache_read_tokens or cache_creation_tokens or int(
@@ -2329,6 +2769,63 @@ class ProxyService:
         total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
 
         return int(prompt_tokens), int(completion_tokens), int(total_tokens), int(cache_tokens)
+
+    def _extract_finish_reason_from_response(self, response_data: Any) -> Optional[str]:
+        """提取上游结束原因，仅用于诊断，不参与业务判断。"""
+        if not isinstance(response_data, dict):
+            return None
+
+        choices = response_data.get("choices")
+        if isinstance(choices, list) and choices:
+            first_choice = choices[0] if isinstance(choices[0], dict) else {}
+            finish_reason = first_choice.get("finish_reason")
+            if finish_reason:
+                return str(finish_reason)
+
+        for key in ["finish_reason", "stop_reason", "status"]:
+            value = response_data.get(key)
+            if value:
+                return str(value)
+
+        response_obj = response_data.get("response")
+        if isinstance(response_obj, dict):
+            for key in ["finish_reason", "stop_reason", "status"]:
+                value = response_obj.get(key)
+                if value:
+                    return str(value)
+        return None
+
+    def _extract_finish_reason_from_sse(self, event_text: str) -> Optional[str]:
+        """从 SSE 事件中提取结束原因，仅用于诊断。"""
+        data_lines = []
+        for line in event_text.splitlines():
+            if line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+        if not data_lines:
+            return None
+        data_text = "\n".join(data_lines)
+        if data_text == "[DONE]":
+            return "done"
+        try:
+            payload = json.loads(data_text)
+        except json.JSONDecodeError:
+            return None
+        return self._extract_finish_reason_from_response(payload)
+
+    def _log_pup_output_diagnostic(
+        self,
+        api_key: Any,
+        *,
+        path: str,
+        body: Optional[dict],
+        status_code: Optional[int],
+        finish_reason: Optional[str],
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        latency_ms: int,
+    ):
+        return
 
     def _extract_stream_usage_from_sse(self, event_text: str) -> tuple[int, int, int, int]:
         """从流式 SSE 事件中提取真实 token 用量，返回 (prompt, completion, total, cache)"""
@@ -2360,6 +2857,32 @@ class ProxyService:
             return self._extract_usage_tokens(payload["message"])
 
         return self._extract_usage_tokens(payload)
+
+    def _adapt_responses_content_to_chat_content(self, content: Any) -> Any:
+        """将 Responses 内容块转换为 OpenAI Chat 兼容内容块。"""
+        if not isinstance(content, list):
+            return content
+
+        adapted = []
+        for item in content:
+            if not isinstance(item, dict):
+                adapted.append(item)
+                continue
+            item_type = item.get("type")
+            if item_type == "input_text":
+                adapted.append({"type": "text", "text": item.get("text") or ""})
+            elif item_type == "input_image":
+                image_url = item.get("image_url")
+                if image_url:
+                    image_payload = {"url": image_url} if isinstance(image_url, str) else dict(image_url)
+                    if item.get("detail") and "detail" not in image_payload:
+                        image_payload["detail"] = item["detail"]
+                    adapted.append({"type": "image_url", "image_url": image_payload})
+                elif item.get("file_id"):
+                    adapted.append({"type": "file", "file_id": item["file_id"]})
+            else:
+                adapted.append(item)
+        return adapted
 
     def _extract_text_segments(self, content: Any) -> list[str]:
         if isinstance(content, str):
@@ -2410,11 +2933,14 @@ class ProxyService:
                 item_type = item.get("type")
                 if item_type == "message":
                     role = item.get("role", "user")
-                    text_segments = self._extract_text_segments(item.get("content"))
-                    if text_segments:
+                    content = self._adapt_responses_content_to_chat_content(item.get("content"))
+                    text_segments = self._extract_text_segments(content)
+                    if isinstance(content, list) and any(isinstance(block, dict) and block.get("type") in {"image_url", "file"} for block in content):
+                        messages.append({"role": role, "content": content})
+                    elif text_segments:
                         messages.append({"role": role, "content": "\n".join(text_segments)})
-                    elif item.get("content") is not None:
-                        messages.append({"role": role, "content": str(item.get("content"))})
+                    elif content is not None:
+                        messages.append({"role": role, "content": str(content)})
                     continue
 
                 if item_type == "function_call":
@@ -2552,6 +3078,11 @@ class ProxyService:
         if "max_output_tokens" in body:
             chat_body["max_tokens"] = body["max_output_tokens"]
 
+        # 仅保留 Grok 缓存亲和字段，供后续 chat 路径回填 x-grok-conv-id
+        prompt_cache_key = str(body.get("prompt_cache_key") or "").strip()
+        if prompt_cache_key and self._is_grok_family_model(str(body.get("model") or "")):
+            chat_body["prompt_cache_key"] = prompt_cache_key
+
         messages = []
         if body.get("instructions"):
             messages.append({"role": "system", "content": body["instructions"]})
@@ -2618,7 +3149,10 @@ class ProxyService:
         }
 
     def _build_response_output_items(self, message: dict, status: str, item_id: Optional[str] = None, output_text: Optional[str] = None) -> list[dict]:
-        output_items = [self._build_response_message_item(message, status, item_id=item_id, output_text=output_text)]
+        text = self._extract_chat_message_text(message) if output_text is None else output_text
+        output_items = []
+        if text:
+            output_items.append(self._build_response_message_item(message, status, item_id=item_id, output_text=text))
         for tool_call in message.get("tool_calls") or []:
             function_call_item = self._build_response_function_call_item(tool_call, status)
             if function_call_item:
@@ -2633,6 +3167,7 @@ class ProxyService:
         message = choice.get("message") or {}
         output_text = self._extract_chat_message_text(message)
         usage = response_data.get("usage") or {}
+        responses_usage = self._extract_usage_details_for_responses(usage)
 
         return {
             "id": response_data.get("id", f"resp_{int(time.time() * 1000)}"),
@@ -2642,11 +3177,7 @@ class ProxyService:
             "model": response_data.get("model"),
             "output": self._build_response_output_items(message, "completed", output_text=output_text),
             "output_text": output_text,
-            "usage": {
-                "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
-                "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
+            "usage": responses_usage,
         }
 
     def _build_sse_event(self, event_name: str, data: dict) -> bytes:
@@ -2669,13 +3200,14 @@ class ProxyService:
         item_id: str,
         output_text: str,
         tool_calls: Optional[list[dict]] = None,
+        usage: Optional[dict] = None,
     ) -> dict:
         message = {
             "role": "assistant",
             "content": output_text,
             "tool_calls": tool_calls or [],
         }
-        return {
+        payload = {
             "id": response_id,
             "object": "response",
             "created_at": created_at,
@@ -2684,6 +3216,9 @@ class ProxyService:
             "output": self._build_response_output_items(message, status, item_id=item_id, output_text=output_text),
             "output_text": output_text,
         }
+        if usage:
+            payload["usage"] = usage
+        return payload
 
     async def adapt_chat_stream_to_responses(
         self,
@@ -2699,6 +3234,7 @@ class ProxyService:
         saw_payload = False
         buffer = ""
         tool_calls_state: dict[int, dict] = {}
+        latest_usage: Optional[dict] = None
 
         def current_tool_calls() -> list[dict]:
             ordered_indexes = sorted(tool_calls_state.keys())
@@ -2809,36 +3345,38 @@ class ProxyService:
                 item_id,
                 output_text,
                 tool_calls=current_tool_calls(),
+                usage=latest_usage,
             )
-            yield self._build_sse_event(
-                "response.output_text.done",
-                self._with_event_id(
+            if output_text:
+                yield self._build_sse_event(
                     "response.output_text.done",
-                    {
-                        "response_id": response_id,
-                        "item_id": item_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "text": output_text,
-                    },
-                ),
-            )
-            yield self._build_sse_event(
-                "response.content_part.done",
-                self._with_event_id(
-                    "response.content_part.done",
-                    {
-                        "response_id": response_id,
-                        "item_id": item_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "part": {
-                            "type": "output_text",
+                    self._with_event_id(
+                        "response.output_text.done",
+                        {
+                            "response_id": response_id,
+                            "item_id": item_id,
+                            "output_index": 0,
+                            "content_index": 0,
                             "text": output_text,
                         },
-                    },
-                ),
-            )
+                    ),
+                )
+                yield self._build_sse_event(
+                    "response.content_part.done",
+                    self._with_event_id(
+                        "response.content_part.done",
+                        {
+                            "response_id": response_id,
+                            "item_id": item_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "part": {
+                                "type": "output_text",
+                                "text": output_text,
+                            },
+                        },
+                    ),
+                )
             if response["output"]:
                 yield self._build_sse_event(
                     "response.output_item.done",
@@ -2897,13 +3435,17 @@ class ProxyService:
                     async for event in emit_created():
                         yield event
 
+                    # 保留 chat stream usage 中的 cached_tokens，回填到 responses.completed
+                    if isinstance(payload.get("usage"), dict):
+                        latest_usage = self._extract_usage_details_for_responses(payload.get("usage"))
+
                     choices = payload.get("choices") or []
                     if not choices:
                         continue
 
                     choice = choices[0]
                     delta = choice.get("delta") or {}
-                    delta_text = delta.get("content")
+                    delta_text = delta.get("content") or delta.get("reasoning_content")
                     if isinstance(delta_text, list):
                         delta_text = "".join(self._extract_text_segments(delta_text))
                     if delta_text:
@@ -3040,9 +3582,17 @@ class ProxyService:
         if upgrade_to_claude:
             body = self._adapt_chat_body_to_claude_messages_body(body)
             path = "v1/messages"
+        else:
+            # 非 Claude 目标：清理 Claude 专属字段，避免 OpenAI 兼容模型校验报错
+            body = self._sanitize_messages_for_openai_compat(body)
+
+        # DeepSeek 思考模式参数注入
+        body = self._inject_thinking_params(api_key, body, path)
+        # 仅 Grok 模型补齐缓存亲和参数
+        body = self._apply_grok_cache_affinity(body, headers, path=path, model=original_model)
 
         url = self._build_url(api_key, path)
-        forward_headers = self._build_headers(api_key, headers, path)
+        forward_headers = self._build_headers(api_key, headers, path, body=body, model=original_model)
         upstream_body = self._normalize_body_for_upstream(body) if body else None
         self._write_upstream_request_debug_dump(
             api_key,
@@ -3062,21 +3612,22 @@ class ProxyService:
 
         upstream_wait_start = None
         try:
-            async with httpx.AsyncClient(**self._build_client_kwargs(api_key, self.timeout)) as client:
-                upstream_wait_start = time.perf_counter()
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    headers=forward_headers,
-                    json=upstream_body,
-                )
+            # 复用连接池，避免每次新建 TCP/TLS 连接导致 ConnectError
+            client = self._get_pooled_client(api_key, self.timeout)
+            upstream_wait_start = time.perf_counter()
+            response = await client.request(
+                method=method,
+                url=url,
+                headers=forward_headers,
+                json=upstream_body,
+            )
 
-                status_code = response.status_code
-                response_data = self._parse_response_body(response)
+            status_code = response.status_code
+            response_data = self._parse_response_body(response)
 
-                if status_code >= 400:
-                    status = "error"
-                    error_message = str(response_data)
+            if status_code >= 400:
+                status = "error"
+                error_message = str(response_data)
 
         except httpx.TimeoutException as e:
             if upstream_wait_start is not None:
@@ -3098,7 +3649,18 @@ class ProxyService:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
             status = "error"
-            error_message = self._safe_error_message("请求错误: ", e)
+            is_connect = type(e).__name__ == "ConnectError"
+            label = "连接失败" if is_connect else "请求错误"
+            error_message = self._safe_error_message(f"{label}: ", e)
+            logger.warning("[CPA UPSTREAM %s] key_id=%s url=%s %s", label.upper(), getattr(api_key, "id", "?"), url, error_message)
+            # ConnectError 时驱逐该连接池条目，下次请求重新建连
+            if is_connect:
+                proxy_url = self._build_proxy_url(api_key)
+                pool_key = (getattr(api_key, "base_url", "") or "", proxy_url or "")
+                old_client = self._client_pool.pop(pool_key, None)
+                if old_client is not None:
+                    import asyncio
+                    asyncio.ensure_future(old_client.aclose())
             response_data = {"error": {"message": error_message}}
         except Exception as e:
             if upstream_wait_start is not None:
@@ -3128,6 +3690,18 @@ class ProxyService:
 
         if response_data and status == "success":
             prompt_tokens, completion_tokens, total_tokens, cache_tokens = self._extract_usage_tokens(response_data)
+
+        self._log_pup_output_diagnostic(
+            api_key,
+            path=path,
+            body=upstream_body,
+            status_code=status_code,
+            finish_reason=self._extract_finish_reason_from_response(response_data),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            latency_ms=latency_ms,
+        )
 
         # 记录用量：model=原始请求模型基础名，actual_model=实际转发模型基础名
         await usage_tracker.record(
@@ -3329,12 +3903,19 @@ class ProxyService:
         from .usage_tracker import usage_tracker
 
         url = self._build_url(api_key, path)
-        forward_headers = self._build_headers(api_key, headers, path)
         model = body.get("model") if body else None
         # OpenAI 协议流式请求：注入 stream_options 确保上游返回 usage 含 cache_tokens
         if isinstance(body, dict) and body.get("stream") is True and not body.get("stream_options"):
             if (path or "").lstrip("/") != "v1/messages":
                 body = {**body, "stream_options": {"include_usage": True}}
+        # 非 Claude 目标：清理 Claude 专属字段，避免 OpenAI 兼容模型校验报错
+        if (path or "").lstrip("/") != "v1/messages":
+            body = self._sanitize_messages_for_openai_compat(body)
+        # DeepSeek 思考模式参数注入
+        body = self._inject_thinking_params(api_key, body, path)
+        # 仅 Grok 模型补齐缓存亲和参数
+        body = self._apply_grok_cache_affinity(body, headers, path=path, model=original_model or model)
+        forward_headers = self._build_headers(api_key, headers, path, body=body, model=original_model or model)
         upstream_body = self._normalize_body_for_upstream(body) if body else None
 
         request_meta = {
@@ -3386,7 +3967,10 @@ class ProxyService:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
             await client.aclose()
-            error_message = self._safe_error_message("连接失败: ", e)
+            is_connect = type(e).__name__ == "ConnectError"
+            label = "连接失败" if is_connect else "连接错误"
+            error_message = self._safe_error_message(f"{label}: ", e)
+            logger.warning("[CPA UPSTREAM %s] key_id=%s url=%s %s", label.upper(), getattr(api_key, "id", "?"), url, error_message)
             latency_ms = int((time.perf_counter() - total_start) * 1000)
             await usage_tracker.record(
                 db=db, api_key_id=api_key.id, model=original_model or model,
@@ -3514,9 +4098,7 @@ class ProxyService:
                     window_exited = True
                     break
 
-                if window_done:
-                    break
-
+                # finish_reason 只表示模型内容完成，仍需继续读取 usage 和 [DONE]
             upstream_wait_seconds += time.perf_counter() - upstream_wait_start
 
             # 处理窗口内残留 buffer
@@ -3710,12 +4292,26 @@ class ProxyService:
         if upgrade_to_claude:
             body = self._adapt_chat_body_to_claude_messages_body(body)
             path = "v1/messages"
-        elif isinstance(body, dict) and body.get("stream") is True and not body.get("stream_options"):
-            # OpenAI 协议流式请求：注入 stream_options 确保上游返回 usage 含 cache_tokens
-            body = {**body, "stream_options": {"include_usage": True}}
+        else:
+            # 非 Claude 目标：清理 Claude 专属字段，避免 OpenAI 兼容模型校验报错
+            body = self._sanitize_messages_for_openai_compat(body)
+            if isinstance(body, dict) and body.get("stream") is True and not body.get("stream_options"):
+                # OpenAI 协议流式请求：注入 stream_options 确保上游返回 usage 含 cache_tokens
+                body = {**body, "stream_options": {"include_usage": True}}
+
+        # DeepSeek 思考模式参数注入
+        body = self._inject_thinking_params(api_key, body, path)
+        # 仅 Grok 模型补齐缓存亲和参数
+        body = self._apply_grok_cache_affinity(body, headers, path=path, model=original_model or original_model_name)
 
         url = self._build_url(api_key, path)
-        forward_headers = self._build_headers(api_key, headers, path)
+        forward_headers = self._build_headers(
+            api_key,
+            headers,
+            path,
+            body=body,
+            model=original_model or original_model_name,
+        )
         upstream_body = self._normalize_body_for_upstream(body) if body else None
         self._write_upstream_request_debug_dump(
             api_key,
@@ -3912,6 +4508,7 @@ class ProxyService:
             total_tokens = 0
             cache_tokens = 0
             last_synced_tokens = (0, 0, 0, 0)
+            finish_reason = None
 
             try:
                 stream_iterator = response.aiter_text()
@@ -3986,6 +4583,9 @@ class ProxyService:
                                     cpa_overhead_ms=max(current_latency_ms - current_upstream_latency_ms, 0),
                                 )
                                 last_synced_tokens = current_tokens
+                        event_finish_reason = self._extract_finish_reason_from_sse(event_text)
+                        if event_finish_reason:
+                            finish_reason = event_finish_reason
                         if self._has_terminal_event(event_text):
                             terminal_seen = True
                         yield event_text.encode("utf-8")
@@ -4014,11 +4614,15 @@ class ProxyService:
                                 prompt_tokens=prompt_tokens,
                                 completion_tokens=completion_tokens,
                                 total_tokens=total_tokens,
+                                cache_tokens=cache_tokens,
                                 latency_ms=current_latency_ms,
                                 upstream_latency_ms=current_upstream_latency_ms,
                                 cpa_overhead_ms=max(current_latency_ms - current_upstream_latency_ms, 0),
                             )
                             last_synced_tokens = current_tokens
+                    buffer_finish_reason = self._extract_finish_reason_from_sse(buffer)
+                    if buffer_finish_reason:
+                        finish_reason = buffer_finish_reason
                     if self._has_terminal_event(buffer):
                         terminal_seen = True
                     yield buffer.encode("utf-8")
@@ -4062,6 +4666,17 @@ class ProxyService:
                     completion_tokens=completion_tokens,
                     total_tokens=total_tokens,
                     error=final_error_message,
+                )
+                self._log_pup_output_diagnostic(
+                    api_key,
+                    path=path,
+                    body=upstream_body,
+                    status_code=response.status_code,
+                    finish_reason=finish_reason,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    latency_ms=latency_ms,
                 )
                 await usage_tracker.update_record(
                     db=db,
@@ -4291,6 +4906,15 @@ class ProxyService:
         # 流式请求注入 stream_options 确保上游返回 usage
         if body.get("stream") is True:
             chat_body["stream_options"] = {"include_usage": True}
+
+        # 思考模式参数转换（Anthropic 格式 → OpenAI 格式，仅 DeepSeek 模型）
+        _model_for_check = self._normalize_model_name_for_family(chat_body.get("model") or "")
+        if any(kw in _model_for_check for kw in self._DEEPSEEK_MODEL_KEYWORDS):
+            if body.get("thinking") is not None:
+                chat_body["thinking"] = body["thinking"]
+            effort_value = self._extract_effort_from_body(body)
+            if effort_value:
+                chat_body["reasoning_effort"] = effort_value
 
         return chat_body
 

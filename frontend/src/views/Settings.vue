@@ -558,6 +558,34 @@
       </div>
     </el-card>
 
+    <!-- 运行日志显示 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('runtimeLog')">
+          <div class="setting-card-header-text">
+            <div class="panel-title">运行日志显示</div>
+            <div class="panel-subtitle">控制管理菜单中的运行日志页面，并使用内存循环缓冲实时展示服务日志</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.runtimeLog }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.runtimeLog" class="setting-card-body">
+        <el-form label-width="160px" v-loading="runtimeLogLoading">
+          <el-form-item label="运行日志菜单">
+            <el-switch v-model="runtimeLogEnabled" active-text="开启" inactive-text="关闭" />
+            <div class="form-tip">开启后显示“运行日志”菜单。日志最多占用 3MB 内存，超过后自动清除最早内容；关闭后清空缓冲。</div>
+          </el-form-item>
+          <el-form-item label="日志自动换行">
+            <el-switch v-model="runtimeLogWrap" active-text="开启" inactive-text="关闭" />
+            <div class="form-tip">开启后运行日志按页面宽度自动换行显示；关闭时保持单行、横向滚动查看完整内容。</div>
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" :loading="runtimeLogSaving" @click="saveRuntimeLogConfig">保存运行日志配置</el-button>
+          </el-form-item>
+        </el-form>
+      </div>
+    </el-card>
+
     <!-- 代理调试追踪 -->
     <el-card class="setting-card" shadow="never">
       <template #header>
@@ -653,6 +681,115 @@
               @change="handleModelSeedChange"
             />
             <div class="form-tip">开启后，模型广场会自动填充系统预设的默认模型；关闭后模型广场仅展示与实际 Key 关联的模型。一键还原后会自动关闭此开关。</div>
+          </el-form-item>
+        </el-form>
+      </div>
+    </el-card>
+
+    <!-- DeepSeek 思考模式配置 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('thinkingMode')">
+          <div class="setting-card-header-text">
+            <div class="panel-title">DeepSeek 思考模式配置</div>
+            <div class="panel-subtitle">为 DeepSeek 模型自动注入思考模式参数（thinking / reasoning_effort），客户端显式传入时优先</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.thinkingMode }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.thinkingMode" class="setting-card-body">
+        <div v-for="(rule, idx) in thinkingModeRules" :key="idx" style="margin-bottom: 16px; padding: 12px; border: 1px solid #e4e7ed; border-radius: 6px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+            <span style="font-weight: 600; color: #303133;">规则 #{{ idx + 1 }}</span>
+            <el-button type="danger" text size="small" @click="removeThinkingModeRule(idx)">删除</el-button>
+          </div>
+          <el-form label-width="120px" size="small">
+            <el-form-item label="启用">
+              <el-switch v-model="rule.enabled" active-text="是" inactive-text="否" />
+            </el-form-item>
+            <el-form-item label="强制模式">
+              <el-switch v-model="rule.force" active-text="是" inactive-text="否" />
+              <div class="form-tip">关闭时客户端传入的参数优先，CPA 只补充缺失的；开启时 CPA 配置强制覆盖客户端传入的 thinking / reasoning_effort / effort</div>
+            </el-form-item>
+            <el-form-item label="供应商过滤">
+              <el-input v-model="rule.providersText" placeholder="留空匹配所有，逗号分隔（如 deepseek,bb）" style="max-width: 400px" />
+              <div class="form-tip">留空则匹配所有供应商；多个供应商用英文逗号分隔</div>
+            </el-form-item>
+            <el-form-item label="模型过滤">
+              <el-input v-model="rule.modelsText" placeholder="留空匹配所有 DeepSeek 模型，逗号分隔（如 deepseek-v4-pro）" style="max-width: 400px" />
+              <div class="form-tip">留空则匹配所有含 deepseek 关键词的模型；支持通配符（如 deepseek-*）</div>
+            </el-form-item>
+            <el-form-item label="思考模式">
+              <el-select v-model="rule.thinking_type" style="width: 180px">
+                <el-option label="启用 (enabled)" value="enabled" />
+                <el-option label="禁用 (disabled)" value="disabled" />
+              </el-select>
+              <div class="form-tip">控制 DeepSeek 模型的思考模式开关；默认 enabled</div>
+            </el-form-item>
+            <el-form-item label="思考强度">
+              <el-select v-model="rule.reasoning_effort" style="width: 180px" clearable>
+                <el-option label="不设置" value="" />
+                <el-option label="high" value="high" />
+                <el-option label="max" value="max" />
+              </el-select>
+              <div class="form-tip">控制思考强度；high 适合普通请求，max 适合复杂 Agent 类请求（如 Claude Code）。留空则不注入此参数。客户端传入 reasoning_effort 或 effort 时，非强制模式下保留客户端值</div>
+            </el-form-item>
+          </el-form>
+        </div>
+        <el-button type="primary" text @click="addThinkingModeRule">+ 添加规则</el-button>
+        <div style="margin-top: 12px;">
+          <el-button type="primary" :loading="thinkingModeSaving" @click="saveThinkingModeConfig">保存思考模式配置</el-button>
+        </div>
+      </div>
+    </el-card>
+
+    <!-- 用量保留期配置 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('usageRetention')">
+          <div class="setting-card-header-text">
+            <div class="panel-title">用量保留期</div>
+            <div class="panel-subtitle">设置请求明细与按天汇总的保留天数；Key 和用户累计用量不会随清理删除</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.usageRetention }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.usageRetention" class="setting-card-body">
+        <el-form label-width="160px" v-loading="usageRetentionLoading">
+          <el-form-item label="请求明细保留天数">
+            <el-input-number v-model="usageRetentionForm.usage_log_retention_days" :min="1" :max="3650" :precision="0" controls-position="right" />
+            <div class="form-tip">超过该天数的请求明细会被清理。默认 7 天。</div>
+          </el-form-item>
+          <el-form-item label="按天汇总保留天数">
+            <el-input-number v-model="usageRetentionForm.usage_summary_retention_days" :min="1" :max="3650" :precision="0" controls-position="right" />
+            <div class="form-tip">超过该天数的按天汇总会被清理。默认 90 天；不影响 Key 和用户的生命周期累计。</div>
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" :loading="usageRetentionSaving" @click="saveUsageRetentionConfig">保存</el-button>
+          </el-form-item>
+        </el-form>
+      </div>
+    </el-card>
+
+    <!-- 同 Key 重试配置 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('retrySameKey')">
+          <div class="setting-card-header-text">
+            <div class="panel-title">同 Key 重试配置</div>
+            <div class="panel-subtitle">指定提供商且单一 Key 来源时，失败后允许重试同一 Key 而非直接返回错误</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.retrySameKey }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.retrySameKey" class="setting-card-body">
+        <el-form label-width="160px">
+          <el-form-item label="启用的提供商">
+            <el-input v-model="retrySameKeyProvidersText" placeholder="输入提供商名称，逗号分隔（如 deepseek,bb）" style="max-width: 500px" />
+            <div class="form-tip">当请求指定了这些提供商且只有一个可用 Key 时，Key 失败后清空排除列表重试同一 Key，而非直接返回"没有可用的 API Key"。留空则不启用此逻辑</div>
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" :loading="retrySameKeySaving" @click="saveRetrySameKeyConfig">保存</el-button>
           </el-form-item>
         </el-form>
       </div>
@@ -882,8 +1019,12 @@ const expandedCards = reactive({
   changePassword: savedCardState.changePassword ?? false,
   passThroughError: savedCardState.passThroughError ?? false,
   providerContinueError: savedCardState.providerContinueError ?? false,
+  runtimeLog: savedCardState.runtimeLog ?? false,
   proxyTrace: savedCardState.proxyTrace ?? false,
   modelSeed: savedCardState.modelSeed ?? false,
+  thinkingMode: savedCardState.thinkingMode ?? false,
+  usageRetention: savedCardState.usageRetention ?? false,
+  retrySameKey: savedCardState.retrySameKey ?? false,
   factoryReset: savedCardState.factoryReset ?? false,
 })
 
@@ -922,6 +1063,12 @@ const providerContinueErrorLoading = ref(false)
 const providerContinueErrorSaving = ref(false)
 const providerContinueErrorRules = ref([])
 
+// 运行日志显示
+const runtimeLogLoading = ref(false)
+const runtimeLogSaving = ref(false)
+const runtimeLogEnabled = ref(false)
+const runtimeLogWrap = ref(false)
+
 // 代理调试追踪
 const proxyTraceLoading = ref(false)
 const proxyTraceSaving = ref(false)
@@ -936,6 +1083,127 @@ const proxyTraceForm = reactive({
 
 // 模型种子
 const modelSeedEnabled = ref(true)
+
+// DeepSeek 思考模式
+const thinkingModeRules = ref([])
+const thinkingModeSaving = ref(false)
+
+const defaultThinkingModeRule = () => ({
+  enabled: true,
+  force: false,
+  providersText: '',
+  modelsText: '',
+  thinking_type: 'enabled',
+  reasoning_effort: '',
+})
+
+const addThinkingModeRule = () => {
+  thinkingModeRules.value.push(defaultThinkingModeRule())
+}
+
+const removeThinkingModeRule = (index) => {
+  thinkingModeRules.value.splice(index, 1)
+}
+
+const loadThinkingModeConfig = async () => {
+  try {
+    const data = await adminApi.getThinkingModeConfig()
+    const rules = data?.rules || []
+    thinkingModeRules.value = rules.length ? rules.map((r) => ({
+      enabled: r.enabled !== false,
+      force: !!r.force,
+      providersText: (r.providers || []).join(','),
+      modelsText: (r.models || []).join(','),
+      thinking_type: r.thinking_type || 'enabled',
+      reasoning_effort: r.reasoning_effort || '',
+    })) : [defaultThinkingModeRule()]
+  } catch {
+    thinkingModeRules.value = [defaultThinkingModeRule()]
+  }
+}
+
+const saveThinkingModeConfig = async () => {
+  thinkingModeSaving.value = true
+  try {
+    const rules = thinkingModeRules.value.map((r) => ({
+      enabled: !!r.enabled,
+      force: !!r.force,
+      providers: r.providersText ? r.providersText.split(/[,，]/).map((s) => s.trim()).filter(Boolean) : null,
+      models: r.modelsText ? r.modelsText.split(/[,，]/).map((s) => s.trim()).filter(Boolean) : null,
+      thinking_type: r.thinking_type || 'enabled',
+      reasoning_effort: r.reasoning_effort || '',
+    }))
+    const data = await adminApi.updateThinkingModeConfig({ rules })
+    thinkingModeRules.value = (data?.rules || []).map((r) => ({
+      enabled: r.enabled !== false,
+      providersText: (r.providers || []).join(','),
+      modelsText: (r.models || []).join(','),
+      thinking_type: r.thinking_type || 'enabled',
+      reasoning_effort: r.reasoning_effort || '',
+    }))
+    ElMessage.success('思考模式配置已保存')
+  } catch (e) { ElMessage.error(e.message || '保存思考模式配置失败') }
+  finally { thinkingModeSaving.value = false }
+}
+
+// 用量保留期配置
+const usageRetentionLoading = ref(false)
+const usageRetentionSaving = ref(false)
+const usageRetentionForm = reactive({
+  usage_log_retention_days: 7,
+  usage_summary_retention_days: 90,
+})
+
+const loadUsageRetentionConfig = async () => {
+  usageRetentionLoading.value = true
+  try {
+    const data = await adminApi.getUsageRetentionConfig()
+    usageRetentionForm.usage_log_retention_days = Number(data?.usage_log_retention_days || 7)
+    usageRetentionForm.usage_summary_retention_days = Number(data?.usage_summary_retention_days || 90)
+  } catch (e) {
+    ElMessage.error(e.message || '加载用量保留期配置失败')
+  } finally {
+    usageRetentionLoading.value = false
+  }
+}
+
+const saveUsageRetentionConfig = async () => {
+  usageRetentionSaving.value = true
+  try {
+    const data = await adminApi.updateUsageRetentionConfig({ ...usageRetentionForm })
+    usageRetentionForm.usage_log_retention_days = Number(data?.usage_log_retention_days || 7)
+    usageRetentionForm.usage_summary_retention_days = Number(data?.usage_summary_retention_days || 90)
+    ElMessage.success('用量保留期配置已保存')
+  } catch (e) {
+    ElMessage.error(e.message || '保存用量保留期配置失败')
+  } finally {
+    usageRetentionSaving.value = false
+  }
+}
+
+// 同 Key 重试配置
+const retrySameKeyProvidersText = ref('')
+const retrySameKeySaving = ref(false)
+
+const loadRetrySameKeyConfig = async () => {
+  try {
+    const data = await adminApi.getRetrySameKeyConfig()
+    retrySameKeyProvidersText.value = (data?.providers || []).join(',')
+  } catch { retrySameKeyProvidersText.value = '' }
+}
+
+const saveRetrySameKeyConfig = async () => {
+  retrySameKeySaving.value = true
+  try {
+    const providers = retrySameKeyProvidersText.value
+      ? retrySameKeyProvidersText.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean)
+      : []
+    const data = await adminApi.updateRetrySameKeyConfig({ providers })
+    retrySameKeyProvidersText.value = (data?.providers || []).join(',')
+    ElMessage.success('同 Key 重试配置已保存')
+  } catch (e) { ElMessage.error(e.message || '保存失败') }
+  finally { retrySameKeySaving.value = false }
+}
 
 // 一键还原
 const factoryResetKeepProviders = ref('')
@@ -1502,6 +1770,35 @@ const saveProviderContinueErrorRules = async () => {
   finally { providerContinueErrorSaving.value = false }
 }
 
+// ── 运行日志显示 ──────────────────────────────────────────
+const loadRuntimeLogConfig = async () => {
+  runtimeLogLoading.value = true
+  try {
+    const data = await adminApi.getRuntimeLogConfig()
+    runtimeLogEnabled.value = !!data.enabled
+    runtimeLogWrap.value = !!data.wrap
+  } catch (e) {
+    ElMessage.error(e.message || '加载运行日志配置失败')
+  } finally {
+    runtimeLogLoading.value = false
+  }
+}
+
+const saveRuntimeLogConfig = async () => {
+  runtimeLogSaving.value = true
+  try {
+    const data = await adminApi.updateRuntimeLogConfig({ enabled: runtimeLogEnabled.value, wrap: runtimeLogWrap.value })
+    runtimeLogEnabled.value = !!data.enabled
+    runtimeLogWrap.value = !!data.wrap
+    window.dispatchEvent(new CustomEvent('runtime-log-config-changed', { detail: { enabled: runtimeLogEnabled.value, wrap: runtimeLogWrap.value } }))
+    ElMessage.success('运行日志配置已保存')
+  } catch (e) {
+    ElMessage.error(e.message || '保存运行日志配置失败')
+  } finally {
+    runtimeLogSaving.value = false
+  }
+}
+
 // ── 代理调试追踪 ──────────────────────────────────────────
 const loadProxyTraceConfig = async () => {
   proxyTraceLoading.value = true
@@ -1587,8 +1884,12 @@ onMounted(async () => {
     loadStreamBufferRules(),
     loadPassThroughErrorCodes(),
     loadProviderContinueErrorRules(),
+    loadRuntimeLogConfig(),
     loadProxyTraceConfig(),
     loadModelSeedConfig(),
+    loadThinkingModeConfig(),
+    loadUsageRetentionConfig(),
+    loadRetrySameKeyConfig(),
   ])
 })
 </script>
@@ -1822,4 +2123,55 @@ code {
   flex: 0 0 40px;
 }
 
+/* ── 移动端：表单标签改顶部排布，输入框放开固定宽度 ── */
+@media (max-width: 768px) {
+  /* 各表单 label-width 是 120~180px，390px 宽下输入框只剩一半，
+     统一改成标签占一行 */
+  :deep(.el-form-item) {
+    display: block;
+    margin-bottom: 14px;
+  }
+
+  :deep(.el-form-item__label) {
+    width: auto !important;
+    justify-content: flex-start;
+    padding: 0 0 4px;
+    line-height: 1.4;
+    text-align: left;
+  }
+
+  :deep(.el-form-item__content) {
+    margin-left: 0 !important;
+    line-height: 1.5;
+  }
+
+  /* 模板里写死的 max-width: 400/500px 在窄屏没有意义，放开占满 */
+  :deep(.el-form-item__content .el-input),
+  :deep(.el-form-item__content .el-select),
+  :deep(.el-form-item__content .el-textarea) {
+    max-width: 100% !important;
+    width: 100%;
+  }
+
+  /* 余额规则那几行是横向 flex，窄屏改纵向 */
+  .balance-rule-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  /* 表头与纵向排布的行对不上，隐藏后由每行自身的占位符表达 */
+  .balance-rule-header {
+    display: none;
+  }
+
+  .balance-rule-col-action {
+    flex: 0 0 auto;
+  }
+
+  /* 接口清单表格与示例代码块允许横向滚动，不撑破页面 */
+  .code-block {
+    overflow-x: auto;
+    font-size: 11px;
+  }
+}
 </style>

@@ -1,23 +1,27 @@
-﻿"""
+"""
 代理转发路由 - 兼容 OpenAI 和 Claude 接口
 """
 from typing import Optional, Any
 from datetime import datetime
 import hashlib
+import logging
 import time
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import settings
+from config import settings, export_config
 from database import get_db
 from services.pool_manager import pool_manager
 from services.proxy_service import proxy_service
 from services.proxy_trace_service import proxy_trace_service
 
+from services.responses_capability_service import responses_capability_service
+
 
 router = APIRouter()
+logger = logging.getLogger("cpa.proxy")
 STREAM_RETRY_LIMIT = 3
 REQUEST_RETRY_LIMIT = 3
 # 永久失败（余额不足、Key 无效等）禁用 Key 后继续尝试的最大次数
@@ -34,12 +38,25 @@ CLAUDE_MESSAGES_NATIVE_PROVIDERS = {"claude", "cc"}
 CLAUDE_MESSAGES_NATIVE_EXCLUDED_PROVIDERS = {"skk"}
 CLAUDE_MESSAGES_NATIVE_PROTOCOL = "anthropic_messages"
 CLAUDE_MODEL_KEYWORDS = ("claude", "sonnet", "opus", "haiku")
+RESPONSES_CAPABILITY_MODEL_PREFIXES = ("gpt-", "deepseek-")
 
 
-def log_proxy_hit(path: str, body: dict):
+def is_responses_capability_candidate(model: Optional[str]) -> bool:
+    actual_model, _, _ = _parse_model_directive(model or "")
+    model_base, _ = _strip_model_suffix(actual_model)
+    normalized = model_base.lower()
+    return any(normalized.startswith(prefix) for prefix in RESPONSES_CAPABILITY_MODEL_PREFIXES)
+
+
+def log_proxy_hit(path: str, body: dict, protocol: Optional[str] = None):
     model = body.get("model") if isinstance(body, dict) else None
     stream = body.get("stream") if isinstance(body, dict) else None
-    print(f"[CPA HIT] path={path} model={model} stream={stream}")
+    protocol_name = protocol or {
+        "/v1/chat/completions": "openai_chat_completions",
+        "/v1/responses": "openai_responses",
+        "/v1/messages": "claude_messages",
+    }.get(path, "unknown")
+    logger.info("[CPA HIT] protocol=%s path=%s model=%s stream=%s", protocol_name, path, model, stream)
 
 
 def should_pass_through_error(status_code: int) -> bool:
@@ -298,6 +315,15 @@ PERMANENT_KEY_FAILURE_KEYWORDS = [
     "用户被封禁",
     "账户被封禁",
 ]
+PERMANENT_ACCOUNT_INACTIVE_KEYWORDS = [
+    "user_inactive",
+    "user inactive",
+    "account_inactive",
+    "account inactive",
+    "用户未激活",
+    "账号未激活",
+    "账户未激活",
+]
 
 
 def collect_upstream_error_texts(response_data: Any) -> list[str]:
@@ -330,6 +356,8 @@ def is_permanent_key_failure(status_code: Optional[int], response_data: Any) -> 
     if not message:
         return False
     if any(keyword in message for keyword in PERMANENT_BALANCE_FAILURE_KEYWORDS):
+        return True
+    if any(keyword in message for keyword in PERMANENT_ACCOUNT_INACTIVE_KEYWORDS):
         return True
     if status_code in {401, 403, 404} and any(keyword in message for keyword in PERMANENT_KEY_FAILURE_KEYWORDS):
         return True
@@ -443,7 +471,7 @@ async def disable_failed_api_key(db: AsyncSession, api_key: Any, reason: str):
     if provider:
         pool_manager.reset_index(provider)
     reason_preview = str(reason or "").replace("\n", " ")[:180]
-    print(f"[CPA KEY DISABLED] api_key_id={api_key.id} provider={provider} reason={reason_preview}")
+    logger.warning(f"[CPA KEY DISABLED] api_key_id={api_key.id} provider={provider} reason={reason_preview}")
 
 
 import json as _json_module
@@ -470,7 +498,7 @@ async def migrate_bb_key_to_bbimg(db: AsyncSession, api_key: Any, reason: str):
     pool_manager.reset_index("bb")
     pool_manager.reset_index("bbimg")
     reason_preview = str(reason or "").replace("\n", " ")[:180]
-    print(f"[CPA KEY BB->BBIMG] api_key_id={api_key.id} reason={reason_preview}")
+    logger.warning(f"[CPA KEY BB->BBIMG] api_key_id={api_key.id} reason={reason_preview}")
 
 
 async def downgrade_key_weight(db: AsyncSession, api_key: Any, new_weight: int, reason: str):
@@ -482,7 +510,7 @@ async def downgrade_key_weight(db: AsyncSession, api_key: Any, new_weight: int, 
     if provider:
         pool_manager.reset_index(provider)
     reason_preview = str(reason or "").replace("\n", " ")[:180]
-    print(f"[CPA KEY DOWNGRADED] api_key_id={api_key.id} provider={provider} new_weight={new_weight} reason={reason_preview}")
+    logger.warning(f"[CPA KEY DOWNGRADED] api_key_id={api_key.id} provider={provider} new_weight={new_weight} reason={reason_preview}")
 
 
 async def handle_permanent_key_failure(
@@ -533,7 +561,7 @@ async def handle_permanent_key_failure(
                 pool_manager.reset_index(current_provider)
                 if to_provider:
                     pool_manager.reset_index(to_provider)
-                print(f"[CPA KEY MIGRATED] api_key_id={api_key.id} {current_provider}->{to_provider} remaining={remaining}")
+                logger.warning(f"[CPA KEY MIGRATED] api_key_id={api_key.id} {current_provider}->{to_provider} remaining={remaining}")
                 return True
 
         # 通用降权/关闭规则
@@ -551,7 +579,11 @@ async def handle_permanent_key_failure(
     message = "\n".join(collect_upstream_error_texts(response_data)).lower()
     if not message:
         return False
-    if status_code in {401, 403, 404} and any(keyword in message for keyword in PERMANENT_KEY_FAILURE_KEYWORDS):
+    is_inactive_account = any(keyword in message for keyword in PERMANENT_ACCOUNT_INACTIVE_KEYWORDS)
+    is_invalid_key = status_code in {401, 403, 404} and any(
+        keyword in message for keyword in PERMANENT_KEY_FAILURE_KEYWORDS
+    )
+    if is_inactive_account or is_invalid_key:
         if sticky_session_key:
             pool_manager.clear_session_binding(sticky_session_key)
         reason = " | ".join(collect_upstream_error_texts(response_data))
@@ -713,7 +745,7 @@ async def forward_stream_with_retry(
     tried_key_ids = []
     last_status_code = 503
     last_response_headers = {}
-    last_response_body = {"error": {"message": "没有可用的 API Key"}}
+    last_response_body = {"error": {"message": "cpa_没有可用的 API Key"}}
 
     retry_count = 0
     disable_count = 0
@@ -733,10 +765,36 @@ async def forward_stream_with_retry(
             trace_ctx=trace_ctx,
         )
         if not api_key:
-            break
+            # 指定 provider 在"同 Key 重试"配置中且已拿到过上游响应时，清空排除列表重试同一 Key
+            _retry_same_providers = export_config.get("retry_same_key_providers") or []
+            _should_retry_same = (
+                tried_key_ids
+                and last_status_code != 503
+                and isinstance(_retry_same_providers, list)
+                and any(
+                    p.strip().lower() in [fp.strip().lower() for fp in (filter_providers or [])]
+                    for p in _retry_same_providers
+                    if p
+                )
+            )
+            if _should_retry_same:
+                logger.warning(f"[CPA STREAM RETRY SAME KEY] provider in retry_same_key_providers, clearing tried_key_ids to retry same key")
+                tried_key_ids.clear()
+                api_key = await select_api_key(
+                    db,
+                    model=model,
+                    sticky_session_key=sticky_session_key,
+                    tried_key_ids=tried_key_ids,
+                    filter_providers=filter_providers or None,
+                    filter_key_name=filter_key_name,
+                    exclude_providers=service_unavailable_providers or None,
+                    trace_ctx=trace_ctx,
+                )
+            if not api_key:
+                break
 
         tried_key_ids.append(api_key.id)
-        print(f"[CPA STREAM RETRY] retry={retry_count} disable={disable_count} api_key_id={api_key.id} model={model} path={path}")
+        logger.warning(f"[CPA STREAM RETRY] retry={retry_count} disable={disable_count} api_key_id={api_key.id} model={model} path={path}")
 
         upstream_body, upstream_model = await build_upstream_body_for_key(db, api_key, body, model, filter_providers or None)
 
@@ -814,7 +872,7 @@ async def forward_stream_with_retry(
             pool_manager.mark_key_cooldown(api_key.id, pool_manager.get_cooldown_seconds_for_status(503))
             if sticky_session_key:
                 pool_manager.clear_session_binding(sticky_session_key)
-            print(f"[CPA SERVICE UNAVAILABLE SWITCH] api_key_id={api_key.id} provider={provider} excluded_providers={service_unavailable_providers}")
+            logger.warning(f"[CPA SERVICE UNAVAILABLE SWITCH] api_key_id={api_key.id} provider={provider} excluded_providers={service_unavailable_providers}")
             if len(service_unavailable_providers) >= SERVICE_UNAVAILABLE_BYPASS_LIMIT:
                 break
             continue
@@ -864,7 +922,7 @@ async def forward_stream_with_retry(
                 filter_providers or None,
             )
             auto_continue_used = True
-            print(f"[CPA STREAM SAME KEY CONTINUE] api_key_id={api_key.id} provider={getattr(api_key, 'provider', None)} model={model} path={path}")
+            logger.warning(f"[CPA STREAM SAME KEY CONTINUE] api_key_id={api_key.id} provider={getattr(api_key, 'provider', None)} model={model} path={path}")
             auto_continue_attempt_started_at = time.perf_counter()
             status_code, response_headers, stream_response, retryable = await stream_fn(
                 db=db,
@@ -925,7 +983,7 @@ async def forward_stream_with_retry(
         if should_cooldown_key(status_code):
             cooldown_seconds = pool_manager.get_cooldown_seconds_for_status(status_code)
             pool_manager.mark_key_cooldown(api_key.id, cooldown_seconds)
-            print(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
+            logger.warning(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
 
         if not retryable:
             _trace_attempt(
@@ -1021,7 +1079,7 @@ async def forward_request_with_retry(
     tried_key_ids = []
     last_status_code = 503
     last_response_headers = {}
-    last_response_body = {"error": {"message": "没有可用的 API Key"}}
+    last_response_body = {"error": {"message": "cpa_没有可用的 API Key"}}
 
     retry_count = 0          # 非永久失败的重试次数
     disable_count = 0        # 永久失败禁用 Key 的次数
@@ -1041,10 +1099,36 @@ async def forward_request_with_retry(
             trace_ctx=trace_ctx,
         )
         if not api_key:
-            break
+            # 指定 provider 在"同 Key 重试"配置中且已拿到过上游响应时，清空排除列表重试同一 Key
+            _retry_same_providers = export_config.get("retry_same_key_providers") or []
+            _should_retry_same = (
+                tried_key_ids
+                and last_status_code != 503
+                and isinstance(_retry_same_providers, list)
+                and any(
+                    p.strip().lower() in [fp.strip().lower() for fp in (filter_providers or [])]
+                    for p in _retry_same_providers
+                    if p
+                )
+            )
+            if _should_retry_same:
+                logger.warning(f"[CPA REQUEST RETRY SAME KEY] provider in retry_same_key_providers, clearing tried_key_ids to retry same key")
+                tried_key_ids.clear()
+                api_key = await select_api_key(
+                    db,
+                    model=model,
+                    sticky_session_key=sticky_session_key,
+                    tried_key_ids=tried_key_ids,
+                    filter_providers=filter_providers or None,
+                    filter_key_name=filter_key_name,
+                    exclude_providers=service_unavailable_providers or None,
+                    trace_ctx=trace_ctx,
+                )
+            if not api_key:
+                break
 
         tried_key_ids.append(api_key.id)
-        print(f"[CPA REQUEST RETRY] retry={retry_count} disable={disable_count} api_key_id={api_key.id} model={model} path={path}")
+        logger.warning(f"[CPA REQUEST RETRY] retry={retry_count} disable={disable_count} api_key_id={api_key.id} model={model} path={path}")
         upstream_body, upstream_model = await build_upstream_body_for_key(db, api_key, body, model, filter_providers or None)
         attempt_started_at = time.perf_counter()
         status_code, response_headers, response_data = await proxy_service.forward_request(
@@ -1112,7 +1196,7 @@ async def forward_request_with_retry(
             pool_manager.mark_key_cooldown(api_key.id, pool_manager.get_cooldown_seconds_for_status(503))
             if sticky_session_key:
                 pool_manager.clear_session_binding(sticky_session_key)
-            print(f"[CPA SERVICE UNAVAILABLE SWITCH] api_key_id={api_key.id} provider={provider} excluded_providers={service_unavailable_providers}")
+            logger.warning(f"[CPA SERVICE UNAVAILABLE SWITCH] api_key_id={api_key.id} provider={provider} excluded_providers={service_unavailable_providers}")
             if len(service_unavailable_providers) >= SERVICE_UNAVAILABLE_BYPASS_LIMIT:
                 break
             continue
@@ -1162,7 +1246,7 @@ async def forward_request_with_retry(
                 filter_providers or None,
             )
             auto_continue_used = True
-            print(f"[CPA SAME KEY CONTINUE] api_key_id={api_key.id} provider={getattr(api_key, 'provider', None)} model={model} path={path}")
+            logger.warning(f"[CPA SAME KEY CONTINUE] api_key_id={api_key.id} provider={getattr(api_key, 'provider', None)} model={model} path={path}")
             auto_continue_attempt_started_at = time.perf_counter()
             status_code, response_headers, response_data = await proxy_service.forward_request(
                 db=db,
@@ -1243,7 +1327,7 @@ async def forward_request_with_retry(
                 filter_providers or None,
             )
             auto_continue_used = True
-            print(f"[CPA CLOUDFLARE 524 AUTO CONTINUE] api_key_id={api_key.id} provider={getattr(api_key, 'provider', None)} model={model} path={path}")
+            logger.warning(f"[CPA CLOUDFLARE 524 AUTO CONTINUE] api_key_id={api_key.id} provider={getattr(api_key, 'provider', None)} model={model} path={path}")
             auto_continue_attempt_started_at = time.perf_counter()
             status_code, response_headers, response_data = await proxy_service.forward_request(
                 db=db,
@@ -1303,7 +1387,7 @@ async def forward_request_with_retry(
         if should_cooldown_key(status_code):
             cooldown_seconds = pool_manager.get_cooldown_seconds_for_status(status_code)
             pool_manager.mark_key_cooldown(api_key.id, cooldown_seconds)
-            print(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
+            logger.warning(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
 
         # 透传错误：不重试，直接返回上游响应
         if should_pass_through_error(status_code):
@@ -1410,7 +1494,7 @@ async def forward_image_request_with_retry(
     tried_key_ids = []
     last_status_code = 503
     last_response_headers = {}
-    last_response_body = {"error": {"message": "没有可用的 API Key"}}
+    last_response_body = {"error": {"message": "cpa_没有可用的 API Key"}}
 
     for attempt in range(REQUEST_RETRY_LIMIT):
         api_key = await select_api_key(
@@ -1424,7 +1508,7 @@ async def forward_image_request_with_retry(
             break
 
         tried_key_ids.append(api_key.id)
-        print(f"[CPA IMAGE RETRY] attempt={attempt + 1} api_key_id={api_key.id} model={model} path={path}")
+        logger.warning(f"[CPA IMAGE RETRY] attempt={attempt + 1} api_key_id={api_key.id} model={model} path={path}")
         attempt_started_at = time.perf_counter()
         status_code, response_headers, response_data = await proxy_service.forward_image_request(
             db=db,
@@ -1499,7 +1583,7 @@ async def forward_image_request_with_retry(
         if should_cooldown_key(status_code):
             cooldown_seconds = pool_manager.get_cooldown_seconds_for_status(status_code)
             pool_manager.mark_key_cooldown(api_key.id, cooldown_seconds)
-            print(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
+            logger.warning(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
 
         # 透传错误：不重试，直接返回上游响应
         if should_pass_through_error(status_code):
@@ -1623,7 +1707,7 @@ async def verify_api_key(
         token = x_api_key
 
     if not token:
-        raise HTTPException(status_code=401, detail="缺少认证信息")
+        raise HTTPException(status_code=401, detail="cpa_缺少认证信息")
 
     # 优先检查 master key
     if token == settings.master_key:
@@ -1636,7 +1720,7 @@ async def verify_api_key(
     )
     user = result.scalar_one_or_none()
     if user is None:
-        raise HTTPException(status_code=403, detail="无效的 API Key")
+        raise HTTPException(status_code=403, detail="cpa_无效的 API Key")
 
     return {
         "auth_type": "user",
@@ -1662,7 +1746,7 @@ def _check_model_permission(auth_info: dict, model: str):
     # 去掉后缀后再检查
     model_base, _ = _strip_model_suffix(model)
     if model not in allowed and model_base not in allowed:
-        raise HTTPException(status_code=403, detail=f"您没有权限使用模型: {model}")
+        raise HTTPException(status_code=403, detail=f"cpa_您没有权限使用模型: {model}")
 
 
 def _parse_user_model_mapping(raw) -> dict:
@@ -1931,10 +2015,11 @@ async def _check_user_quota(auth_info: dict, db: AsyncSession):
                 detail={"error": {"code": "", "message": msg, "type": "new_api_error"}},
             )
         else:
-            msg = custom_message or f"已超出{period}用量限额（{used:,} / {limit:,} tokens）"
+            msg = custom_message or f"cpa_已超出{period}用量限额（{used:,} / {limit:,} tokens）"
             raise HTTPException(status_code=429, detail=msg)
 
-    from models import UsageLog
+    from models import UsageDailySummary, UsageLog
+    from services import usage_rollup_service
     from sqlalchemy import func
     from datetime import datetime, timedelta
 
@@ -1946,14 +2031,30 @@ async def _check_user_quota(auth_info: dict, db: AsyncSession):
         effective_start = start
         if quota_reset_at and quota_reset_at > start:
             effective_start = quota_reset_at
-        result = await db.execute(
-            select(func.coalesce(func.sum(UsageLog.total_tokens), 0)).where(
-                UsageLog.user_id == user_id,
-                UsageLog.request_time >= effective_start,
-                UsageLog.status == "success",
+
+        window = usage_rollup_service.split_time_range(0, effective_start, now)
+        total = 0
+        if window.summary_start and window.summary_end:
+            result = await db.execute(
+                select(func.coalesce(func.sum(UsageDailySummary.total_tokens), 0)).where(
+                    UsageDailySummary.user_id == user_id,
+                    UsageDailySummary.summary_date >= window.summary_start.date(),
+                    UsageDailySummary.summary_date <= window.summary_end.date(),
+                )
             )
-        )
-        return int(result.scalar() or 0)
+            total += int(result.scalar() or 0)
+
+        if window.realtime_start and window.realtime_end:
+            result = await db.execute(
+                select(func.coalesce(func.sum(UsageLog.total_tokens), 0)).where(
+                    UsageLog.user_id == user_id,
+                    UsageLog.request_time >= window.realtime_start,
+                    UsageLog.request_time <= window.realtime_end,
+                    UsageLog.status == "success",
+                )
+            )
+            total += int(result.scalar() or 0)
+        return total
 
     if daily_limit is not None:
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1992,7 +2093,7 @@ async def openai_chat_completions(
 
     model = body.get("model")
     if not model:
-        raise HTTPException(status_code=400, detail="缺少 model")
+        raise HTTPException(status_code=400, detail="cpa_缺少 model")
 
     _actual_model_for_check, _, _ = _parse_model_directive(model or "")
     _check_model_permission(auth_info, _actual_model_for_check)
@@ -2072,7 +2173,7 @@ async def openai_completions(
 
     model = body.get("model")
     if not model:
-        raise HTTPException(status_code=400, detail="缺少 model")
+        raise HTTPException(status_code=400, detail="cpa_缺少 model")
 
     # 解析 {provider} 指令，权限检查用实际模型名
     _actual_model_for_check, _, _ = _parse_model_directive(model)
@@ -2146,7 +2247,7 @@ async def openai_images_generations(
 
     model = body.get("model") if isinstance(body, dict) else None
     if not model:
-        raise HTTPException(status_code=400, detail="缺少 model")
+        raise HTTPException(status_code=400, detail="cpa_缺少 model")
 
     _actual_model_for_check, _, _ = _parse_model_directive(model or "")
     _check_model_permission(auth_info, _actual_model_for_check)
@@ -2180,7 +2281,7 @@ async def openai_images_edits(
     if isinstance(model, list):
         model = model[0] if model else None
     if not model:
-        raise HTTPException(status_code=400, detail="缺少 model")
+        raise HTTPException(status_code=400, detail="cpa_缺少 model")
 
     _check_model_permission(auth_info, str(model))
     await _check_user_quota(auth_info, db)
@@ -2228,6 +2329,8 @@ async def openai_models(
                 "pricing": {
                     "input": item.input_price,
                     "output": item.output_price,
+                    "cache_read": float(getattr(item, "cache_read_price", 0) or 0),
+                    "cache_write": float(getattr(item, "cache_write_price", 0) or 0),
                 },
                 "capabilities": {
                     "codex": item.supports_codex,
@@ -2255,7 +2358,7 @@ async def openai_embeddings(
 
     model = body.get("model")
     if not model:
-        raise HTTPException(status_code=400, detail="缺少 model")
+        raise HTTPException(status_code=400, detail="cpa_缺少 model")
 
     # 解析 {provider} 指令，权限检查用实际模型名
     _actual_model_for_check, _, _ = _parse_model_directive(model)
@@ -2305,7 +2408,7 @@ async def openai_responses(
 
     model = body.get("model")
     if not model:
-        raise HTTPException(status_code=400, detail="缺少 model")
+        raise HTTPException(status_code=400, detail="cpa_缺少 model")
 
     # 解析 {provider} 指令，权限检查用实际模型名
     _actual_model_for_check, _, _ = _parse_model_directive(model)
@@ -2325,13 +2428,90 @@ async def openai_responses(
         _dir_providers = []
         _dir_key = None
 
+    is_stream = body.get("stream", False)
+    user_id = auth_info.get("user_id")
+
+    # 支持原生 Responses 的模型按上游 base_url 探测能力；结果 10 天内复用
+    use_native_responses = False
+    native_key_name = None
+    if is_responses_capability_candidate(body.get("model")):
+        sticky_session_key = get_sticky_session_key(headers, body.get("model"))
+        candidate_key = await select_api_key(
+            db,
+            model=body.get("model"),
+            sticky_session_key=sticky_session_key,
+            tried_key_ids=[],
+            filter_providers=_dir_providers if _dir_providers else None,
+            filter_key_name=_dir_key,
+        )
+        if candidate_key:
+            candidate_body, candidate_model = await build_upstream_body_for_key(
+                db,
+                candidate_key,
+                body,
+                body.get("model"),
+                _dir_providers if _dir_providers else None,
+            )
+            capability = await responses_capability_service.resolve(
+                candidate_key,
+                candidate_model or body.get("model"),
+                proxy_service.probe_openai_responses_capability,
+            )
+            if capability is True:
+                use_native_responses = True
+                native_key_name = getattr(candidate_key, "name", None)
+
+    logger.info(
+        "[CPA RESPONSES ROUTE] model=%s native=%s upstream_key=%s",
+        body.get("model"),
+        use_native_responses,
+        native_key_name or "auto",
+    )
+    if use_native_responses:
+        if is_stream:
+            status_code, response_headers, stream_response, _selected_api_key = await forward_stream_with_retry(
+                db=db,
+                method="POST",
+                path="/v1/responses",
+                headers=headers,
+                body=body,
+                request=request,
+                user_id=user_id,
+                original_model=original_model,
+                force_providers=_dir_providers if _dir_providers else None,
+                force_key_name=native_key_name,
+            )
+            if status_code >= 400:
+                return JSONResponse(content=stream_response, status_code=status_code)
+            return StreamingResponse(
+                stream_response,
+                status_code=status_code,
+                media_type="text/event-stream",
+                headers=response_headers,
+            )
+
+        status_code, response_headers, response_data, _selected_api_key = await forward_request_with_retry(
+            db=db,
+            method="POST",
+            path="/v1/responses",
+            headers=headers,
+            body=body,
+            user_id=user_id,
+            original_model=original_model,
+            force_providers=_dir_providers if _dir_providers else None,
+            force_key_name=native_key_name,
+        )
+        return JSONResponse(
+            content=_restore_model_in_response(response_data, original_model),
+            status_code=status_code,
+            headers=response_headers,
+        )
+
+    # 不支持或暂时无法确认 Responses 时，保持原有 Chat Completions 转换
     try:
         chat_body = proxy_service.adapt_responses_request_to_chat(body)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-    is_stream = body.get("stream", False)
-    user_id = auth_info.get("user_id")
+        raise HTTPException(status_code=400, detail=f"cpa_{e}") from e
 
     if is_stream:
         status_code, response_headers, stream_response, _selected_api_key = await forward_stream_with_retry(
@@ -2374,6 +2554,37 @@ async def openai_responses(
 
 # ============ Claude 兼容接口 ============
 
+
+def _is_claude_messages_request(request: Request, body: dict) -> bool:
+    """依据 Claude Messages 专属请求头和字段识别根路径协议。"""
+    if request.headers.get("anthropic-version"):
+        return True
+    return any(field in body for field in ("system", "stop_sequences", "anthropic_version"))
+
+
+def _is_openai_responses_request(body: dict) -> bool:
+    """依据 OpenAI Responses 专属字段识别根路径协议。"""
+    return any(field in body for field in ("input", "instructions", "previous_response_id", "conversation", "background"))
+
+
+@router.post("/")
+async def root_chat_completions(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    auth_info: dict = Depends(verify_api_key),
+):
+    """根路径兼容入口，按请求体自动分流 OpenAI 或 Claude 协议。"""
+    body = await request.json()
+    if _is_claude_messages_request(request, body):
+        logger.info("[CPA ROOT ROUTE] protocol=claude_messages model=%s", body.get("model"))
+        return await claude_messages(request, db, auth_info)
+    if _is_openai_responses_request(body):
+        logger.info("[CPA ROOT ROUTE] protocol=openai_responses model=%s", body.get("model"))
+        return await openai_responses(request, db, auth_info)
+    logger.info("[CPA ROOT ROUTE] protocol=openai_chat_completions model=%s", body.get("model"))
+    return await openai_chat_completions(request, db, auth_info)
+
+
 @router.post("/v1/messages")
 async def claude_messages(
     request: Request,
@@ -2390,7 +2601,7 @@ async def claude_messages(
 
     model = body.get("model")
     if not model:
-        raise HTTPException(status_code=400, detail="缺少 model")
+        raise HTTPException(status_code=400, detail="cpa_缺少 model")
 
     # 解析 {provider} 指令，权限检查用实际模型名
     _actual_model_for_check, _, _ = _parse_model_directive(model)
@@ -2572,7 +2783,7 @@ async def generic_proxy(
 
     model = body.get("model") if body else None
     if not model:
-        raise HTTPException(status_code=400, detail="缺少 model")
+        raise HTTPException(status_code=400, detail="cpa_缺少 model")
 
     _actual_model_for_check, _, _ = _parse_model_directive(model or "")
     _check_model_permission(auth_info, _actual_model_for_check)

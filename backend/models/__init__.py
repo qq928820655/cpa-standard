@@ -11,6 +11,8 @@ from .provider_model_mapping import ProviderModelMapping
 from .content_guard_event import ContentGuardEvent
 from .openai_plus_account import OpenAIPlusAccount
 from .openai_plus_usage_log import OpenAIPlusUsageLog
+from .grok_account import GrokAccount
+from .grok_usage_log import GrokUsageLog
 from .proxy_trace import ProxyTrace
 from .usage import UsageLog, UsageDailySummary
 from .admin_user import AdminUser
@@ -30,6 +32,8 @@ __all__ = [
     "ContentGuardEvent",
     "OpenAIPlusAccount",
     "OpenAIPlusUsageLog",
+    "GrokAccount",
+    "GrokUsageLog",
     "ProxyTrace",
     "UsageLog",
     "UsageDailySummary",

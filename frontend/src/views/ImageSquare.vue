@@ -1,6 +1,6 @@
 <template>
   <div class="image-square page-shell">
-    <div class="page-header">
+    <div v-if="!isMobile" class="page-header">
       <div class="page-header-main">
         <div class="page-kicker">Images</div>
         <h2 class="page-title"><a href="https://photofan.heabl.top/" target="_blank" rel="noopener noreferrer" class="title-hidden-link">光影世界</a></h2>
@@ -27,14 +27,14 @@
                 <el-option
                   v-for="item in imageModels"
                   :key="item.model"
-                  :label="`${item.display_name}（可用 Key：${item.available_key_count}，${formatRemainingImageCount(item.total_remaining_image_count)}）`"
+                  :label="showUserFilter ? `${item.display_name}（可用 Key：${item.available_key_count}，${formatRemainingImageCount(item.total_remaining_image_count)}）` : `${item.display_name}（${item.available_key_count > 0 ? '可用' : '暂无可用'}，${formatRemainingImageCount(item.total_remaining_image_count)}）`"
                   :value="item.model"
                 >
                   <div class="model-option">
                     <span>{{ item.display_name }}</span>
                     <div class="model-option-meta">
                       <el-tag :type="item.available_key_count > 0 ? 'success' : 'info'" size="small">
-                        {{ item.available_key_count }} 个可用 Key
+                        {{ showUserFilter ? `${item.available_key_count} 个可用 Key` : (item.available_key_count > 0 ? '可用' : '暂无可用') }}
                       </el-tag>
                       <el-tag type="info" size="small">
                         {{ formatRemainingImageCount(item.total_remaining_image_count) }}
@@ -43,6 +43,39 @@
                   </div>
                 </el-option>
               </el-select>
+            </el-form-item>
+
+            <el-form-item label="提供商 / Key" class="source-field">
+              <el-select
+                v-if="showUserFilter"
+                v-model="form.source"
+                filterable
+                clearable
+                placeholder="提供商 | Key（自动轮询）"
+              >
+                <el-option-group label="按提供商指定">
+                  <el-option
+                    v-for="provider in imageSourceProviders"
+                    :key="`provider:${provider}`"
+                    :label="provider"
+                    :value="`provider:${provider}`"
+                  />
+                </el-option-group>
+                <el-option-group label="按 Key 指定">
+                  <el-option
+                    v-for="item in keyStats"
+                    :key="`key:${item.api_key_id}`"
+                    :label="`${item.provider} | #${item.api_key_id} ${item.api_key_name}`"
+                    :value="`key:${item.api_key_id}`"
+                  />
+                </el-option-group>
+              </el-select>
+              <el-input
+                v-else
+                v-model="form.source"
+                clearable
+                placeholder="提供商，或 提供商|Key名称；留空自动轮询"
+              />
             </el-form-item>
 
             <el-form-item label="生成模式" class="mode-field">
@@ -144,7 +177,7 @@
                     fit="cover"
                     :preview-src-list="inputImagePreviewList"
                     :preview-teleported="true"
-                    :initial-index="index"
+                    @click="openMobilePreview(item.data_url || item.image_url)"
                     :zoom-rate="1.2"
                     :min-scale="0.2"
                     :max-scale="7"
@@ -160,29 +193,43 @@
           </el-form-item>
 
           <div class="param-grid">
-            <el-form-item label="尺寸">
-              <el-select v-model="form.size" filterable allow-create default-first-option placeholder="选择或输入尺寸">
-                <el-option-group
-                  v-for="group in sizeOptionGroups"
-                  :key="group.label"
-                  :label="group.label"
-                >
+            <el-form-item :label="isGrokImagineModel ? '比例' : '尺寸'">
+              <el-select v-model="form.size" filterable allow-create default-first-option :placeholder="isGrokImagineModel ? '选择画面比例' : '选择或输入尺寸'">
+                <template v-if="isGrokImagineModel">
                   <el-option
-                    v-for="item in group.options"
+                    v-for="item in grokAspectRatioOptions"
                     :key="item.value"
                     :value="item.value"
                     :label="item.label"
+                  />
+                </template>
+                <template v-else>
+                  <el-option-group
+                    v-for="group in sizeOptionGroups"
+                    :key="group.label"
+                    :label="group.label"
                   >
-                    <div class="size-option">
-                      <span>{{ item.label }}</span>
-                      <span>{{ item.scene }}</span>
-                    </div>
-                  </el-option>
-                </el-option-group>
+                    <el-option
+                      v-for="item in group.options"
+                      :key="item.value"
+                      :value="item.value"
+                      :label="item.label"
+                    >
+                      <div class="size-option">
+                        <span>{{ item.label }}</span>
+                        <span>{{ item.scene }}</span>
+                      </div>
+                    </el-option>
+                  </el-option-group>
+                </template>
               </el-select>
             </el-form-item>
-            <el-form-item label="质量">
-              <el-select v-model="form.quality" placeholder="质量">
+            <el-form-item :label="isGrokImagineModel ? '分辨率' : '质量'">
+              <el-select v-if="isGrokImagineModel" v-model="form.resolution" placeholder="分辨率">
+                <el-option value="1k" label="1K" />
+                <el-option value="2k" label="2K" />
+              </el-select>
+              <el-select v-else v-model="form.quality" placeholder="质量">
                 <el-option value="auto" label="auto" />
                 <el-option value="low" label="low" />
                 <el-option value="medium" label="medium" />
@@ -223,18 +270,26 @@
               <div>
                 <div class="panel-title">可用模型</div>
               </div>
+              <div class="model-header-actions">
+                <el-button v-if="showUserFilter" :icon="Plus" circle title="新增生图模型" @click="imageModelDialogVisible = true" />
+                <el-button v-if="isMobile" :icon="Refresh" circle :loading="loadingModels" title="刷新" @click="loadAll" />
+                <el-button v-if="isMobile" link type="primary" @click="modelsCollapsed = !modelsCollapsed">
+                  {{ modelsCollapsed ? '展开' : '折叠' }}
+                </el-button>
+              </div>
             </div>
           </template>
-          <div class="model-list" v-loading="loadingModels">
+          <div v-show="!isMobile || !modelsCollapsed" class="model-list" v-loading="loadingModels">
             <div v-for="item in imageModels" :key="item.model" class="model-list-item" :class="{ 'is-active': form.model === item.model }" @click="selectModel(item.model)">
               <div>
                 <div class="model-name">{{ item.display_name }}</div>
                 <div class="model-id">{{ item.model }}</div>
               </div>
               <div class="model-capacity">
-                <el-button link type="primary" @click.stop="openModelKeys(item)">
+                <el-button v-if="showUserFilter" link type="primary" @click.stop="openModelKeys(item)">
                   {{ item.available_key_count }} Key
                 </el-button>
+                <span v-else class="model-capacity__status">{{ item.available_key_count > 0 ? '可用' : '暂无可用' }}</span>
                 <span>{{ formatRemainingImageCount(item.total_remaining_image_count) }}</span>
               </div>
             </div>
@@ -289,35 +344,23 @@
         <div v-if="successResults.length" class="image-grid">
           <div v-for="item in successResults" :key="item.id" class="image-card">
             <div v-if="isImageToImageTask(currentTask) && getFirstInputImageUrl(currentTask)" class="image-pair">
-              <el-image
-                class="image-pair-input"
+              <img
+                class="image-pair-input image-preview-trigger"
                 :src="getFirstInputImageUrl(currentTask)"
-                fit="cover"
-                :preview-src-list="[getFirstInputImageUrl(currentTask)]"
-                :preview-teleported="true"
+                @click="openMobilePreview(getFirstInputImageUrl(currentTask))"
               />
               <span class="image-pair-arrow">-&gt;</span>
-              <el-image
-                class="image-pair-output"
+              <img
+                class="image-pair-output image-preview-trigger"
                 :src="imageSrc(item)"
-                fit="cover"
-                :preview-src-list="previewImages"
-                :preview-teleported="true"
-                :zoom-rate="1.2"
-                :min-scale="0.2"
-                :max-scale="7"
+                @click="openMobilePreview(imageSrc(item))"
               />
             </div>
-            <el-image
+            <img
               v-else
-              class="image-preview"
+              class="image-preview image-preview-trigger"
               :src="imageSrc(item)"
-              fit="cover"
-              :preview-src-list="previewImages"
-              :preview-teleported="true"
-              :zoom-rate="1.2"
-              :min-scale="0.2"
-              :max-scale="7"
+              @click="openMobilePreview(imageSrc(item))"
             />
             <div class="image-card-footer">
               <div class="image-card-info">
@@ -342,10 +385,25 @@
       <el-collapse-item name="history">
         <template #title>
           <div class="collapse-title">
-            <div class="panel-title">历史记录</div>
+            <div class="history-title-row">
+              <div class="panel-title">历史记录</div>
+              <el-select
+                v-if="isMobile && showUserFilter"
+                v-model="userIdFilter"
+                class="history-user-filter"
+                placeholder="筛选用户"
+                clearable
+                filterable
+                size="small"
+                @click.stop
+                @change="() => { taskPage = 1; loadTasks() }"
+              >
+                <el-option v-for="item in userOptions" :key="item.id" :label="item.username" :value="item.id" />
+              </el-select>
+            </div>
             <div class="history-actions" @click.stop>
               <el-select
-                v-if="showUserFilter"
+                v-if="!isMobile && showUserFilter"
                 v-model="userIdFilter"
                 placeholder="筛选用户"
                 clearable
@@ -368,16 +426,105 @@
               >
                 批量删除
               </el-button>
-              <el-button @click.stop="openStorageDialog">存储位置</el-button>
+              <el-button v-if="showUserFilter" @click.stop="openStorageDialog">存储位置</el-button>
               <el-badge :value="pendingRefreshTaskIds.size" :hidden="!pendingRefreshTaskIds.size" class="polling-badge">
                 <el-button :disabled="!pendingRefreshTaskIds.size" @click.stop="openPollingDialog">轮询信息</el-button>
               </el-badge>
-              <el-button :loading="loadingTasks" @click.stop="loadTasks">刷新历史</el-button>
+              <el-button
+                v-if="isMobile"
+                :icon="Refresh"
+                circle
+                title="刷新历史"
+                :loading="loadingTasks"
+                @click.stop="loadTasks"
+              />
+              <el-button v-else :loading="loadingTasks" @click.stop="loadTasks">刷新历史</el-button>
             </div>
           </div>
         </template>
 
+        <!-- 窄屏：10 列历史表格改卡片流，详细字段折叠在「详情」里 -->
+        <div v-if="isMobile" class="task-card-list" v-loading="loadingTasks">
+          <div class="task-card-toolbar">
+            <el-checkbox :model-value="mobileAllTasksSelected" @change="toggleMobileSelectAllTasks">
+              全选本页
+            </el-checkbox>
+            <span class="task-card-toolbar__count">共 {{ taskTotal }} 条</span>
+          </div>
+
+          <div v-if="!tasks.length" class="task-card-empty">暂无数据</div>
+
+          <div
+            v-for="row in tasks"
+            :key="row.id"
+            class="task-card"
+            :class="{ 'is-selected': isTaskSelected(row) }"
+          >
+            <div class="task-card__head">
+              <el-checkbox :model-value="isTaskSelected(row)" @change="() => toggleTaskSelect(row)" />
+              <span class="task-card__model">{{ row.model || '-' }}</span>
+              <button type="button" class="task-card__toggle" @click="toggleTaskExpand(row.id)">
+                <span>{{ isTaskExpanded(row.id) ? '收起' : '详情' }}</span>
+                <el-icon :class="{ 'is-open': isTaskExpanded(row.id) }"><ArrowDown /></el-icon>
+              </button>
+            </div>
+
+            <div class="task-card__tags">
+              <el-tag size="small" type="info">#{{ row.id }}</el-tag>
+              <el-tag :type="statusType(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
+              <el-tag :type="taskMode(row) === 'image_to_image' ? 'warning' : 'info'" size="small">
+                {{ taskModeLabel(row) }}
+              </el-tag>
+              <el-tag v-if="taskInputImageCount(row)" size="small" type="info">
+                参考图 {{ taskInputImageCount(row) }}
+              </el-tag>
+            </div>
+
+            <div class="task-card__prompt">{{ row.prompt || '-' }}</div>
+
+            <div v-show="isTaskExpanded(row.id)" class="task-card__rows">
+              <div class="task-card__row">
+                <span class="task-card__label">Key</span>
+                <span class="task-card__value">
+                  <el-button
+                    v-if="showUserFilter && row.api_key_id"
+                    link
+                    type="primary"
+                    class="key-name-link"
+                    @click="openImageKeyDetail(row.api_key_id)"
+                  >
+                    {{ row.api_key_name || `Key #${row.api_key_id}` }}
+                  </el-button>
+                  <span v-else>{{ row.api_key_name || (row.api_key_id ? `Key #${row.api_key_id}` : '-') }}</span>
+                </span>
+              </div>
+              <div class="task-card__row">
+                <span class="task-card__label">用时</span>
+                <span class="task-card__value">{{ formatDuration(row.duration_ms) }}</span>
+              </div>
+              <div class="task-card__row">
+                <span class="task-card__label">创建时间</span>
+                <span class="task-card__value">{{ formatTime(row.created_at) }}</span>
+              </div>
+            </div>
+
+            <div class="task-card__actions">
+              <el-button size="small" type="primary" @click="openTask(row.id)">查看</el-button>
+              <el-button v-if="row.status === 'success'" size="small" @click="editTaskImage(row)">调整</el-button>
+              <el-button
+                v-if="row.status === 'error' || row.status === 'running'"
+                size="small"
+                @click="openTaskUpstreamRefresh(row)"
+              >
+                ID取图
+              </el-button>
+              <el-button size="small" @click="reuseTaskPrompt(row)">引用</el-button>
+            </div>
+          </div>
+        </div>
+
         <el-table
+          v-else
           :data="tasks"
           stripe
           size="small"
@@ -404,7 +551,7 @@
           <el-table-column label="Key" width="112" show-overflow-tooltip>
             <template #default="{ row }">
               <el-button
-                v-if="row.api_key_id"
+                v-if="showUserFilter && row.api_key_id"
                 link
                 type="primary"
                 class="key-name-link"
@@ -412,7 +559,7 @@
               >
                 {{ row.api_key_name || `Key #${row.api_key_id}` }}
               </el-button>
-              <span v-else>{{ row.api_key_name || '-' }}</span>
+              <span v-else>{{ row.api_key_name || (row.api_key_id ? `Key #${row.api_key_id}` : '-') }}</span>
             </template>
           </el-table-column>
           <el-table-column prop="status" label="状态" width="64" align="center">
@@ -445,7 +592,8 @@
             :page-sizes="[10, 20, 50]"
             :total="taskTotal"
             small
-            layout="total, sizes, prev, pager, next"
+            :pager-count="isMobile ? 5 : 7"
+            :layout="isMobile ? 'prev, pager, next, sizes, total' : 'total, sizes, prev, pager, next'"
             @current-change="loadTasks"
             @size-change="handleTaskSizeChange"
           />
@@ -595,6 +743,34 @@
       </div>
     </el-dialog>
 
+    <el-dialog v-model="imageModelDialogVisible" title="新增生图模型" width="520px">
+      <el-form :model="imageModelForm" label-position="top">
+        <el-form-item label="模型 ID">
+          <el-input v-model="imageModelForm.model" placeholder="例如：my-image-model" />
+        </el-form-item>
+        <el-form-item label="显示名称">
+          <el-input v-model="imageModelForm.display_name" placeholder="例如：My Image Model" />
+        </el-form-item>
+        <el-form-item label="提供商">
+          <el-input v-model="imageModelForm.provider" placeholder="例如：openai" />
+        </el-form-item>
+        <el-form-item label="请求格式">
+          <el-checkbox-group v-model="imageModelForm.request_formats">
+            <el-checkbox label="images">Images</el-checkbox>
+            <el-checkbox label="chat">Chat</el-checkbox>
+            <el-checkbox label="responses">Responses</el-checkbox>
+          </el-checkbox-group>
+        </el-form-item>
+        <el-form-item label="单次最大数量">
+          <el-input-number v-model="imageModelForm.max_count" :min="1" :max="4" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="imageModelDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="creatingImageModel" @click="submitImageModel">新增</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="storageDialogVisible" title="图片存储位置" width="680px">
       <div class="storage-dialog">
         <el-alert title="存储位置只影响后续新生成图片，不会迁移历史图片文件。" type="info" show-icon :closable="false" />
@@ -618,7 +794,7 @@
       @closed="handleImageKeyDetailDialogClosed"
     >
       <div v-loading="imageKeyDetailLoading" class="key-detail-dialog">
-        <el-descriptions :column="2" border>
+        <el-descriptions :column="isMobile ? 1 : 2" border>
           <el-descriptions-item label="Key ID">{{ imageKeyDetail.id || '-' }}</el-descriptions-item>
           <el-descriptions-item label="名称">
             <span>{{ imageKeyDetail.name || '-' }}</span>
@@ -787,36 +963,24 @@
         <div class="image-grid detail-images">
           <div v-for="item in detailTask.results" :key="item.id" class="image-card">
             <div v-if="imageSrc(item) && isImageToImageTask(detailTask) && getFirstInputImageUrl(detailTask)" class="image-pair">
-              <el-image
-                class="image-pair-input"
+              <img
+                class="image-pair-input image-preview-trigger"
                 :src="getFirstInputImageUrl(detailTask)"
-                fit="cover"
-                :preview-src-list="[getFirstInputImageUrl(detailTask)]"
-                :preview-teleported="true"
+                @click="openMobilePreview(getFirstInputImageUrl(detailTask))"
               />
               <span class="image-pair-arrow">-&gt;</span>
-              <el-image
-                class="image-pair-output"
+              <img
+                class="image-pair-output image-preview-trigger"
                 :src="imageSrc(item)"
-                fit="cover"
-                :preview-src-list="detailPreviewImages"
-                :preview-teleported="true"
-                :zoom-rate="1.2"
-                :min-scale="0.2"
-                :max-scale="7"
+                @click="openMobilePreview(imageSrc(item))"
               />
             </div>
-            <el-image
-                v-else-if="imageSrc(item)"
-                class="image-preview"
-                :src="imageSrc(item)"
-                fit="cover"
-                :preview-src-list="detailPreviewImages"
-                :preview-teleported="true"
-                :zoom-rate="1.2"
-                :min-scale="0.2"
-                :max-scale="7"
-              />
+            <img
+              v-else-if="imageSrc(item)"
+              class="image-preview image-preview-trigger"
+              :src="imageSrc(item)"
+              @click="openMobilePreview(imageSrc(item))"
+            />
             <div v-else class="error-box">{{ item.error_detail || '无图片结果' }}</div>
             <div class="detail-image-info">
               <div class="image-card-footer">
@@ -833,9 +997,17 @@
                 <div><span>尺寸：</span>{{ imageSizeText(item) }}</div>
                 <div><span>大小：</span>{{ item.file_size_bytes ? formatFileSize(item.file_size_bytes) : '-' }}</div>
                 <div><span>用时：</span>{{ formatDuration(item.duration_ms) }}</div>
-                <div class="local-path" :title="item.local_path || ''"><span>本地：</span>{{ item.local_path || '未保存到本地' }}</div>
+                <button
+                  v-if="showUserFilter"
+                  type="button"
+                  class="local-path"
+                  :title="item.local_path || ''"
+                  @click="showLocalPath(item.local_path)"
+                >
+                  <span>本地：</span>{{ item.local_path || '未保存到本地' }}
+                </button>
               </div>
-              <div v-if="item.local_path" class="local-file-actions">
+              <div v-if="showUserFilter && item.local_path" class="local-file-actions">
                 <el-button size="small" @click="openResultFolder(item)">打开文件夹</el-button>
                 <el-button size="small" type="primary" @click="revealResultFile(item)">定位文件</el-button>
               </div>
@@ -905,17 +1077,60 @@
         <el-button type="danger" :disabled="!pendingRefreshTaskIds.size" @click="stopAllPendingRefresh">全部停止</el-button>
       </template>
     </el-dialog>
+
+    <div
+      v-if="mobilePreviewVisible"
+      class="mobile-image-viewer"
+      @click.self="closeMobilePreview"
+      @pointerdown="handlePreviewPointerDown"
+      @pointermove="handlePreviewPointerMove"
+      @pointerup="handlePreviewPointerUp"
+      @pointercancel="handlePreviewPointerUp"
+    >
+      <div class="mobile-image-viewer__toolbar">
+        <span>双指缩放，单指拖动</span>
+        <el-button link type="primary" @click="resetMobilePreview">复位</el-button>
+        <el-button link type="primary" @click="closeMobilePreview">关闭</el-button>
+      </div>
+      <img
+        :src="mobilePreviewSrc"
+        class="mobile-image-viewer__image"
+        :style="{ transform: `translate(${mobilePreviewOffset.x}px, ${mobilePreviewOffset.y}px) scale(${mobilePreviewScale})` }"
+        draggable="false"
+        @dblclick="resetMobilePreview"
+      />
+    </div>
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { View } from '@element-plus/icons-vue'
+import { ArrowDown, Plus, Refresh, View } from '@element-plus/icons-vue'
 import { adminApi, authApi, copyText } from '../api'
+
+// 手机竖屏改用卡片流，桌面端保持原表格
+const MOBILE_QUERY = '(max-width: 768px)'
+const isMobile = ref(false)
+let mobileMediaQuery = null
+const syncMobile = (event) => {
+  isMobile.value = event.matches
+}
+
+// 历史记录卡片的详细字段按需展开
+const expandedTaskIds = ref(new Set())
+const isTaskExpanded = (id) => expandedTaskIds.value.has(Number(id))
+const toggleTaskExpand = (id) => {
+  const next = new Set(expandedTaskIds.value)
+  const key = Number(id)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedTaskIds.value = next
+}
 
 const imageModels = ref([])
 const keyStats = ref([])
+const imageSourceProviders = computed(() => Array.from(new Set(keyStats.value.map((item) => item.provider).filter(Boolean))))
 const modelKeyRows = ref([])
 const modelKeyFilters = reactive({
   names: '',
@@ -926,6 +1141,15 @@ const tasks = ref([])
 const currentTask = ref(null)
 const detailTask = ref(null)
 const detailVisible = ref(false)
+const imageModelDialogVisible = ref(false)
+const creatingImageModel = ref(false)
+const imageModelForm = reactive({
+  model: '',
+  display_name: '',
+  provider: 'openai',
+  request_formats: ['images'],
+  max_count: 1,
+})
 const storageDialogVisible = ref(false)
 const savingStorage = ref(false)
 const storageForm = reactive({
@@ -951,6 +1175,7 @@ const imageKeyDetailBalance = ref(null)
 const imageKeyDetailBalanceLoading = ref(false)
 const imageKeyDetailToggling = ref(false)
 const loadingModels = ref(false)
+const modelsCollapsed = ref(true)
 const loadingStats = ref(false)
 const loadingModelKeys = ref(false)
 const loadingTasks = ref(false)
@@ -1046,14 +1271,29 @@ const imageModeOptions = [
 
 const form = reactive({
   model: '',
+  source: '',
   prompt: '',
   size: 'auto',
   quality: 'high',
+  resolution: '1k',
   count: 1,
   request_format: 'images',
   mode: 'text_to_image',
   input_images: [],
 })
+
+const grokAspectRatioOptions = [
+  { value: 'auto', label: 'auto · 自动' },
+  { value: '1:1', label: '1:1 · 方图' },
+  { value: '16:9', label: '16:9 · 横屏' },
+  { value: '9:16', label: '9:16 · 竖屏' },
+  { value: '4:3', label: '4:3 · 横图' },
+  { value: '3:4', label: '3:4 · 竖图' },
+  { value: '3:2', label: '3:2 · 摄影横图' },
+  { value: '2:3', label: '2:3 · 摄影竖图' },
+  { value: '2:1', label: '2:1 · 横幅' },
+  { value: '1:2', label: '1:2 · 竖幅' },
+]
 
 const sizeOptionGroups = [
   {
@@ -1350,6 +1590,7 @@ const promptTipGroups = [
 ]
 
 const selectedModel = computed(() => imageModels.value.find((item) => item.model === form.model))
+const isGrokImagineModel = computed(() => String(form.model || '').startsWith('grok-imagine-image'))
 const requestFormatOptions = computed(() => selectedModel.value?.request_formats?.length ? selectedModel.value.request_formats : ['images', 'chat'])
 const maxCount = computed(() => Math.max(1, Number(selectedModel.value?.max_count || 1)))
 const successResults = computed(() => (currentTask.value?.results || []).filter((item) => item.status === 'success' && imageSrc(item)))
@@ -1389,6 +1630,134 @@ const replaceResultInTask = (task, result) => {
 const updateResultState = (result) => {
   replaceResultInTask(currentTask.value, result)
   replaceResultInTask(detailTask.value, result)
+}
+
+const mobilePreviewVisible = ref(false)
+const mobilePreviewSrc = ref('')
+const mobilePreviewScale = ref(1)
+const mobilePreviewOffset = reactive({ x: 0, y: 0 })
+let previewTouchState = null
+
+const resetMobilePreview = () => {
+  mobilePreviewScale.value = 1
+  mobilePreviewOffset.x = 0
+  mobilePreviewOffset.y = 0
+}
+
+const openMobilePreview = (src) => {
+  if (!src) return
+  mobilePreviewSrc.value = src
+  resetMobilePreview()
+  mobilePreviewVisible.value = true
+}
+
+const closeMobilePreview = () => {
+  mobilePreviewVisible.value = false
+  mobilePreviewSrc.value = ''
+  previewTouchState = null
+  previewPointers.clear()
+  previewGestureState = null
+  previewLastTapAt = 0
+}
+
+const previewPointers = new Map()
+let previewGestureState = null
+let previewLastTapAt = 0
+
+const getPointerDistance = () => {
+  const points = [...previewPointers.values()]
+  if (points.length < 2) return 0
+  return Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y)
+}
+
+const toggleMobilePreviewZoom = () => {
+  if (mobilePreviewScale.value > 1) {
+    resetMobilePreview()
+  } else {
+    mobilePreviewScale.value = 2.5
+  }
+}
+
+const handlePreviewPointerDown = (event) => {
+  event.currentTarget.setPointerCapture?.(event.pointerId)
+  previewPointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
+
+  if (previewPointers.size === 2) {
+    previewGestureState = {
+      type: 'pinch',
+      distance: getPointerDistance(),
+      scale: mobilePreviewScale.value,
+    }
+    return
+  }
+
+  if (previewPointers.size === 1) {
+    previewGestureState = {
+      type: 'drag',
+      x: event.clientX,
+      y: event.clientY,
+      offsetX: mobilePreviewOffset.x,
+      offsetY: mobilePreviewOffset.y,
+      moved: false,
+    }
+  }
+}
+
+const handlePreviewPointerMove = (event) => {
+  if (!previewPointers.has(event.pointerId)) return
+  previewPointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
+
+  if (previewPointers.size >= 2) {
+    if (!previewGestureState || previewGestureState.type !== 'pinch') {
+      previewGestureState = {
+        type: 'pinch',
+        distance: getPointerDistance(),
+        scale: mobilePreviewScale.value,
+      }
+    }
+    const distance = getPointerDistance()
+    if (previewGestureState.distance > 0) {
+      mobilePreviewScale.value = Math.min(6, Math.max(1, previewGestureState.scale * distance / previewGestureState.distance))
+    }
+    return
+  }
+
+  if (previewGestureState?.type === 'drag') {
+    const deltaX = event.clientX - previewGestureState.x
+    const deltaY = event.clientY - previewGestureState.y
+    if (Math.abs(deltaX) > 4 || Math.abs(deltaY) > 4) previewGestureState.moved = true
+    mobilePreviewOffset.x = previewGestureState.offsetX + deltaX
+    mobilePreviewOffset.y = previewGestureState.offsetY + deltaY
+  }
+}
+
+const handlePreviewPointerUp = (event) => {
+  const wasTap = previewGestureState?.type === 'drag' && !previewGestureState.moved
+  previewPointers.delete(event.pointerId)
+
+  if (wasTap && previewPointers.size === 0) {
+    const now = Date.now()
+    if (now - previewLastTapAt < 300) {
+      toggleMobilePreviewZoom()
+      previewLastTapAt = 0
+    } else {
+      previewLastTapAt = now
+    }
+  }
+
+  if (previewPointers.size === 1) {
+    const point = [...previewPointers.values()][0]
+    previewGestureState = {
+      type: 'drag',
+      x: point.x,
+      y: point.y,
+      offsetX: mobilePreviewOffset.x,
+      offsetY: mobilePreviewOffset.y,
+      moved: false,
+    }
+  } else if (!previewPointers.size) {
+    previewGestureState = null
+  }
 }
 
 const imageSrc = (item) => {
@@ -1537,7 +1906,14 @@ const selectModel = (model) => {
 }
 
 const handleModelChange = () => {
+  form.source = ''
   const opts = requestFormatOptions.value
+  if (isGrokImagineModel.value) {
+    form.size = grokAspectRatioOptions.some((item) => item.value === form.size) ? form.size : 'auto'
+    form.resolution = ['1k', '2k'].includes(form.resolution) ? form.resolution : '1k'
+  } else if (grokAspectRatioOptions.some((item) => item.value === form.size) && form.size !== 'auto') {
+    form.size = 'auto'
+  }
   if (!opts.includes(form.request_format)) {
     // 当前格式不在新模型支持列表里，重新选，优先 images
     form.request_format = opts.includes('images') ? 'images' : (opts[0] || 'images')
@@ -1658,12 +2034,48 @@ const loadModels = async () => {
     const res = await adminApi.getImageModels()
     imageModels.value = res.items || []
     if (!form.model && imageModels.value.length) {
-      const available = imageModels.value.find((item) => item.available_key_count > 0) || imageModels.value[0]
+      const available = imageModels.value.find((item) => item.model === 'gpt-image-2' && item.available_key_count > 0)
+        || imageModels.value.find((item) => item.available_key_count > 0)
+        || imageModels.value.find((item) => item.model === 'gpt-image-2')
+        || imageModels.value[0]
       form.model = available.model
       handleModelChange()
     }
   } finally {
     loadingModels.value = false
+  }
+}
+
+const submitImageModel = async () => {
+  const payload = {
+    model: imageModelForm.model.trim(),
+    display_name: imageModelForm.display_name.trim(),
+    provider: imageModelForm.provider.trim(),
+    request_formats: imageModelForm.request_formats,
+    max_count: imageModelForm.max_count,
+  }
+  if (!payload.model || !payload.display_name || !payload.provider || !payload.request_formats.length) {
+    ElMessage.warning('请完整填写模型信息并至少选择一种请求格式')
+    return
+  }
+
+  creatingImageModel.value = true
+  try {
+    const created = await adminApi.createImageModel(payload)
+    imageModelDialogVisible.value = false
+    imageModelForm.model = ''
+    imageModelForm.display_name = ''
+    imageModelForm.provider = 'openai'
+    imageModelForm.request_formats = ['images']
+    imageModelForm.max_count = 1
+    await loadModels()
+    form.model = created.model
+    handleModelChange()
+    ElMessage.success('生图模型已新增')
+  } catch (error) {
+    ElMessage.error(error.message || '新增生图模型失败')
+  } finally {
+    creatingImageModel.value = false
   }
 }
 
@@ -1677,6 +2089,10 @@ const loadImageCapabilities = async () => {
 }
 
 const loadKeyStats = async () => {
+  if (!showUserFilter.value) {
+    keyStats.value = []
+    return
+  }
   loadingStats.value = true
   try {
     const res = await adminApi.getImageKeyStats({ model: form.model || undefined })
@@ -1980,11 +2396,18 @@ const submitGeneration = async () => {
 
   stopTaskPolling()
   generating.value = true
+  const sourceValue = (form.source || '').trim()
+  const sourceProvider = showUserFilter.value && sourceValue.startsWith('provider:') ? sourceValue.slice(9) : undefined
+  const sourceKeyId = showUserFilter.value && sourceValue.startsWith('key:') ? Number(sourceValue.slice(4)) : undefined
   const payload = {
     model: form.model,
     prompt: form.prompt.trim(),
+    provider: sourceProvider,
+    api_key_id: Number.isInteger(sourceKeyId) ? sourceKeyId : undefined,
+    source: showUserFilter.value ? undefined : (sourceValue || undefined),
     size: form.size === 'auto' ? undefined : form.size,
     quality: form.quality,
+    resolution: isGrokImagineModel.value ? form.resolution : undefined,
     count: form.count,
     request_format: form.request_format,
     mode: form.mode,
@@ -2322,6 +2745,34 @@ const handleHistorySelectionChange = (rows) => {
   selectedHistoryTasks.value = rows || []
 }
 
+// 窄屏卡片列表复用同一份选择态，批量删除逻辑无需区分两端
+const isTaskSelected = (row) => selectedHistoryTasks.value.some((item) => item.id === row.id)
+
+const toggleTaskSelect = (row) => {
+  if (isTaskSelected(row)) {
+    selectedHistoryTasks.value = selectedHistoryTasks.value.filter((item) => item.id !== row.id)
+  } else {
+    selectedHistoryTasks.value = [...selectedHistoryTasks.value, row]
+  }
+}
+
+const mobileAllTasksSelected = computed(
+  () => tasks.value.length > 0 && tasks.value.every((row) => isTaskSelected(row))
+)
+
+const toggleMobileSelectAllTasks = () => {
+  selectedHistoryTasks.value = mobileAllTasksSelected.value ? [] : [...tasks.value]
+}
+
+// 窄屏卡片列表没有 el-table 的多选列，这里手工维护同一份选中态
+const selectedTaskIdSet = computed(() => new Set(selectedHistoryTasks.value.map((item) => Number(item.id))))
+const toggleMobileTaskSelect = (row) => {
+  const id = Number(row.id)
+  selectedHistoryTasks.value = selectedTaskIdSet.value.has(id)
+    ? selectedHistoryTasks.value.filter((item) => Number(item.id) !== id)
+    : [...selectedHistoryTasks.value, row]
+}
+
 const removeDeletedTasksFromHistory = (deletedIds) => {
   const deletedIdSet = new Set(deletedIds)
   tasks.value = tasks.value.filter((item) => !deletedIdSet.has(item.id))
@@ -2476,37 +2927,63 @@ const revealResultFile = async (item) => {
   }
 }
 
+const showLocalPath = async (path) => {
+  if (!path) return
+  await ElMessageBox.alert(path, '图片本地路径', {
+    confirmButtonText: '关闭',
+    customClass: 'local-path-dialog',
+  })
+}
+
 const copyToClipboard = async (value) => {
   await copyText(value)
   ElMessage.success('已复制')
 }
 
-const downloadImage = async (item) => {
-  if (!item?.id) return
-  let target = item
-  if (!target.local_path) {
-    setResultSaving(target.id, true)
-    try {
-      target = await adminApi.saveImageResultLocal(target.id)
-      updateResultState(target)
-      ElMessage.success('图片已保存到本地')
-    } catch (error) {
-      ElMessage.error(error.message || '保存图片到本地失败')
-      return
-    } finally {
-      setResultSaving(item.id, false)
-    }
+const saveBlobToDevice = async (blob, filename) => {
+  if (typeof window.showSaveFilePicker === 'function') {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: filename,
+      types: [{
+        description: '图片文件',
+        accept: { [blob.type || 'image/png']: [`.${filename.split('.').pop() || 'png'}`] },
+      }],
+    })
+    const writable = await handle.createWritable()
+    await writable.write(blob)
+    await writable.close()
+    return
   }
 
-  const src = imageSrc(target)
-  if (!src) return
+  const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
-  link.href = src
-  link.download = `image-task-${target.task_id}-${target.image_index}.png`
-  link.target = '_blank'
+  link.href = url
+  link.download = filename
   document.body.appendChild(link)
   link.click()
   document.body.removeChild(link)
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+const downloadImage = async (item) => {
+  if (!item?.id) return
+  const src = imageSrc(item)
+  if (!src) return
+
+  setResultSaving(item.id, true)
+  try {
+    const response = await fetch(src)
+    if (!response.ok) throw new Error('图片下载失败')
+    const blob = await response.blob()
+    const extension = blob.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png'
+    await saveBlobToDevice(blob, `image-task-${item.task_id}-${item.image_index}.${extension}`)
+  } catch (error) {
+    if (error?.name !== 'AbortError') {
+      ElMessage.error(error.message || '图片下载失败')
+    }
+  } finally {
+    setResultSaving(item.id, false)
+  }
 }
 
 const downloadPsd = async (item) => {
@@ -2530,14 +3007,7 @@ const downloadPsd = async (item) => {
   try {
     const response = await adminApi.downloadImageResultPsd(target.id)
     const blob = response instanceof Blob ? response : new Blob([response], { type: 'image/vnd.adobe.photoshop' })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = `image-result-${target.id}.psd`
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
-    URL.revokeObjectURL(url)
+    await saveBlobToDevice(blob, `image-result-${target.id}.psd`)
   } catch (error) {
     ElMessage.error(error.message || 'PSD 下载失败')
   } finally {
@@ -2563,6 +3033,9 @@ watch(requestFormatOptions, () => {
 })
 
 onMounted(() => {
+  mobileMediaQuery = window.matchMedia(MOBILE_QUERY)
+  isMobile.value = mobileMediaQuery.matches
+  mobileMediaQuery.addEventListener('change', syncMobile)
   loadAll()
   document.addEventListener('wheel', stopImageViewerPageScroll, { passive: false })
 })
@@ -2573,6 +3046,7 @@ onUnmounted(() => {
   if (historyRefreshTimer.value) {
     clearTimeout(historyRefreshTimer.value)
   }
+  mobileMediaQuery?.removeEventListener('change', syncMobile)
   document.removeEventListener('wheel', stopImageViewerPageScroll)
 })
 </script>
@@ -2679,6 +3153,50 @@ onUnmounted(() => {
   background-color: var(--cpa-primary);
 }
 
+.mobile-image-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 4000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: rgba(2, 8, 23, 0.96);
+  touch-action: none;
+}
+
+.mobile-image-viewer__toolbar {
+  position: absolute;
+  z-index: 1;
+  top: max(12px, env(safe-area-inset-top));
+  left: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 12px;
+}
+
+.mobile-image-viewer__toolbar span {
+  margin-right: auto;
+}
+
+.mobile-image-viewer__image {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+  transform-origin: center;
+  transition: transform 0.04s linear;
+}
+
+.image-preview-trigger {
+  cursor: zoom-in;
+}
 .polling-dialog-body {
   max-height: 440px;
   overflow-y: auto;
@@ -2742,7 +3260,7 @@ onUnmounted(() => {
 
 .model-mode-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(260px, 1.2fr) minmax(220px, 0.8fr) auto;
   gap: 12px;
   align-items: end;
 }
@@ -2794,11 +3312,31 @@ onUnmounted(() => {
 @media (max-width: 768px) {
   .model-mode-row {
     grid-template-columns: 1fr;
-    align-items: stretch;
+  }
+
+  /* 移动端只隐藏「提供商 / Key」标题，保留输入框（placeholder 已含说明） */
+  .source-field :deep(.el-form-item__label) {
+    display: none;
   }
 
   .mode-field {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
     min-width: 0;
+  }
+
+  .mode-field :deep(.el-form-item__label) {
+    margin-bottom: 0;
+    padding: 0;
+    height: auto;
+    line-height: normal;
+    white-space: nowrap;
+  }
+
+  .mode-field :deep(.el-form-item__content) {
+    flex: 1;
   }
 }
 
@@ -3516,9 +4054,27 @@ onUnmounted(() => {
 }
 
 .local-path {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+  text-align: left;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  cursor: pointer;
+}
+
+.local-path:hover {
+  color: var(--cpa-primary);
+}
+
+.local-path-dialog .el-message-box__message {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .local-file-actions {
@@ -3562,9 +4118,81 @@ onUnmounted(() => {
     grid-template-columns: 1fr;
   }
 
+  .param-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .collapse-title {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  /* 历史操作固定四列，刷新使用图标按钮 */
+  .history-title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+  }
+
+  .history-user-filter {
+    flex: 0 1 150px;
+    width: 150px;
+    min-width: 0;
+  }
+
+  .history-user-filter :deep(.el-select__wrapper) {
+    min-height: 32px;
+  }
+
+  .history-actions {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    flex: 0 0 auto;
+    width: 100%;
+    gap: 5px;
+  }
+
+  .history-actions :deep(.el-button),
+  .history-actions :deep(.polling-badge) {
+    width: 100%;
+    min-width: 0;
+    margin: 0;
+  }
+
+  .history-actions :deep(.el-button) {
+    padding-left: 5px;
+    padding-right: 5px;
+    font-size: 11px;
+  }
+
+  .history-actions :deep(.el-button.is-circle) {
+    width: 32px;
+    justify-self: center;
+  }
+
+  .history-actions :deep(.polling-badge .el-button) {
+    width: 100%;
+  }
+
+  .model-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .model-header-actions :deep(.el-button) {
+    margin-left: 0;
+  }
+
+  .model-header-actions :deep(.el-button.is-circle) {
+    width: 30px;
+    height: 30px;
+  }
+
+  .history-actions :deep(.el-select) {
+    margin-right: 0 !important;
   }
 
   .content-collapse :deep(.el-collapse-item__header) {
@@ -3580,5 +4208,134 @@ onUnmounted(() => {
   color: inherit;
   text-decoration: none;
   cursor: pointer;
+}
+
+/* ── 移动端：历史记录卡片流 ── */
+.task-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.task-card-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 2px 2px;
+  font-size: 12px;
+  color: var(--cpa-text-tertiary);
+}
+
+.task-card-empty {
+  padding: 24px 0;
+  text-align: center;
+  font-size: 12px;
+  color: var(--cpa-text-tertiary);
+}
+
+.task-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--cpa-border-soft, rgba(148, 163, 184, 0.24));
+  border-radius: 12px;
+  background: var(--cpa-surface, #fff);
+}
+
+.task-card.is-selected {
+  border-color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+}
+
+.task-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.task-card__model {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--cpa-text);
+}
+
+.task-card__toggle {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: 11px;
+  color: var(--cpa-text-tertiary);
+  cursor: pointer;
+}
+
+.task-card__toggle .el-icon {
+  transition: transform 0.2s;
+}
+
+.task-card__toggle .el-icon.is-open {
+  transform: rotate(180deg);
+}
+
+.task-card__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* 提示词可能很长，窄屏最多展示两行 */
+.task-card__prompt {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--cpa-text-secondary);
+  word-break: break-word;
+}
+
+.task-card__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--cpa-border-soft, rgba(148, 163, 184, 0.24));
+}
+
+.task-card__row {
+  display: grid;
+  grid-template-columns: 60px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.task-card__label {
+  color: var(--cpa-text-tertiary);
+}
+
+.task-card__value {
+  min-width: 0;
+  color: var(--cpa-text-secondary);
+  word-break: break-word;
+}
+
+.task-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--cpa-border-soft, rgba(148, 163, 184, 0.24));
 }
 </style>

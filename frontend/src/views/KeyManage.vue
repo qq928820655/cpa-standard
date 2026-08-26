@@ -5,7 +5,7 @@
         <div class="page-kicker">Keys</div>
         <h2 class="page-title">API Key 管理</h2>
       </div>
-      <div class="header-actions">
+      <div v-if="!isMobile" class="header-actions">
         <el-button class="header-action-wide" :loading="exportingAllKeys" @click="exportConfigs">导出配置</el-button>
         <el-button @click="importDialogVisible = true">一键导入</el-button>
         <el-button class="header-action-wide" :loading="batchChecking" @click="openCheckDialog">一键检测</el-button>
@@ -21,6 +21,25 @@
         <el-button :disabled="!selectedKeys.length" :loading="batchActiveSubmitting" @click="batchSetActive(false)">批量关闭</el-button>
         <el-button type="primary" @click="showAddDialog">新增key</el-button>
       </div>
+
+      <!-- 手机竖屏只留高频入口，其余收进下拉，避免按钮铺满半屏 -->
+      <div v-else class="header-actions header-actions--mobile">
+        <el-button size="small" type="primary" @click="showAddDialog">新增key</el-button>
+        <el-button size="small" :loading="batchChecking" @click="openCheckDialog">一键检测</el-button>
+        <el-button size="small" @click="showBatchDialog">keys调整</el-button>
+        <el-dropdown trigger="click">
+          <el-button size="small">更多<el-icon><ArrowDown /></el-icon></el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item @click="exportConfigs">导出配置</el-dropdown-item>
+              <el-dropdown-item @click="importDialogVisible = true">一键导入</el-dropdown-item>
+              <el-dropdown-item @click="showCooldownDialog">冷却设置</el-dropdown-item>
+              <el-dropdown-item :disabled="!selectedKeys.length" @click="batchClearCooldown">解除冷却</el-dropdown-item>
+              <el-dropdown-item :disabled="!selectedKeys.length" divided @click="confirmBatchDeleteSelectedKeys">一键删除</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+      </div>
     </div>
 
     <!-- 筛选 -->
@@ -31,7 +50,7 @@
             <div class="panel-title">筛选条件</div>
           </div>
           <div class="filter-header-actions">
-            <div class="filter-summary-text">
+            <div v-if="!isMobile" class="filter-summary-text">
               提供商 {{ filterProviders.length }} 项，模型 {{ filterModels.length }} 项，Key ID / 名称 {{ filterKeyIds.length + filterKeyNames.length }} 项，状态 {{ filterActiveLabel }}
             </div>
             <el-button link type="primary" @click="toggleFilters">
@@ -53,7 +72,7 @@
               clearable
               collapse-tags
               collapse-tags-tooltip
-              placeholder="筛选提供商（可多选）"
+              :placeholder="isMobile ? '提供商' : '筛选提供商（可多选）'"
               @change="() => { resetToFirstPage(); loadKeys() }"
             >
               <el-option
@@ -68,7 +87,7 @@
             <el-select
               v-model="filterActive"
               clearable
-              placeholder="筛选是否启用"
+              :placeholder="isMobile ? '状态' : '筛选是否启用'"
               @change="() => { resetToFirstPage(); loadKeys() }"
             >
               <el-option :value="true" label="已启用" />
@@ -80,10 +99,11 @@
               <el-input
                 v-model="filterProviderInput"
                 clearable
-                placeholder="快速输入提供商，使用英文逗号分隔"
+                :placeholder="isMobile ? '输入提供商' : '快速输入提供商，使用英文逗号分隔'"
                 @keyup.enter="applyFilterProviders"
               />
-              <el-button @click="applyFilterProviders">加入</el-button>
+              <el-button v-if="isMobile" :icon="Plus" title="加入提供商" @click="applyFilterProviders" />
+              <el-button v-else @click="applyFilterProviders">加入</el-button>
             </div>
           </div>
           <div class="filter-item quick-filter-item">
@@ -91,10 +111,11 @@
               <el-input
                 v-model="filterKeyIdsInput"
                 clearable
-                placeholder="输入 Key ID / 名称，支持中英文逗号分隔"
+                :placeholder="isMobile ? 'ID / 名称' : '输入 Key ID / 名称，支持中英文逗号分隔'"
                 @keyup.enter="applyFilterKeyIds"
               />
-              <el-button @click="applyFilterKeyIds">查询</el-button>
+              <el-button v-if="isMobile" :icon="Search" title="查询" @click="applyFilterKeyIds" />
+              <el-button v-else @click="applyFilterKeyIds">查询</el-button>
             </div>
           </div>
           <div class="filter-item">
@@ -107,7 +128,7 @@
               clearable
               collapse-tags
               collapse-tags-tooltip
-              placeholder="筛选模型（命中任一即可）"
+              :placeholder="isMobile ? '模型' : '筛选模型（命中任一即可）'"
               @change="() => { resetToFirstPage(); loadKeys() }"
             >
               <el-option
@@ -123,18 +144,146 @@
               <el-input
                 v-model="filterModelInput"
                 clearable
-                placeholder="快速输入模型，使用英文逗号分隔"
+                :placeholder="isMobile ? '输入模型' : '快速输入模型，使用英文逗号分隔'"
                 @keyup.enter="applyFilterModels"
               />
-              <el-button @click="applyFilterModels">加入</el-button>
+              <el-button v-if="isMobile" :icon="Plus" title="加入模型" @click="applyFilterModels" />
+              <el-button v-else @click="applyFilterModels">加入</el-button>
             </div>
           </div>
         </div>
       </div>
     </el-card>
 
-    <!-- Key 列表 -->
-    <div class="keys-table-sticky">
+    <!-- Key 列表：手机竖屏改用卡片流，桌面端保持原表格 -->
+    <div
+      v-if="isMobile"
+      class="key-card-list"
+      :class="{ 'has-selection-bar': selectedKeys.length > 0 }"
+      v-loading="loading"
+    >
+      <div class="key-card-toolbar">
+        <el-checkbox :model-value="mobileAllSelected" @change="toggleMobileSelectAll">
+          全选本页
+        </el-checkbox>
+        <span class="key-card-toolbar__count">共 {{ totalKeys }} 个</span>
+      </div>
+
+      <div v-if="!keysTableData.length" class="key-card-empty">暂无数据</div>
+
+      <div
+        v-for="row in keysTableData"
+        :key="row.id"
+        class="key-card"
+        :class="{ 'is-selected': selectedKeyIdSet.has(Number(row.id)) }"
+      >
+        <div class="key-card__head">
+          <el-checkbox
+            :model-value="selectedKeyIdSet.has(Number(row.id))"
+            @change="() => toggleMobileKeySelect(row)"
+          />
+          <button type="button" class="key-card__name" @click="openKeyDetail(row.id)">
+            {{ row.name }}
+          </button>
+          <button type="button" class="key-card__toggle" @click="toggleCardExpand(row.id)">
+            <span>{{ isCardExpanded(row.id) ? '收起' : '详情' }}</span>
+            <el-icon :class="{ 'is-open': isCardExpanded(row.id) }"><ArrowDown /></el-icon>
+          </button>
+          <el-switch v-model="row.is_active" :loading="row.toggling" @change="toggleKey(row)" />
+        </div>
+
+        <div class="key-card__tags">
+          <el-tag :type="getProviderType(row.provider)" size="small">{{ row.provider }}</el-tag>
+          <el-tag :type="getApiTypeTagType(row.api_type)" size="small">{{ getApiTypeLabel(row.api_type) }}</el-tag>
+          <el-tag size="small" type="info">#{{ row.id }}</el-tag>
+          <el-tag size="small" type="info">权重 {{ row.weight }}</el-tag>
+          <el-tag v-if="row.is_cooled_down" size="small" type="warning">
+            冷却 {{ formatCooldownSeconds(row.cooldown_remaining_seconds) }}
+          </el-tag>
+        </div>
+
+        <div v-show="isCardExpanded(row.id)" class="key-card__rows">
+          <div class="key-card__row">
+            <span class="key-card__label">API Key</span>
+            <code class="key-card__code">{{ row.api_key_masked }}</code>
+          </div>
+          <div class="key-card__row">
+            <span class="key-card__label">请求地址</span>
+            <span class="key-card__value">{{ row.base_url || '-' }}</span>
+          </div>
+          <div class="key-card__row">
+            <span class="key-card__label">支持模型</span>
+            <span class="key-card__value">
+              {{ row.supported_models?.length ? row.supported_models.join('、') : '全部模型' }}
+            </span>
+          </div>
+          <div class="key-card__row">
+            <span class="key-card__label">检测</span>
+            <span class="key-card__value">
+              <span v-if="row.check_state === 'checking'" class="check-result-pending">检测中...</span>
+              <template v-else-if="row.check_state === 'success'">
+                <span v-if="row.check_mode === 'balance'" class="check-result-success">
+                  ${{ Number(row.check_balance_usd || 0).toFixed(4) }}
+                </span>
+                <span v-else class="check-result-success">{{ formatCheckLatency(row.check_latency_ms) }}</span>
+              </template>
+              <el-button
+                v-else-if="row.check_state === 'error'"
+                type="danger"
+                link
+                class="check-result-link"
+                @click="showCheckFailureDetail(row)"
+              >
+                {{ getCheckFailureLabel(row.check_error_category) }}
+              </el-button>
+              <span v-else class="check-result-idle">-</span>
+            </span>
+          </div>
+        </div>
+
+        <div class="key-card__actions">
+          <el-button size="small" type="primary" @click="showEditDialog(row)">编辑</el-button>
+          <el-button
+            v-if="row.is_cooled_down"
+            size="small"
+            type="warning"
+            :loading="row.clearingCooldown"
+            @click="clearCooldown(row)"
+          >
+            解除冷却
+          </el-button>
+          <el-dropdown trigger="click">
+            <el-button size="small">更多</el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item @click="copyApiKey(row)">复制 Key</el-dropdown-item>
+                <el-dropdown-item @click="copyKeyConfig(row)">复制配置</el-dropdown-item>
+                <el-dropdown-item @click="duplicateKey(row)">复制记录</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+          <el-popconfirm title="确定删除此 Key？" @confirm="deleteKey(row)">
+            <template #reference>
+              <el-button size="small" type="danger">删除</el-button>
+            </template>
+          </el-popconfirm>
+        </div>
+      </div>
+
+      <div v-if="selectedKeys.length" class="key-card-selection-bar">
+        <span class="key-card-selection-bar__text">已选 {{ selectedKeys.length }} 个</span>
+        <el-button size="small" text @click="clearMobileSelection">取消</el-button>
+        <el-button size="small" :loading="batchActiveSubmitting" @click="batchSetActive(true)">启用</el-button>
+        <el-button size="small" :loading="batchActiveSubmitting" @click="batchSetActive(false)">关闭</el-button>
+        <el-popconfirm title="确定删除当前勾选的 Key？" @confirm="batchDeleteSelectedKeys">
+          <template #reference>
+            <el-button size="small" type="danger" :loading="batchDeleting">删除</el-button>
+          </template>
+        </el-popconfirm>
+      </div>
+    </div>
+
+    <div v-else class="keys-table-sticky">
       <el-card class="keys-table-card" shadow="never">
         <el-table
           ref="tableRef"
@@ -301,7 +450,9 @@
         v-model:page-size="pageSize"
         :page-sizes="pageSizeOptions"
         :total="totalKeys"
-        layout="total, sizes, prev, pager, next"
+        :small="isMobile"
+        :pager-count="isMobile ? 5 : 7"
+        :layout="isMobile ? 'prev, pager, next, sizes, total' : 'total, sizes, prev, pager, next'"
         @current-change="handlePageChange"
         @size-change="handlePageSizeChange"
       />
@@ -310,14 +461,15 @@
     <el-dialog v-model="importDialogVisible" title="一键导入 API Key" width="760px">
       <div class="import-actions">
         <el-button @click="fillImportTemplate">填充模板</el-button>
-        <input ref="importFileRef" type="file" accept=".txt,.json,.jsonl" class="hidden-input" @change="handleImportFile" />
+        <input ref="importFileRef" type="file" accept=".txt,.json,.jsonl" multiple class="hidden-input" @change="handleImportFile" />
         <el-button @click="openImportFile">选择文件</el-button>
       </div>
       <div class="form-tip">
-        支持粘贴多行 JSON，或导入 .txt / .json / .jsonl 文件；每行一个对象；也支持直接导入“导出全部”生成的文件。
+        支持粘贴多行 JSON，或导入 .txt / .json / .jsonl 文件（可多选）；每行一个对象；也支持直接导入“导出全部”生成的文件。大批量会自动分批提交。
       </div>
       <el-input v-model="importText" type="textarea" :rows="12" placeholder="粘贴多行 JSON 数据" />
       <template #footer>
+        <span v-if="importProgressText" class="import-progress">{{ importProgressText }}</span>
         <el-button @click="importDialogVisible = false">取消</el-button>
         <el-button type="primary" @click="submitImport" :loading="importing">导入</el-button>
       </template>
@@ -375,10 +527,29 @@
           <el-radio-group v-model="batchModelMode" class="batch-mode-group">
             <el-radio value="keep">不修改</el-radio>
             <el-radio value="append">追加指定模型</el-radio>
+            <el-radio value="remove">移除指定模型</el-radio>
             <el-radio value="replace">替换为指定模型</el-radio>
             <el-radio value="clear">清空为全部模型</el-radio>
           </el-radio-group>
         </el-form-item>
+        <el-form-item label="独立代理">
+          <el-radio-group v-model="batchProxyMode" class="batch-mode-group">
+            <el-radio value="keep">不修改</el-radio>
+            <el-radio value="enable">开启并设置</el-radio>
+            <el-radio value="disable">关闭并清空</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <template v-if="batchProxyMode === 'enable'">
+          <el-form-item label="代理地址">
+            <el-input v-model="batchProxyUrl" clearable placeholder="例如 http://127.0.0.1:17890" />
+          </el-form-item>
+          <el-form-item label="代理账号">
+            <el-input v-model="batchProxyUsername" clearable placeholder="可选，输入代理账号" />
+          </el-form-item>
+          <el-form-item label="代理密码">
+            <el-input v-model="batchProxyPassword" clearable show-password placeholder="可选，输入代理密码" />
+          </el-form-item>
+        </template>
         <el-form-item label="独立 fake IP">
           <el-radio-group v-model="batchFakeIpMode" class="batch-mode-group">
             <el-radio value="keep">不修改</el-radio>
@@ -400,7 +571,7 @@
           <el-input-number v-model="batchWeight" :min="0" :step="1" style="width: 100%" />
           <div class="form-tip">0 表示该 Key 保留在管理列表中，但不参与调度轮询。</div>
         </el-form-item>
-        <el-form-item v-if="batchModelMode === 'replace' || batchModelMode === 'append'" label="支持模型">
+        <el-form-item v-if="batchModelMode === 'replace' || batchModelMode === 'append' || batchModelMode === 'remove'" label="支持模型">
           <div class="model-select-wrap">
             <el-input
               v-model="batchModelKeyword"
@@ -425,7 +596,7 @@
               clearable
               collapse-tags
               collapse-tags-tooltip
-              :placeholder="batchModelMode === 'append' ? '选择要追加的支持模型' : '选择要替换成的支持模型'"
+              :placeholder="batchModelMode === 'append' ? '选择要追加的支持模型' : batchModelMode === 'remove' ? '选择要移除的支持模型' : '选择要替换成的支持模型'"
               style="width: 100%"
             >
               <el-option
@@ -682,10 +853,18 @@
     <el-dialog
       v-model="dialogVisible"
       :title="isEdit ? '编辑 API Key' : '添加 API Key'"
-      width="500px"
-      align-center
+      :width="isMobile ? '100%' : '500px'"
+      :fullscreen="isMobile"
+      :align-center="!isMobile"
+      :class="{ 'key-form-dialog--mobile': isMobile }"
     >
-      <el-form :model="form" :rules="rules" ref="formRef" label-width="100px">
+      <el-form
+        :model="form"
+        :rules="rules"
+        ref="formRef"
+        :label-width="isMobile ? 'auto' : '100px'"
+        :label-position="isMobile ? 'top' : 'right'"
+      >
         <el-form-item label="名称" prop="name">
           <el-input v-model="form.name" placeholder="输入名称标识" />
         </el-form-item>
@@ -830,7 +1009,7 @@
       @closed="handleKeyDetailDialogClosed"
     >
       <div v-loading="keyDetailLoading" class="key-detail-dialog">
-        <el-descriptions :column="2" border>
+        <el-descriptions :column="isMobile ? 1 : 2" border>
           <el-descriptions-item label="Key ID">{{ keyDetailData.id || '-' }}</el-descriptions-item>
           <el-descriptions-item label="名称">
             <span>{{ keyDetailData.name || '-' }}</span>
@@ -863,15 +1042,15 @@
             </el-button>
           </el-descriptions-item>
           <el-descriptions-item label="权重">{{ keyDetailData.weight ?? '-' }}</el-descriptions-item>
-          <el-descriptions-item label="总请求数">{{ Number(keyDetailSummary.total_requests || 0).toLocaleString('zh-CN') }}</el-descriptions-item>
-          <el-descriptions-item label="成功率">{{ getKeyDetailSuccessRate() }}%</el-descriptions-item>
-          <el-descriptions-item label="总 Token">{{ formatKeyDetailToken(keyDetailSummary.total_tokens) }}</el-descriptions-item>
-          <el-descriptions-item label="输入 Token">{{ formatKeyDetailToken(keyDetailSummary.prompt_tokens) }}</el-descriptions-item>
-          <el-descriptions-item label="缓存 Token">{{ formatKeyDetailToken(keyDetailSummary.cache_tokens) }}</el-descriptions-item>
-          <el-descriptions-item label="输出 Token">{{ formatKeyDetailToken(keyDetailSummary.completion_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="历史总请求数">{{ Number(keyDetailData.request_count || 0).toLocaleString('zh-CN') }}</el-descriptions-item>
+          <el-descriptions-item label="历史成功率">{{ getKeyDetailSuccessRate() }}%</el-descriptions-item>
+          <el-descriptions-item label="历史总 Token">{{ formatKeyDetailToken(keyDetailData.total_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="历史输入 Token">{{ formatKeyDetailToken(keyDetailData.prompt_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="历史缓存 Token">{{ formatKeyDetailToken(keyDetailData.cache_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="历史输出 Token">{{ formatKeyDetailToken(keyDetailData.completion_tokens) }}</el-descriptions-item>
           <el-descriptions-item label="平均上游耗时">{{ formatKeyDetailLatency(keyDetailSummary.avg_upstream_latency_ms) }}</el-descriptions-item>
           <el-descriptions-item label="CPA 额外耗时">{{ formatKeyDetailLatency(keyDetailSummary.avg_cpa_overhead_ms) }}</el-descriptions-item>
-          <el-descriptions-item label="账户余额" :span="2">
+          <el-descriptions-item label="账户余额" :span="isMobile ? 1 : 2">
             <span v-if="keyDetailBalanceLoading" style="color: #909399; font-size: 13px">查询中...</span>
             <span v-else-if="keyDetailBalance">
               <span style="color: #10b981; font-weight: 600">${{ keyDetailBalance.balance_usd.toFixed(4) }}</span>
@@ -937,8 +1116,8 @@
 
 <script setup>
 import { computed, ref, reactive, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
-import { ElMessage } from 'element-plus'
-import { View } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { View, ArrowDown, Plus, Search } from '@element-plus/icons-vue'
 import { adminApi, statsApi, copyText as copyTextUtil } from '../api'
 
 const KEY_MANAGE_STATE_STORAGE_KEY = 'keyManageViewState'
@@ -1021,6 +1200,7 @@ const isEdit = ref(false)
 const loading = ref(false)
 const submitting = ref(false)
 const importing = ref(false)
+const importProgressText = ref('')
 const exportingAllKeys = ref(false)
 const batchSubmitting = ref(false)
 const batchChecking = ref(false)
@@ -1042,6 +1222,10 @@ const batchScope = ref('filtered')
 const batchBaseUrl = ref('')
 const batchModelMode = ref('keep')
 const batchWeightMode = ref('keep')
+const batchProxyMode = ref('keep')
+const batchProxyUrl = ref('')
+const batchProxyUsername = ref('')
+const batchProxyPassword = ref('')
 const batchFakeIpMode = ref('keep')
 const batchApiTypeMode = ref('keep')
 const batchNewProvider = ref('')
@@ -1076,6 +1260,7 @@ const builtinProviderOptions = [
   { value: 'openai', label: 'OpenAI' },
   { value: 'claude', label: 'Claude' },
   { value: 'google', label: 'Google' },
+  { value: 'grok', label: 'Grok' },
   { value: 'xAI', label: 'xAI' },
   { value: 'deepseek', label: 'DeepSeek' },
   { value: 'qwen', label: 'Qwen' },
@@ -1116,6 +1301,7 @@ const defaultUrls = {
   openai: 'https://api.openai.com',
   claude: 'https://api.anthropic.com',
   google: 'https://generativelanguage.googleapis.com',
+  grok: 'https://api.x.ai',
   xAI: 'https://api.x.ai',
   deepseek: 'https://api.deepseek.com',
   qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
@@ -1822,6 +2008,8 @@ const hasBatchModelUpdate = () => batchModelMode.value !== 'keep'
 
 const hasBatchWeightUpdate = () => batchWeightMode.value === 'set'
 
+const hasBatchProxyUpdate = () => batchProxyMode.value !== 'keep'
+
 const hasBatchFakeIpUpdate = () => batchFakeIpMode.value !== 'keep'
 
 const submitBatchFakeIpUpdate = async () => {
@@ -2016,6 +2204,36 @@ const selectedKeyIdSet = computed(() => new Set(selectedKeyIds.value))
 const selectedKeys = computed(() => keys.value.filter((item) => selectedKeyIdSet.value.has(Number(item?.id))))
 
 const keysTableData = ref([])
+
+// 移动端卡片直接改 selectedKeyIds，批量操作沿用桌面端那套派生状态
+const toggleMobileKeySelect = (row) => {
+  const id = Number(row?.id)
+  if (!Number.isInteger(id) || id <= 0) return
+  const next = new Set(selectedKeyIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selectedKeyIds.value = Array.from(next)
+}
+
+const mobileAllSelected = computed(() => {
+  const rows = keysTableData.value
+  if (!rows.length) return false
+  return rows.every((row) => selectedKeyIdSet.value.has(Number(row?.id)))
+})
+
+const toggleMobileSelectAll = () => {
+  const pageIds = keysTableData.value
+    .map((row) => Number(row?.id))
+    .filter((id) => Number.isInteger(id) && id > 0)
+  const next = new Set(selectedKeyIds.value)
+  if (mobileAllSelected.value) pageIds.forEach((id) => next.delete(id))
+  else pageIds.forEach((id) => next.add(id))
+  selectedKeyIds.value = Array.from(next)
+}
+
+const clearMobileSelection = () => {
+  selectedKeyIds.value = []
+}
 
 const compareKeyValues = (left, right, prop) => {
   if (prop === 'is_active') {
@@ -2297,6 +2515,10 @@ const resetBatchForm = () => {
   batchNewProvider.value = ''
   batchModelMode.value = 'keep'
   batchWeightMode.value = 'keep'
+  batchProxyMode.value = 'keep'
+  batchProxyUrl.value = ''
+  batchProxyUsername.value = ''
+  batchProxyPassword.value = ''
   batchFakeIpMode.value = 'keep'
   batchApiTypeMode.value = 'keep'
   batchWeight.value = 1
@@ -2368,7 +2590,7 @@ const applyQuickModels = () => {
 }
 
 const applyBatchQuickModels = () => {
-  if (batchModelMode.value !== 'append' && batchModelMode.value !== 'replace') {
+  if (!['append', 'remove', 'replace'].includes(batchModelMode.value)) {
     batchModelMode.value = 'append'
   }
   const names = normalizeModelNames((batchQuickModelInput.value || '').split(','))
@@ -2555,33 +2777,48 @@ const submitBatchUpdate = async () => {
 
   const normalizedBaseUrl = typeof batchBaseUrl.value === 'string' ? batchBaseUrl.value.trim() : ''
   const normalizedNewProvider = typeof batchNewProvider.value === 'string' ? batchNewProvider.value.trim() : ''
+  const normalizedProxyUrl = typeof batchProxyUrl.value === 'string' ? batchProxyUrl.value.trim() : ''
+  const normalizedProxyUsername = typeof batchProxyUsername.value === 'string' ? batchProxyUsername.value.trim() : ''
+  const normalizedProxyPassword = typeof batchProxyPassword.value === 'string' ? batchProxyPassword.value : ''
   const normalizedBatchModels = normalizeModelNames(batchSupportedModels.value || [])
   const shouldUpdateBaseUrl = hasBatchBaseUpdate()
   const shouldUpdateModels = hasBatchModelUpdate()
   const shouldUpdateWeight = hasBatchWeightUpdate()
+  const shouldUpdateProxy = hasBatchProxyUpdate()
   const shouldUpdateFakeIp = hasBatchFakeIpUpdate()
   const shouldUpdateProvider = !!normalizedNewProvider
   const shouldUpdateApiType = batchApiTypeMode.value !== 'keep'
   const modelActionLabelMap = {
     append: '追加模型',
+    remove: '移除模型',
     replace: '替换模型',
     clear: '清空模型',
   }
   const modelActionLabel = shouldUpdateModels ? modelActionLabelMap[batchModelMode.value] : ''
   const normalizedWeight = shouldUpdateWeight ? Number(batchWeight.value) : null
 
-  if (!shouldUpdateBaseUrl && !shouldUpdateModels && !shouldUpdateWeight && !shouldUpdateFakeIp && !shouldUpdateProvider && !shouldUpdateApiType) {
+  if (!shouldUpdateBaseUrl && !shouldUpdateModels && !shouldUpdateWeight && !shouldUpdateProxy && !shouldUpdateFakeIp && !shouldUpdateProvider && !shouldUpdateApiType) {
     ElMessage.warning('请至少选择一项要调整的内容')
     return
   }
 
-  if (shouldUpdateModels && (batchModelMode.value === 'replace' || batchModelMode.value === 'append') && !normalizedBatchModels.length) {
+  if (shouldUpdateModels && ['replace', 'append', 'remove'].includes(batchModelMode.value) && !normalizedBatchModels.length) {
     ElMessage.warning('请先选择支持模型，如需恢复全部模型请使用清空')
     return
   }
 
   if (shouldUpdateWeight && (!Number.isInteger(normalizedWeight) || normalizedWeight < 0)) {
     ElMessage.warning('请输入有效的非负整数权重')
+    return
+  }
+
+  if (shouldUpdateProxy && batchProxyMode.value === 'enable' && !normalizedProxyUrl) {
+    ElMessage.warning('请输入代理地址')
+    return
+  }
+
+  if (shouldUpdateProxy && batchProxyMode.value === 'enable' && !/^https?:\/\//i.test(normalizedProxyUrl)) {
+    ElMessage.warning('代理地址需要以 http:// 或 https:// 开头')
     return
   }
 
@@ -2595,10 +2832,16 @@ const submitBatchUpdate = async () => {
     let modelResult = null
     let fakeIpResult = null
 
-    if (shouldUpdateBaseUrl || shouldUpdateModels || shouldUpdateWeight || shouldUpdateProvider || shouldUpdateApiType) {
+    if (shouldUpdateBaseUrl || shouldUpdateModels || shouldUpdateWeight || shouldUpdateProxy || shouldUpdateProvider || shouldUpdateApiType) {
       const payload = buildBatchScopePayload()
       if (shouldUpdateBaseUrl) {
         payload.base_url = normalizedBaseUrl
+      }
+      if (shouldUpdateProxy) {
+        payload.enable_proxy = batchProxyMode.value === 'enable'
+        payload.proxy_url = batchProxyMode.value === 'enable' ? normalizedProxyUrl : null
+        payload.proxy_username = batchProxyMode.value === 'enable' ? (normalizedProxyUsername || null) : null
+        payload.proxy_password = batchProxyMode.value === 'enable' ? (normalizedProxyPassword || null) : null
       }
       if (shouldUpdateProvider) {
         payload.new_provider = normalizedNewProvider
@@ -2609,7 +2852,7 @@ const submitBatchUpdate = async () => {
       if (shouldUpdateApiType) {
         payload.api_type = normalizeApiType(batchApiTypeMode.value)
       }
-      if (batchModelMode.value === 'replace' || batchModelMode.value === 'append') {
+      if (['replace', 'append', 'remove'].includes(batchModelMode.value)) {
         payload.supported_models = normalizedBatchModels
         payload.supported_models_mode = batchModelMode.value
       } else if (batchModelMode.value === 'clear') {
@@ -2626,7 +2869,8 @@ const submitBatchUpdate = async () => {
     const successMessages = []
     if (modelResult) {
       const modelActionSuffix = modelActionLabel ? `，${modelActionLabel}` : ''
-      successMessages.push(`已批量更新 ${modelResult.count} 个 Key${modelActionSuffix}${modelResult.auto_created_model_count ? `，自动创建 ${modelResult.auto_created_model_count} 个模型` : ''}`)
+      const proxyActionSuffix = shouldUpdateProxy ? `，${batchProxyMode.value === 'enable' ? '开启并设置独立代理' : '关闭独立代理'}` : ''
+      successMessages.push(`已批量更新 ${modelResult.count} 个 Key${modelActionSuffix}${proxyActionSuffix}${modelResult.auto_created_model_count ? `，自动创建 ${modelResult.auto_created_model_count} 个模型` : ''}`)
     }
     if (fakeIpResult) {
       successMessages.push(`已为 ${fakeIpResult.count} 个 Key${fakeIpResult.enabled ? '开启独立 fake IP' : '关闭 fake IP'}`)
@@ -2802,10 +3046,15 @@ const openImportFile = () => {
 }
 
 const handleImportFile = async (event) => {
-  const [file] = event.target.files || []
-  if (!file) return
-  importText.value = await file.text()
+  const files = Array.from(event.target.files || [])
+  if (!files.length) return
+  // 多选文件：逐个读取后按换行合并，追加到已有内容之后
+  const contents = await Promise.all(files.map((file) => file.text()))
+  const merged = contents.map((text) => text.trim()).filter(Boolean).join('\n')
+  const existing = importText.value.trim()
+  importText.value = existing ? `${existing}\n${merged}` : merged
   event.target.value = ''
+  ElMessage.success(`已加载 ${files.length} 个文件`)
 }
 
 const submitImport = async () => {
@@ -2821,29 +3070,57 @@ const submitImport = async () => {
 
   importing.value = true
   try {
-    const items = lines.map((line) => {
-      const item = JSON.parse(line)
-      const supportedModels = Array.isArray(item.supported_models)
-        ? normalizeModelNames(item.supported_models)
-        : null
-      const enableProxy = Boolean(item.enable_proxy)
-      const enableFakeIp = Boolean(item.enable_fake_ip)
-      const rawWzUrl = item.wz_url ?? item.wzurl ?? item.wzUrl ?? item.web_url ?? item.webUrl
-      return {
-        ...item,
-        api_type: normalizeApiType(item.api_type),
-        enable_proxy: enableProxy,
-        proxy_url: enableProxy ? (typeof item.proxy_url === 'string' ? item.proxy_url.trim() : item.proxy_url) : null,
-        proxy_username: enableProxy ? (typeof item.proxy_username === 'string' ? item.proxy_username.trim() : item.proxy_username) : null,
-        proxy_password: enableProxy ? (item.proxy_password || null) : null,
-        enable_fake_ip: enableFakeIp,
-        fake_ip: enableFakeIp ? (typeof item.fake_ip === 'string' ? item.fake_ip.trim() : item.fake_ip) : null,
-        supported_models: supportedModels?.length ? supportedModels : null,
-        wz_url: typeof rawWzUrl === 'string' ? rawWzUrl.trim() || null : rawWzUrl || null,
+    let items
+    try {
+      items = lines.map((line) => {
+        const item = JSON.parse(line)
+        const supportedModels = Array.isArray(item.supported_models)
+          ? normalizeModelNames(item.supported_models)
+          : null
+        const enableProxy = Boolean(item.enable_proxy)
+        const enableFakeIp = Boolean(item.enable_fake_ip)
+        const rawWzUrl = item.wz_url ?? item.wzurl ?? item.wzUrl ?? item.web_url ?? item.webUrl
+        return {
+          ...item,
+          api_type: normalizeApiType(item.api_type),
+          enable_proxy: enableProxy,
+          proxy_url: enableProxy ? (typeof item.proxy_url === 'string' ? item.proxy_url.trim() : item.proxy_url) : null,
+          proxy_username: enableProxy ? (typeof item.proxy_username === 'string' ? item.proxy_username.trim() : item.proxy_username) : null,
+          proxy_password: enableProxy ? (item.proxy_password || null) : null,
+          enable_fake_ip: enableFakeIp,
+          fake_ip: enableFakeIp ? (typeof item.fake_ip === 'string' ? item.fake_ip.trim() : item.fake_ip) : null,
+          supported_models: supportedModels?.length ? supportedModels : null,
+          wz_url: typeof rawWzUrl === 'string' ? rawWzUrl.trim() || null : rawWzUrl || null,
+        }
+      })
+    } catch (parseError) {
+      ElMessage.error(`数据格式有误，无法解析为 JSON：${parseError.message}`)
+      importing.value = false
+      return
+    }
+
+    // 大批量分批提交，避免单个请求体过大导致超时
+    const BATCH_SIZE = 200
+    let totalCount = 0
+    let totalCreated = 0
+    let totalUpdated = 0
+    let totalAutoModels = 0
+    const totalBatches = Math.ceil(items.length / BATCH_SIZE)
+
+    for (let i = 0; i < items.length; i += BATCH_SIZE) {
+      const batch = items.slice(i, i + BATCH_SIZE)
+      const batchNo = Math.floor(i / BATCH_SIZE) + 1
+      if (totalBatches > 1) {
+        importProgressText.value = `正在导入第 ${batchNo}/${totalBatches} 批（共 ${items.length} 条）…`
       }
-    })
-    const result = await adminApi.importKeys(items)
-    ElMessage.success(`成功导入 ${result.count} 个 Key，自动创建 ${result.auto_created_model_count || 0} 个模型`)
+      const result = await adminApi.importKeys(batch)
+      totalCount += result.count || 0
+      totalCreated += result.created_count || 0
+      totalUpdated += result.updated_count || 0
+      totalAutoModels += result.auto_created_model_count || 0
+    }
+
+    ElMessage.success(`成功导入 ${totalCount} 个 Key（新增 ${totalCreated}，更新 ${totalUpdated}），自动创建 ${totalAutoModels} 个模型`)
     importDialogVisible.value = false
     importText.value = ''
     resetToFirstPage()
@@ -2854,6 +3131,7 @@ const submitImport = async () => {
     ElMessage.error(e.message)
   } finally {
     importing.value = false
+    importProgressText.value = ''
   }
 }
 
@@ -2940,7 +3218,47 @@ const deleteKey = async (row) => {
   }
 }
 
+// 手机竖屏改用卡片列表，桌面端继续走原表格
+const MOBILE_QUERY = '(max-width: 768px)'
+const isMobile = ref(false)
+let mobileMediaQuery = null
+const syncMobile = (event) => {
+  isMobile.value = event.matches
+}
+
+// 下拉项里放不了 popconfirm，改用确认弹窗兜住批量删除
+const confirmBatchDeleteSelectedKeys = async () => {
+  if (!selectedKeys.value.length) {
+    ElMessage.warning('请先勾选要删除的 Key')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(`确定删除当前勾选的 ${selectedKeys.value.length} 个 Key？`, '确认删除', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  await batchDeleteSelectedKeys()
+}
+
+// 卡片详情默认折叠，支持模型动辄几十个，全铺开会把列表撑得很长
+const expandedCardIds = ref(new Set())
+const isCardExpanded = (id) => expandedCardIds.value.has(Number(id))
+const toggleCardExpand = (id) => {
+  const next = new Set(expandedCardIds.value)
+  const key = Number(id)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedCardIds.value = next
+}
+
 onMounted(() => {
+  mobileMediaQuery = window.matchMedia(MOBILE_QUERY)
+  isMobile.value = mobileMediaQuery.matches
+  mobileMediaQuery.addEventListener('change', syncMobile)
   loadProviderOptions()
   loadModelOptions()
   loadCheckTasks()
@@ -2953,6 +3271,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  mobileMediaQuery?.removeEventListener('change', syncMobile)
   stopActiveCheckTaskPolling()
   stopCooldownTimer()
 })
@@ -2992,8 +3311,8 @@ const formatKeyDetailLatency = (value) => {
 }
 
 const getKeyDetailSuccessRate = () => {
-  const total = Number(keyDetailSummary.value?.total_requests || 0)
-  const success = Number(keyDetailSummary.value?.success_requests || 0)
+  const total = Number(keyDetailData.value?.request_count || 0)
+  const success = Number(keyDetailData.value?.success_count || 0)
   if (!total) return 0
   return Math.round((success / total) * 100)
 }
@@ -3035,12 +3354,9 @@ const openKeyDetail = async (keyId) => {
   keyDetailLoading.value = true
   keyDetailBalance.value = null
   try {
-    const [keyData, summaryData] = await Promise.all([
-      adminApi.getKey(keyId),
-      statsApi.getSummary({ api_key_id: keyId, days: 7 }),
-    ])
+    const keyData = await adminApi.getKey(keyId)
     keyDetailData.value = keyData || {}
-    keyDetailSummary.value = summaryData || {}
+    keyDetailSummary.value = {}
     keyDetailLogsPage.value = 1
     await loadKeyDetailLogs(keyId)
     loadKeyDetailBalance(keyId)
@@ -3452,13 +3768,105 @@ const handleKeyDetailDialogClosed = () => {
     white-space: normal;
   }
 
+  /* 筛选项排成三列两行；theme.css 的移动端规则用了 !important 塌陷为单列，这里需要同等权重覆盖 */
   .filter-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+    gap: 8px;
   }
 
+  /* 输入框与「加入 / 查询」按钮同处一格，按钮换成图标只占一个方块 */
+  .quick-filter-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 4px;
+  }
+
+  /* 卡片标题与摘要横向排布，避免「筛选条件」被挤成竖排单字 */
+  .filter-card :deep(.el-card__header) .card-header-simple {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .panel-title {
+    white-space: nowrap;
+  }
+
+  .filter-grid :deep(.el-input__wrapper),
+  .filter-grid :deep(.el-select__wrapper) {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
+  .filter-grid :deep(.el-input__inner),
+  .filter-grid :deep(.el-select__placeholder) {
+    font-size: 12px;
+  }
+
+  /* 图标按钮压成方块，给输入框留出尽量多的宽度 */
+  .quick-filter-row :deep(.el-button) {
+    width: 30px;
+    min-width: 30px;
+    padding: 5px 0;
+    font-size: 12px;
+  }
+
+  /* 页码、每页条数、总条数挤在一行，允许必要时换行 */
+  .key-manage-pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .key-manage-pagination :deep(.el-pagination) {
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 4px 6px;
+  }
+
+  /* 每页条数选择器默认 100px 起，窄屏压窄给页码让位 */
+  .key-manage-pagination :deep(.el-pagination__sizes),
+  .key-manage-pagination :deep(.el-pagination__sizes .el-select) {
+    width: 82px;
+    margin: 0;
+  }
+
+  .key-manage-pagination :deep(.el-pagination__total) {
+    margin: 0;
+    font-size: 11px;
+  }
+
+  .pagination-total {
+    font-size: 11px;
+    color: var(--cpa-text-tertiary);
+    white-space: nowrap;
+  }
+
+  /* 摘要文案在窄屏已隐藏，这里只需把折叠按钮推到右侧 */
   .filter-header-actions {
-    width: 100%;
-    justify-content: flex-start;
+    width: auto;
+    margin-left: auto;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .panel-title {
+    font-size: 13px;
+  }
+
+  .filter-card :deep(.el-card__header) {
+    padding: 8px 12px;
+  }
+
+  .filter-card :deep(.el-card__body) {
+    padding: 10px 12px;
+  }
+
+  .page-kicker {
+    font-size: 10px;
+  }
+
+  .page-title {
+    font-size: 18px;
   }
 
   .header-actions {
@@ -3466,6 +3874,12 @@ const handleKeyDetailDialogClosed = () => {
     width: 100%;
     margin-left: 0;
     justify-content: flex-start;
+    gap: 8px;
+  }
+
+  .header-actions :deep(.el-button) {
+    padding: 7px 12px;
+    font-size: 12px;
   }
 
   .header-action-wide {
@@ -3588,5 +4002,216 @@ code {
 
 .form-extra-collapse :deep(.el-collapse-item__content) {
   padding: 4px 0 0 0;
+}
+
+/* ── 移动端卡片列表：仅窄屏渲染，桌面端仍走上面的 el-table ── */
+.key-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 120px;
+}
+
+/* 勾选后浮出的批量操作条会盖住列表尾部，这里预留出让位空间 */
+.key-card-list.has-selection-bar {
+  padding-bottom: 58px;
+}
+
+.key-card-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 2px;
+}
+
+.key-card-toolbar__count {
+  font-size: 12px;
+  color: var(--cpa-text-tertiary);
+}
+
+.key-card-empty {
+  padding: 32px 0;
+  text-align: center;
+  font-size: 13px;
+  color: var(--cpa-text-tertiary);
+}
+
+.key-card {
+  padding: 10px;
+  border: 1px solid var(--cpa-border-soft, rgba(148, 163, 184, 0.24));
+  border-radius: 12px;
+  background: var(--cpa-surface, #fff);
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.05);
+}
+
+.key-card.is-selected {
+  border-color: var(--cpa-primary);
+  box-shadow: 0 6px 18px rgba(37, 99, 235, 0.16);
+}
+
+.key-card.is-inactive {
+  opacity: 0.72;
+}
+
+.key-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.key-card__id {
+  font-size: 12px;
+  color: var(--cpa-text-tertiary);
+  flex-shrink: 0;
+}
+
+.key-card__name {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--cpa-primary);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.key-card__switch {
+  flex-shrink: 0;
+}
+
+.key-card__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* 详情默认折叠，这里是展开开关 */
+/* 折叠开关与名称同处头部行，必须让位给名称，不能吃满剩余宽度 */
+.key-card__toggle {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  padding: 2px 0;
+  border: none;
+  background: none;
+  font-size: 11px;
+  color: var(--cpa-text-tertiary);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.key-card__toggle .el-icon {
+  transition: transform 0.2s;
+}
+
+.key-card__toggle .el-icon.is-open {
+  transform: rotate(180deg);
+}
+
+.key-card__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--cpa-border-soft, rgba(148, 163, 184, 0.24));
+}
+
+.key-card__row {
+  display: grid;
+  grid-template-columns: 60px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.key-card__label {
+  color: var(--cpa-text-tertiary);
+}
+
+.key-card__value {
+  color: var(--cpa-text-secondary);
+  word-break: break-all;
+}
+
+.key-card__code {
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.key-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--cpa-border-soft, rgba(148, 163, 184, 0.24));
+}
+
+.key-card__actions :deep(.el-button + .el-button) {
+  margin-left: 0;
+}
+
+/* 批量操作条固定悬浮在底部标签栏上方，滚动时始终可见 */
+.key-card-selection-bar {
+  position: fixed;
+  left: 12px;
+  right: 12px;
+  bottom: calc(63px + env(safe-area-inset-bottom, 0px));
+  z-index: 1900;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--cpa-surface, #fff);
+  border: 1px solid var(--cpa-primary);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.16);
+}
+
+.key-card-selection-bar__text {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--cpa-text-primary);
+  margin-right: auto;
+}
+
+/* 全屏表单：标签置顶、控件占满宽度，底部按钮换行排布 */
+:deep(.key-form-dialog--mobile .el-dialog__body) {
+  padding: 12px 16px;
+}
+
+:deep(.key-form-dialog--mobile .el-form-item__label) {
+  padding-bottom: 2px;
+  font-size: 13px;
+}
+
+:deep(.key-form-dialog--mobile .el-select),
+:deep(.key-form-dialog--mobile .el-input-number) {
+  width: 100%;
+}
+
+:deep(.key-form-dialog--mobile .el-dialog__footer) {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--cpa-border-soft, rgba(148, 163, 184, 0.24));
+}
+
+:deep(.key-form-dialog--mobile .el-dialog__footer .el-button) {
+  flex: 1 1 calc(50% - 4px);
+  margin-left: 0;
 }
 </style>

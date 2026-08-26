@@ -46,7 +46,35 @@
     </el-card>
 
     <el-card shadow="never">
-      <el-table :data="events" stripe border v-loading="loading" height="640" size="small">
+      <div v-if="isMobile" class="event-card-list" v-loading="loading">
+        <div v-for="row in events" :key="row.id" class="event-card">
+          <div class="event-card__head">
+            <span class="event-card__title">#{{ row.id }} {{ row.key_name || `Key ${row.api_key_id}` }}</span>
+            <button type="button" class="event-card__toggle" @click="toggleEventExpand(row.id)">
+              <span>{{ isEventExpanded(row.id) ? '收起' : '详情' }}</span>
+              <el-icon :class="{ 'is-open': isEventExpanded(row.id) }"><ArrowDown /></el-icon>
+            </button>
+          </div>
+          <div class="event-card__tags">
+            <el-tag :type="categoryTagType(row.category)" size="small">{{ categoryLabel(row.category) }}</el-tag>
+            <el-tag :type="actionTagType(row.action)" size="small">{{ actionLabel(row.action) }}</el-tag>
+            <el-tag v-if="row.provider" type="info" effect="plain" size="small">{{ row.provider }}</el-tag>
+          </div>
+          <div class="event-card__summary">{{ row.snippet || row.explanation || '-' }}</div>
+          <div class="event-card__time">{{ row.created_at || '-' }}</div>
+          <div v-if="isEventExpanded(row.id)" class="event-card__detail">
+            <div class="event-card__row"><span>Key</span><span>#{{ row.api_key_id }} {{ row.key_name || '' }}</span></div>
+            <div class="event-card__row"><span>模型</span><span>{{ row.model || '-' }}</span></div>
+            <div class="event-card__row"><span>说明</span><span>{{ row.explanation || '-' }}</span></div>
+          </div>
+          <div class="event-card__actions">
+            <el-button type="primary" link @click="openDetail(row)">查看完整详情</el-button>
+          </div>
+        </div>
+        <el-empty v-if="!loading && !events.length" description="暂无安全事件" :image-size="80" />
+      </div>
+
+      <el-table v-else :data="events" stripe border v-loading="loading" height="640" size="small">
         <el-table-column prop="id" label="ID" width="76" />
         <el-table-column prop="created_at" label="时间" width="172" />
         <el-table-column prop="provider" label="提供商" width="110" show-overflow-tooltip />
@@ -79,15 +107,17 @@
           v-model:page-size="limit"
           :page-sizes="[20, 50, 100, 200]"
           :total="total"
-          layout="total, sizes, prev, pager, next"
+          :layout="isMobile ? 'prev, pager, next, sizes, total' : 'total, sizes, prev, pager, next'"
+          :small="isMobile"
+          :pager-count="isMobile ? 5 : 7"
           @current-change="loadEvents"
           @size-change="handleSizeChange"
         />
       </div>
     </el-card>
 
-    <el-dialog v-model="configVisible" title="安全规则与策略配置" width="860px">
-      <el-form label-width="180px" v-loading="configLoading">
+    <el-dialog v-model="configVisible" title="安全规则与策略配置" :width="isMobile ? '100%' : '860px'" :fullscreen="isMobile" :align-center="!isMobile">
+      <el-form :label-width="isMobile ? 'auto' : '180px'" :label-position="isMobile ? 'top' : 'right'" v-loading="configLoading">
         <el-form-item label="启用防护">
           <el-switch v-model="configForm.enabled" active-text="开启" inactive-text="关闭" />
           <div class="form-tip">开启后 CPA 会在普通响应与缓冲流式短响应返回前扫描上游内容。</div>
@@ -137,8 +167,8 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="detailVisible" title="安全事件详情" width="820px">
-      <el-descriptions v-if="currentEvent" :column="2" border>
+    <el-dialog v-model="detailVisible" title="安全事件详情" :width="isMobile ? '100%' : '820px'" :fullscreen="isMobile" :align-center="!isMobile">
+      <el-descriptions v-if="currentEvent" :column="isMobile ? 1 : 2" border>
         <el-descriptions-item label="事件 ID">{{ currentEvent.id }}</el-descriptions-item>
         <el-descriptions-item label="时间">{{ currentEvent.created_at }}</el-descriptions-item>
         <el-descriptions-item label="提供商">{{ currentEvent.provider || '-' }}</el-descriptions-item>
@@ -163,9 +193,26 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import { ArrowDown } from '@element-plus/icons-vue'
 import { adminApi, copyText } from '../api'
+
+const MOBILE_QUERY = '(max-width: 768px)'
+const isMobile = ref(false)
+let mobileMediaQuery = null
+const syncMobile = (event) => {
+  isMobile.value = event.matches
+}
+const expandedEventIds = ref(new Set())
+const isEventExpanded = (id) => expandedEventIds.value.has(Number(id))
+const toggleEventExpand = (id) => {
+  const next = new Set(expandedEventIds.value)
+  const key = Number(id)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedEventIds.value = next
+}
 
 const loading = ref(false)
 const events = ref([])
@@ -309,8 +356,15 @@ const copyDetail = async () => {
 }
 
 onMounted(() => {
+  mobileMediaQuery = window.matchMedia(MOBILE_QUERY)
+  isMobile.value = mobileMediaQuery.matches
+  mobileMediaQuery.addEventListener('change', syncMobile)
   loadEvents()
   loadConfig()
+})
+
+onBeforeUnmount(() => {
+  mobileMediaQuery?.removeEventListener('change', syncMobile)
 })
 </script>
 
@@ -367,6 +421,141 @@ onMounted(() => {
 @media (max-width: 1280px) {
   .filter-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.event-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.event-card {
+  padding: 9px 10px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  background: var(--el-bg-color);
+}
+
+.event-card__head,
+.event-card__tags,
+.event-card__actions {
+  display: flex;
+  align-items: center;
+}
+
+.event-card__head {
+  gap: 8px;
+}
+
+.event-card__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.event-card__toggle {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+}
+
+.event-card__toggle .el-icon {
+  transition: transform 0.2s;
+}
+
+.event-card__toggle .el-icon.is-open {
+  transform: rotate(180deg);
+}
+
+.event-card__tags {
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.event-card__summary {
+  margin-top: 6px;
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--el-text-color-regular);
+}
+
+.event-card__time {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.event-card__detail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--el-border-color-lighter);
+}
+
+.event-card__row {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.event-card__row > span:first-child {
+  flex: 0 0 42px;
+  color: var(--el-text-color-secondary);
+}
+
+.event-card__row > span:last-child {
+  min-width: 0;
+  word-break: break-word;
+}
+
+.event-card__actions {
+  justify-content: flex-end;
+  margin-top: 5px;
+}
+
+@media (max-width: 768px) {
+  .filter-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: 8px;
+  }
+
+  .filter-actions {
+    grid-column: 1 / -1;
+  }
+
+  .filter-actions :deep(.el-button) {
+    flex: 1;
+  }
+
+  .pagination {
+    justify-content: center;
+    overflow-x: auto;
+  }
+
+  .config-inline {
+    align-items: flex-start;
+  }
+
+  .detail-snippet {
+    max-height: none;
   }
 }
 </style>

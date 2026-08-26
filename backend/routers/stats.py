@@ -35,7 +35,7 @@ class UsageSummary(BaseModel):
 
 
 class KeyUsageSummary(BaseModel):
-    """单个 Key 的用量汇总"""
+    """单个 Key 的区间用量与生命周期累计"""
     api_key_id: int
     api_key_name: str
     provider: str
@@ -51,6 +51,14 @@ class KeyUsageSummary(BaseModel):
     avg_latency_ms: float
     avg_upstream_latency_ms: float
     avg_cpa_overhead_ms: float
+    lifetime_total_requests: int = 0
+    lifetime_success_requests: int = 0
+    lifetime_error_requests: int = 0
+    lifetime_total_tokens: int = 0
+    lifetime_prompt_tokens: int = 0
+    lifetime_completion_tokens: int = 0
+    lifetime_cache_tokens: int = 0
+    last_request_time: Optional[datetime] = None
 
 
 class DailyUsage(BaseModel):
@@ -338,6 +346,7 @@ async def get_usage_by_key(
     effective_user_id = _resolve_user_id(auth_info, user_id)
     window = usage_rollup_service.split_time_range(days, start_time, end_time)
     merged_by_key: dict[int, dict] = defaultdict(_empty_metrics)
+    last_request_times: dict[int, datetime] = {}
     provider_values = [value.strip().lower() for value in (providers or []) if isinstance(value, str) and value.strip()]
     model_values = [value.strip().lower() for value in (models or []) if isinstance(value, str) and value.strip()]
 
@@ -389,6 +398,7 @@ async def get_usage_by_key(
                 func.coalesce(func.sum(case((UsageLog.upstream_latency_ms > 0, 1), else_=0)), 0).label("upstream_latency_count"),
                 func.coalesce(func.sum(case((UsageLog.upstream_latency_ms > 0, UsageLog.cpa_overhead_ms), else_=0)), 0).label("cpa_overhead_sum_ms"),
                 func.coalesce(func.sum(case((UsageLog.upstream_latency_ms > 0, 1), else_=0)), 0).label("cpa_overhead_count"),
+                func.max(UsageLog.request_time).label("last_request_time"),
             )
             .where(
                 UsageLog.request_time >= window.realtime_start,
@@ -400,6 +410,18 @@ async def get_usage_by_key(
             realtime_query = realtime_query.where(UsageLog.user_id == effective_user_id)
         for row in (await db.execute(realtime_query)).all():
             merged_by_key[row.api_key_id] = _merge_metrics(merged_by_key[row.api_key_id], dict(row._mapping))
+            if row.last_request_time:
+                last_request_times[row.api_key_id] = row.last_request_time
+
+    # 管理员查看全部用户时，补齐没有当前区间明细的 Key，确保生命周期累计不随明细清理而消失。
+    if effective_user_id is None and not model_values:
+        lifetime_keys_query = select(ApiKey)
+        if provider_values:
+            lifetime_keys_query = lifetime_keys_query.where(ApiKey.provider.in_(provider_values))
+        lifetime_keys = (await db.execute(lifetime_keys_query)).scalars().all()
+        for key in lifetime_keys:
+            if int(getattr(key, "request_count", 0) or 0) > 0:
+                merged_by_key.setdefault(key.id, _empty_metrics())
 
     if not merged_by_key:
         return []
@@ -442,6 +464,14 @@ async def get_usage_by_key(
                 avg_latency_ms=round(metrics["latency_sum_ms"] / latency_count, 2) if latency_count else 0,
                 avg_upstream_latency_ms=round(metrics["upstream_latency_sum_ms"] / upstream_count, 2) if upstream_count else 0,
                 avg_cpa_overhead_ms=round(metrics["cpa_overhead_sum_ms"] / cpa_count, 2) if cpa_count else 0,
+                lifetime_total_requests=int(getattr(key, "request_count", 0) or 0),
+                lifetime_success_requests=int(getattr(key, "success_count", 0) or 0),
+                lifetime_error_requests=int(getattr(key, "error_count", 0) or 0),
+                lifetime_total_tokens=int(getattr(key, "total_tokens", 0) or 0),
+                lifetime_prompt_tokens=int(getattr(key, "prompt_tokens", 0) or 0),
+                lifetime_completion_tokens=int(getattr(key, "completion_tokens", 0) or 0),
+                lifetime_cache_tokens=int(getattr(key, "cache_tokens", 0) or 0),
+                last_request_time=last_request_times.get(api_key_id),
             )
         )
 

@@ -14,6 +14,8 @@ IMAGE_MODEL_PRICE_UNITS = {
     "gpt-image-1": 0.04,
     "nano-banana-pro": 0.06,
     "nano-banana-pro-4k": 0.08,
+    "grok-imagine-image": 0.02,
+    "grok-imagine-image-quality": 0.05,
 }
 
 
@@ -121,6 +123,14 @@ async def init_db():
             columns = inspect(sync_conn).get_columns("model_catalog")
             return any(column["name"] == "supports_gemini" for column in columns)
 
+        def has_model_catalog_cache_read_price(sync_conn):
+            columns = inspect(sync_conn).get_columns("model_catalog")
+            return any(column["name"] == "cache_read_price" for column in columns)
+
+        def has_model_catalog_cache_write_price(sync_conn):
+            columns = inspect(sync_conn).get_columns("model_catalog")
+            return any(column["name"] == "cache_write_price" for column in columns)
+
         def has_upstream_latency_ms(sync_conn):
             columns = inspect(sync_conn).get_columns("usage_logs")
             return any(column["name"] == "upstream_latency_ms" for column in columns)
@@ -128,6 +138,18 @@ async def init_db():
         def has_cpa_overhead_ms(sync_conn):
             columns = inspect(sync_conn).get_columns("usage_logs")
             return any(column["name"] == "cpa_overhead_ms" for column in columns)
+
+        def has_openai_plus_usage_latency_ms(sync_conn):
+            columns = inspect(sync_conn).get_columns("openai_plus_usage_logs")
+            return any(column["name"] == "latency_ms" for column in columns)
+
+        def has_openai_plus_usage_cache_tokens(sync_conn):
+            columns = inspect(sync_conn).get_columns("openai_plus_usage_logs")
+            return any(column["name"] == "cache_tokens" for column in columns)
+
+        def has_openai_plus_account_cache_tokens(sync_conn):
+            columns = inspect(sync_conn).get_columns("openai_plus_accounts")
+            return any(column["name"] == "cache_tokens" for column in columns)
 
         def has_image_generation_task_is_deleted(sync_conn):
             columns = inspect(sync_conn).get_columns("image_generation_tasks")
@@ -216,11 +238,37 @@ async def init_db():
         if not await conn.run_sync(has_supports_gemini):
             await conn.exec_driver_sql("ALTER TABLE model_catalog ADD COLUMN supports_gemini BOOLEAN DEFAULT 0")
 
+        if not await conn.run_sync(has_model_catalog_cache_read_price):
+            await conn.exec_driver_sql("ALTER TABLE model_catalog ADD COLUMN cache_read_price FLOAT DEFAULT 0")
+
+        if not await conn.run_sync(has_model_catalog_cache_write_price):
+            await conn.exec_driver_sql("ALTER TABLE model_catalog ADD COLUMN cache_write_price FLOAT DEFAULT 0")
+
         if not await conn.run_sync(has_upstream_latency_ms):
             await conn.exec_driver_sql("ALTER TABLE usage_logs ADD COLUMN upstream_latency_ms INTEGER DEFAULT 0")
 
         if not await conn.run_sync(has_cpa_overhead_ms):
             await conn.exec_driver_sql("ALTER TABLE usage_logs ADD COLUMN cpa_overhead_ms INTEGER DEFAULT 0")
+
+        if not await conn.run_sync(has_openai_plus_usage_latency_ms):
+            await conn.exec_driver_sql("ALTER TABLE openai_plus_usage_logs ADD COLUMN latency_ms INTEGER DEFAULT 0")
+
+        if not await conn.run_sync(has_openai_plus_usage_cache_tokens):
+            await conn.exec_driver_sql("ALTER TABLE openai_plus_usage_logs ADD COLUMN cache_tokens INTEGER DEFAULT 0")
+
+        if not await conn.run_sync(has_openai_plus_account_cache_tokens):
+            await conn.exec_driver_sql("ALTER TABLE openai_plus_accounts ADD COLUMN cache_tokens INTEGER DEFAULT 0")
+            await conn.exec_driver_sql(
+                """
+                UPDATE openai_plus_accounts
+                SET cache_tokens = COALESCE((
+                    SELECT SUM(cache_tokens)
+                    FROM openai_plus_usage_logs
+                    WHERE account_id = openai_plus_accounts.id
+                ), 0)
+                WHERE COALESCE(cache_tokens, 0) = 0
+                """
+            )
 
         def has_cache_tokens_log(sync_conn):
             columns = inspect(sync_conn).get_columns("usage_logs")
@@ -261,6 +309,27 @@ async def init_db():
         if not await conn.run_sync(has_api_key_last_security_violation):
             await conn.exec_driver_sql("ALTER TABLE api_keys ADD COLUMN last_security_violation TEXT")
 
+        def has_api_key_lifetime_column(column_name: str):
+            def _check(sync_conn):
+                columns = inspect(sync_conn).get_columns("api_keys")
+                return any(column["name"] == column_name for column in columns)
+            return _check
+
+        api_key_lifetime_columns = [
+            "request_count",
+            "success_count",
+            "error_count",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "cache_tokens",
+        ]
+        api_key_lifetime_columns_added = False
+        for column_name in api_key_lifetime_columns:
+            if not await conn.run_sync(has_api_key_lifetime_column(column_name)):
+                await conn.exec_driver_sql(f"ALTER TABLE api_keys ADD COLUMN {column_name} INTEGER DEFAULT 0")
+                api_key_lifetime_columns_added = True
+
         def has_actual_model(sync_conn):
             columns = inspect(sync_conn).get_columns("usage_logs")
             return any(column["name"] == "actual_model" for column in columns)
@@ -270,6 +339,85 @@ async def init_db():
 
         if not await conn.run_sync(has_cache_tokens_summary):
             await conn.exec_driver_sql("ALTER TABLE usage_daily_summaries ADD COLUMN cache_tokens INTEGER DEFAULT 0")
+
+        if api_key_lifetime_columns_added:
+            await conn.exec_driver_sql(
+                """
+                UPDATE api_keys
+                SET
+                    request_count = COALESCE((SELECT SUM(total_requests) FROM usage_daily_summaries WHERE api_key_id = api_keys.id), 0)
+                        + COALESCE((SELECT COUNT(1) FROM usage_logs WHERE api_key_id = api_keys.id), 0),
+                    success_count = COALESCE((SELECT SUM(success_requests) FROM usage_daily_summaries WHERE api_key_id = api_keys.id), 0)
+                        + COALESCE((SELECT SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) FROM usage_logs WHERE api_key_id = api_keys.id), 0),
+                    error_count = COALESCE((SELECT SUM(error_requests) FROM usage_daily_summaries WHERE api_key_id = api_keys.id), 0)
+                        + COALESCE((SELECT SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) FROM usage_logs WHERE api_key_id = api_keys.id), 0),
+                    prompt_tokens = COALESCE((SELECT SUM(prompt_tokens) FROM usage_daily_summaries WHERE api_key_id = api_keys.id), 0)
+                        + COALESCE((SELECT SUM(prompt_tokens) FROM usage_logs WHERE api_key_id = api_keys.id), 0),
+                    completion_tokens = COALESCE((SELECT SUM(completion_tokens) FROM usage_daily_summaries WHERE api_key_id = api_keys.id), 0)
+                        + COALESCE((SELECT SUM(completion_tokens) FROM usage_logs WHERE api_key_id = api_keys.id), 0),
+                    total_tokens = COALESCE((SELECT SUM(total_tokens) FROM usage_daily_summaries WHERE api_key_id = api_keys.id), 0)
+                        + COALESCE((SELECT SUM(total_tokens) FROM usage_logs WHERE api_key_id = api_keys.id), 0),
+                    cache_tokens = COALESCE((SELECT SUM(cache_tokens) FROM usage_daily_summaries WHERE api_key_id = api_keys.id), 0)
+                        + COALESCE((SELECT SUM(cache_tokens) FROM usage_logs WHERE api_key_id = api_keys.id), 0)
+                WHERE COALESCE(request_count, 0) = 0
+                    AND COALESCE(success_count, 0) = 0
+                    AND COALESCE(error_count, 0) = 0
+                    AND COALESCE(prompt_tokens, 0) = 0
+                    AND COALESCE(completion_tokens, 0) = 0
+                    AND COALESCE(total_tokens, 0) = 0
+                    AND COALESCE(cache_tokens, 0) = 0
+                """
+            )
+
+        def has_admin_user_lifetime_column(column_name: str):
+            def _check(sync_conn):
+                columns = inspect(sync_conn).get_columns("admin_users")
+                return any(column["name"] == column_name for column in columns)
+            return _check
+
+        admin_user_lifetime_columns = [
+            "request_count",
+            "success_count",
+            "error_count",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "cache_tokens",
+        ]
+        admin_user_lifetime_columns_added = False
+        for column_name in admin_user_lifetime_columns:
+            if not await conn.run_sync(has_admin_user_lifetime_column(column_name)):
+                await conn.exec_driver_sql(f"ALTER TABLE admin_users ADD COLUMN {column_name} INTEGER DEFAULT 0")
+                admin_user_lifetime_columns_added = True
+
+        if admin_user_lifetime_columns_added:
+            await conn.exec_driver_sql(
+                """
+                UPDATE admin_users
+                SET
+                    request_count = COALESCE((SELECT SUM(total_requests) FROM usage_daily_summaries WHERE user_id = admin_users.id), 0)
+                        + COALESCE((SELECT COUNT(1) FROM usage_logs WHERE user_id = admin_users.id), 0),
+                    success_count = COALESCE((SELECT SUM(success_requests) FROM usage_daily_summaries WHERE user_id = admin_users.id), 0)
+                        + COALESCE((SELECT SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) FROM usage_logs WHERE user_id = admin_users.id), 0),
+                    error_count = COALESCE((SELECT SUM(error_requests) FROM usage_daily_summaries WHERE user_id = admin_users.id), 0)
+                        + COALESCE((SELECT SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) FROM usage_logs WHERE user_id = admin_users.id), 0),
+                    prompt_tokens = COALESCE((SELECT SUM(prompt_tokens) FROM usage_daily_summaries WHERE user_id = admin_users.id), 0)
+                        + COALESCE((SELECT SUM(prompt_tokens) FROM usage_logs WHERE user_id = admin_users.id), 0),
+                    completion_tokens = COALESCE((SELECT SUM(completion_tokens) FROM usage_daily_summaries WHERE user_id = admin_users.id), 0)
+                        + COALESCE((SELECT SUM(completion_tokens) FROM usage_logs WHERE user_id = admin_users.id), 0),
+                    total_tokens = COALESCE((SELECT SUM(total_tokens) FROM usage_daily_summaries WHERE user_id = admin_users.id), 0)
+                        + COALESCE((SELECT SUM(total_tokens) FROM usage_logs WHERE user_id = admin_users.id), 0),
+                    cache_tokens = COALESCE((SELECT SUM(cache_tokens) FROM usage_daily_summaries WHERE user_id = admin_users.id), 0)
+                        + COALESCE((SELECT SUM(cache_tokens) FROM usage_logs WHERE user_id = admin_users.id), 0)
+                WHERE COALESCE(request_count, 0) = 0
+                    AND COALESCE(success_count, 0) = 0
+                    AND COALESCE(error_count, 0) = 0
+                    AND COALESCE(prompt_tokens, 0) = 0
+                    AND COALESCE(completion_tokens, 0) = 0
+                    AND COALESCE(total_tokens, 0) = 0
+                    AND COALESCE(cache_tokens, 0) = 0
+                """
+            )
 
         if not await conn.run_sync(has_image_generation_task_is_deleted):
             await conn.exec_driver_sql("ALTER TABLE image_generation_tasks ADD COLUMN is_deleted BOOLEAN DEFAULT 0")
@@ -304,6 +452,7 @@ async def init_db():
         await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_usage_logs_api_key_id_request_time ON usage_logs(api_key_id, request_time)")
         await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_usage_logs_request_time_api_key_id ON usage_logs(request_time, api_key_id)")
         await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_usage_logs_api_key_id_status_request_time ON usage_logs(api_key_id, status, request_time)")
+        await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_usage_logs_user_id_status_request_time ON usage_logs(user_id, status, request_time)")
         await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_image_generation_tasks_is_deleted_created_at ON image_generation_tasks(is_deleted, created_at)")
         await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_proxy_traces_trace_id ON proxy_traces(trace_id)")
         await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_proxy_traces_created_at ON proxy_traces(created_at)")
@@ -321,6 +470,20 @@ async def init_db():
 
         if not await conn.run_sync(has_admin_user_supported_models):
             await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN supported_models TEXT")
+
+        def has_admin_user_show_image_square(sync_conn):
+            columns = inspect(sync_conn).get_columns("admin_users")
+            return any(column["name"] == "show_image_square" for column in columns)
+
+        def has_admin_user_supported_image_models(sync_conn):
+            columns = inspect(sync_conn).get_columns("admin_users")
+            return any(column["name"] == "supported_image_models" for column in columns)
+
+        if not await conn.run_sync(has_admin_user_show_image_square):
+            await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN show_image_square INTEGER DEFAULT 0")
+
+        if not await conn.run_sync(has_admin_user_supported_image_models):
+            await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN supported_image_models TEXT")
 
         def has_admin_user_daily_token_limit(sync_conn):
             columns = inspect(sync_conn).get_columns("admin_users")

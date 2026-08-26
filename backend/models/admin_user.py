@@ -29,6 +29,10 @@ class AdminUser(Base):
     api_key = Column(String(128), unique=True, nullable=True)
     # 该用户可用的模型列表（JSON 数组，null 表示不限制）
     supported_models = Column(Text, nullable=True)
+    # 是否显示图片广场入口
+    show_image_square = Column(Integer, default=0, nullable=True)
+    # 该用户可用的生图模型列表（JSON 数组，null 表示不限制）
+    supported_image_models = Column(Text, nullable=True)
     # 用量限额（token 数，null 表示不限制）
     daily_token_limit = Column(Integer, nullable=True)
     weekly_token_limit = Column(Integer, nullable=True)
@@ -43,6 +47,14 @@ class AdminUser(Base):
     show_quota_to_user = Column(Integer, default=0, nullable=True)
     # 额度重置时间点（查用量时从此时间开始计算，null 表示从不限制起始时间）
     quota_reset_at = Column(DateTime, nullable=True)
+    # 生命周期累计用量（不随明细/汇总保留期清理，永久累加）
+    request_count = Column(Integer, default=0, nullable=True)
+    success_count = Column(Integer, default=0, nullable=True)
+    error_count = Column(Integer, default=0, nullable=True)
+    prompt_tokens = Column(Integer, default=0, nullable=True)
+    completion_tokens = Column(Integer, default=0, nullable=True)
+    total_tokens = Column(Integer, default=0, nullable=True)
+    cache_tokens = Column(Integer, default=0, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -82,6 +94,18 @@ class AdminUser(Base):
             return None
         try:
             models = json.loads(self.supported_models)
+            if isinstance(models, list) and models:
+                return models
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return None
+
+    def get_supported_image_models(self) -> Optional[list]:
+        """解析 supported_image_models JSON 字段"""
+        if not self.supported_image_models:
+            return None
+        try:
+            models = json.loads(self.supported_image_models)
             if isinstance(models, list) and models:
                 return models
         except (json.JSONDecodeError, TypeError):

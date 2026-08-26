@@ -38,7 +38,51 @@
       </div>
     </el-card>
 
-    <el-card shadow="never">
+    <el-card v-if="isMobile" shadow="never" class="map-card-card">
+      <div class="map-card-toolbar">
+        <el-checkbox :model-value="mobileAllMappingsSelected" @change="toggleMobileSelectAllMappings">全选本页</el-checkbox>
+        <span class="map-card-count">共 {{ mappings.length }} 条</span>
+      </div>
+      <div class="map-card-list" v-loading="loading">
+        <div v-for="row in mappings" :key="row.id" class="map-card">
+          <div class="map-card__head">
+            <el-checkbox :model-value="isMappingSelected(row)" @change="() => toggleMappingSelect(row)" />
+            <span class="map-card__name">{{ row.provider_model || '-' }}</span>
+            <button type="button" class="map-card__toggle" @click="toggleMappingExpand(row.id)">
+              <span>{{ isMappingExpanded(row.id) ? '收起' : '详情' }}</span>
+              <el-icon :class="{ 'is-open': isMappingExpanded(row.id) }"><ArrowDown /></el-icon>
+            </button>
+            <el-tag :type="row.enabled ? 'success' : 'info'" size="small" class="status-tag">
+              {{ row.enabled ? '启用' : '停用' }}
+            </el-tag>
+          </div>
+          <div class="map-card__meta">
+            <el-tag size="small" type="info" effect="plain">{{ row.provider || '-' }}</el-tag>
+            <span class="map-card__arrow">→</span>
+            <span class="map-card__real">{{ row.real_model || '-' }}</span>
+          </div>
+          <div v-if="isMappingExpanded(row.id)" class="map-card__detail">
+            <div class="map-card__row"><span>ID</span><span>{{ row.id }}</span></div>
+            <div class="map-card__row"><span>原始模型</span><span>{{ row.provider_model || '-' }}</span></div>
+            <div class="map-card__row"><span>映射模型</span><span>{{ row.real_model || '-' }}</span></div>
+            <div class="map-card__row"><span>备注</span><span>{{ row.remark || '-' }}</span></div>
+          </div>
+          <div class="map-card__actions">
+            <el-button type="primary" link @click="copyMapping(row)">复制配置</el-button>
+            <el-button type="primary" link @click="duplicateMapping(row)">复制记录</el-button>
+            <el-button type="primary" link @click="showEditDialog(row)">编辑</el-button>
+            <el-popconfirm title="确定删除此映射？" @confirm="removeMapping(row)">
+              <template #reference>
+                <el-button type="danger" link>删除</el-button>
+              </template>
+            </el-popconfirm>
+          </div>
+        </div>
+        <el-empty v-if="!loading && !mappings.length" description="暂无模型映射" :image-size="80" />
+      </div>
+    </el-card>
+
+    <el-card v-else shadow="never">
       <el-table :data="mappings" stripe border v-loading="loading" height="620" size="small" class="mapping-table" @selection-change="handleSelectionChange">
         <el-table-column type="selection" width="46" align="center" />
         <el-table-column prop="provider" label="提供商" width="120" show-overflow-tooltip />
@@ -76,7 +120,7 @@
       </el-table>
     </el-card>
 
-    <el-dialog v-model="importDialogVisible" title="JSON 批量导入模型映射" width="760px">
+    <el-dialog v-model="importDialogVisible" title="JSON 批量导入模型映射" :width="isMobile ? '100%' : '760px'" :fullscreen="isMobile" :align-center="!isMobile">
       <div class="import-actions">
         <el-button @click="fillImportTemplate">填充模板</el-button>
         <input ref="importFileRef" type="file" accept=".txt,.json,.jsonl" class="hidden-input" @change="handleImportFile" />
@@ -92,8 +136,8 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="dialogVisible" :title="isEdit ? '编辑模型映射' : '新增模型映射'" width="620px">
-      <el-form :model="form" :rules="rules" ref="formRef" label-width="110px">
+    <el-dialog v-model="dialogVisible" :title="isEdit ? '编辑模型映射' : '新增模型映射'" :width="isMobile ? '100%' : '620px'" :fullscreen="isMobile" :align-center="!isMobile">
+      <el-form :model="form" :rules="rules" ref="formRef" :label-width="isMobile ? 'auto' : '110px'" :label-position="isMobile ? 'top' : 'right'">
         <el-form-item label="提供商" prop="provider">
           <el-select v-model="form.provider" filterable allow-create default-first-option clearable reserve-keyword="false" style="width: 100%">
             <el-option v-for="item in providerOptions" :key="item" :value="item" :label="item" />
@@ -124,10 +168,28 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Plus } from '@element-plus/icons-vue'
+import { ArrowDown, Plus } from '@element-plus/icons-vue'
 import { adminApi, copyText as copyTextUtil } from '../api'
+
+// 手机竖屏改用卡片流，桌面端保持原表格
+const MOBILE_QUERY = '(max-width: 768px)'
+const isMobile = ref(false)
+let mobileMediaQuery = null
+const syncMobile = (event) => {
+  isMobile.value = event.matches
+}
+
+const expandedMappingIds = ref(new Set())
+const isMappingExpanded = (id) => expandedMappingIds.value.has(Number(id))
+const toggleMappingExpand = (id) => {
+  const next = new Set(expandedMappingIds.value)
+  const key = Number(id)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedMappingIds.value = next
+}
 
 const loading = ref(false)
 const submitting = ref(false)
@@ -216,6 +278,23 @@ const loadMappings = async () => {
 
 const handleSelectionChange = (rows) => {
   selectedMappings.value = rows || []
+}
+
+const selectedMappingIdSet = computed(() => new Set(selectedMappings.value.map((item) => Number(item.id))))
+const isMappingSelected = (row) => selectedMappingIdSet.value.has(Number(row.id))
+const toggleMappingSelect = (row) => {
+  const key = Number(row.id)
+  if (selectedMappingIdSet.value.has(key)) {
+    selectedMappings.value = selectedMappings.value.filter((item) => Number(item.id) !== key)
+  } else {
+    selectedMappings.value = [...selectedMappings.value, row]
+  }
+}
+const mobileAllMappingsSelected = computed(
+  () => mappings.value.length > 0 && mappings.value.every((item) => selectedMappingIdSet.value.has(Number(item.id))),
+)
+const toggleMobileSelectAllMappings = () => {
+  selectedMappings.value = mobileAllMappingsSelected.value ? [] : [...mappings.value]
 }
 
 const batchSetEnabled = async (enabled) => {
@@ -480,6 +559,13 @@ const removeMapping = async (row) => {
 onMounted(() => {
   loadProviders()
   loadMappings()
+  mobileMediaQuery = window.matchMedia(MOBILE_QUERY)
+  isMobile.value = mobileMediaQuery.matches
+  mobileMediaQuery.addEventListener('change', syncMobile)
+})
+
+onBeforeUnmount(() => {
+  mobileMediaQuery?.removeEventListener('change', syncMobile)
 })
 </script>
 
@@ -572,5 +658,147 @@ onMounted(() => {
   .filter-row {
     grid-template-columns: 1fr;
   }
+}
+
+@media (max-width: 768px) {
+  .filter-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: 8px;
+  }
+
+  .filter-row :deep(.el-button) {
+    width: 100%;
+    margin-left: 0;
+  }
+}
+
+.map-card-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  margin-bottom: 8px;
+}
+
+.map-card-count {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.map-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.map-card {
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: var(--el-bg-color);
+}
+
+.map-card__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.map-card__name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-card__toggle {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 2px;
+  padding: 2px 0;
+  border: none;
+  background: none;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+  cursor: pointer;
+}
+
+.map-card__toggle .el-icon {
+  transition: transform 0.2s;
+}
+
+.map-card__toggle .el-icon.is-open {
+  transform: rotate(180deg);
+}
+
+.map-card__meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 12px;
+  min-width: 0;
+}
+
+.map-card__arrow {
+  color: var(--el-text-color-secondary);
+  flex: 0 0 auto;
+}
+
+.map-card__real {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--el-text-color-regular);
+}
+
+.map-card__detail {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--el-border-color-lighter);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.map-card__row {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.map-card__row > span:first-child {
+  flex: 0 0 62px;
+  color: var(--el-text-color-secondary);
+}
+
+.map-card__row > span:last-child {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-all;
+}
+
+.map-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
+.map-card__actions :deep(.el-button) {
+  margin-left: 0;
+  padding: 0;
+  font-size: 12px;
 }
 </style>

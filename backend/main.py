@@ -19,13 +19,17 @@ mimetypes.add_type("font/woff", ".woff")
 mimetypes.add_type("application/json", ".json")
 mimetypes.add_type("application/wasm", ".wasm")
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from config import settings, export_config
+from services.runtime_log_service import install_runtime_log_handler
+
+install_runtime_log_handler()
+
 from database import async_session_maker, init_db
-from routers import admin_router, proxy_router, stats_router, auth_router, openai_plus_router
+from routers import admin_router, proxy_router, stats_router, auth_router, openai_plus_router, grok_admin_router, grok_proxy_router
 from services import usage_rollup_service
 
 logger = logging.getLogger(__name__)
@@ -77,6 +81,7 @@ async def _periodic_clear_stale_result_meta() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and tear down application resources."""
+    install_runtime_log_handler()
     await init_db()
     async with async_session_maker() as session:
         await usage_rollup_service.maintain(session)
@@ -84,8 +89,8 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(_periodic_close_stale_image_tasks())
     meta_cleanup_task = asyncio.create_task(_periodic_clear_stale_result_meta())
 
-    print("[CPA] System started")
-    print(f"[CPA] Master Key: {settings.master_key}")
+    logger.info("[CPA] System started")
+    logger.info("[CPA] Master Key loaded")
     yield
     cleanup_task.cancel()
     meta_cleanup_task.cancel()
@@ -97,7 +102,7 @@ async def lifespan(app: FastAPI):
         await meta_cleanup_task
     except asyncio.CancelledError:
         pass
-    print("[CPA] System stopped")
+    logger.info("[CPA] System stopped")
 
 
 app = FastAPI(
@@ -115,11 +120,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def log_plus_requests(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/plus/") and response.status_code >= 400:
+        logger.warning(
+            "[CPA PLUS REQUEST] method=%s path=%s status=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+        )
+    return response
+
+
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
 app.include_router(stats_router, prefix="/api/stats", tags=["stats"])
 app.include_router(proxy_router, tags=["proxy"])
 app.include_router(openai_plus_router, tags=["openai-plus"])
+app.include_router(grok_admin_router, prefix="/api/admin/grok", tags=["grok-admin"])
+app.include_router(grok_proxy_router, prefix="/grok", tags=["grok-proxy"])
 
 
 def _guess_media_type(filepath: Path) -> str | None:

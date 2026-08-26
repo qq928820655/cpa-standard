@@ -3,11 +3,76 @@
 """
 from datetime import datetime
 from typing import Optional, Any
+from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class UsageTracker:
     """用量追踪器"""
+
+    @staticmethod
+    async def _add_api_key_lifetime_usage(
+        db: AsyncSession,
+        api_key_id: int,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        cache_tokens: int = 0,
+        status: str = "success",
+    ):
+        """累加 Key 生命周期用量，不依赖明细日志保留期。"""
+        from models import ApiKey
+
+        if total_tokens == 0:
+            total_tokens = prompt_tokens + completion_tokens
+
+        await db.execute(
+            update(ApiKey)
+            .where(ApiKey.id == api_key_id)
+            .values(
+                request_count=func.coalesce(ApiKey.request_count, 0) + 1,
+                success_count=func.coalesce(ApiKey.success_count, 0) + (1 if status == "success" else 0),
+                error_count=func.coalesce(ApiKey.error_count, 0) + (0 if status == "success" else 1),
+                prompt_tokens=func.coalesce(ApiKey.prompt_tokens, 0) + int(prompt_tokens or 0),
+                completion_tokens=func.coalesce(ApiKey.completion_tokens, 0) + int(completion_tokens or 0),
+                total_tokens=func.coalesce(ApiKey.total_tokens, 0) + int(total_tokens or 0),
+                cache_tokens=func.coalesce(ApiKey.cache_tokens, 0) + int(cache_tokens or 0),
+            )
+        )
+
+    @staticmethod
+    async def _add_user_lifetime_usage(
+        db: AsyncSession,
+        user_id: Optional[int],
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        cache_tokens: int = 0,
+        status: str = "success",
+    ):
+        """累加用户生命周期用量，不依赖明细日志保留期。user_id 为空时跳过。"""
+        if user_id is None:
+            return
+        from models import AdminUser
+
+        if total_tokens == 0:
+            total_tokens = prompt_tokens + completion_tokens
+
+        await db.execute(
+            update(AdminUser)
+            .where(AdminUser.id == user_id)
+            .values(
+                request_count=func.coalesce(AdminUser.request_count, 0) + 1,
+                success_count=func.coalesce(AdminUser.success_count, 0) + (1 if status == "success" else 0),
+                error_count=func.coalesce(AdminUser.error_count, 0) + (0 if status == "success" else 1),
+                prompt_tokens=func.coalesce(AdminUser.prompt_tokens, 0) + int(prompt_tokens or 0),
+                completion_tokens=func.coalesce(AdminUser.completion_tokens, 0) + int(completion_tokens or 0),
+                total_tokens=func.coalesce(AdminUser.total_tokens, 0) + int(total_tokens or 0),
+                cache_tokens=func.coalesce(AdminUser.cache_tokens, 0) + int(cache_tokens or 0),
+            )
+        )
 
     @staticmethod
     async def create_pending_record(
@@ -98,6 +163,9 @@ class UsageTracker:
         if persistent_log is None:
             return None
 
+        previous_status = persistent_log.status
+        should_add_lifetime_usage = previous_status == "in_progress" and status != "in_progress"
+
         persistent_log.prompt_tokens = prompt_tokens
         persistent_log.completion_tokens = completion_tokens
         persistent_log.total_tokens = total_tokens
@@ -107,6 +175,26 @@ class UsageTracker:
         persistent_log.cpa_overhead_ms = cpa_overhead_ms
         persistent_log.status = status
         persistent_log.error_message = error_message
+
+        if should_add_lifetime_usage:
+            await UsageTracker._add_api_key_lifetime_usage(
+                db,
+                persistent_log.api_key_id,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cache_tokens=cache_tokens,
+                status=status,
+            )
+            await UsageTracker._add_user_lifetime_usage(
+                db,
+                getattr(persistent_log, "user_id", None),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cache_tokens=cache_tokens,
+                status=status,
+            )
 
         await db.commit()
         return persistent_log
@@ -148,6 +236,8 @@ class UsageTracker:
             cpa_overhead_ms = max(latency_ms - upstream_latency_ms, 0)
 
         persistent_log = await db.merge(log)
+        previous_status = getattr(persistent_log, "status", None)
+        should_add_lifetime_usage = previous_status == "in_progress" and status != "in_progress"
         persistent_log.prompt_tokens = prompt_tokens
         persistent_log.completion_tokens = completion_tokens
         persistent_log.total_tokens = total_tokens
@@ -157,6 +247,26 @@ class UsageTracker:
         persistent_log.cpa_overhead_ms = cpa_overhead_ms
         persistent_log.status = status
         persistent_log.error_message = error_message
+
+        if should_add_lifetime_usage:
+            await UsageTracker._add_api_key_lifetime_usage(
+                db,
+                persistent_log.api_key_id,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cache_tokens=cache_tokens,
+                status=status,
+            )
+            await UsageTracker._add_user_lifetime_usage(
+                db,
+                getattr(persistent_log, "user_id", None),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cache_tokens=cache_tokens,
+                status=status,
+            )
 
         await db.commit()
         return persistent_log

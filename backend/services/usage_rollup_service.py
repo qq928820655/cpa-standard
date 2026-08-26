@@ -15,6 +15,28 @@ REALTIME_RETENTION_DAYS = 7
 SUMMARY_RETENTION_DAYS = 90
 
 
+def _get_realtime_retention_days() -> int:
+    """读取实时明细保留天数配置，非法值回退默认 7 天。"""
+    try:
+        from config import export_config
+
+        value = int(export_config.get("usage_log_retention_days") or REALTIME_RETENTION_DAYS)
+        return value if value >= 1 else REALTIME_RETENTION_DAYS
+    except (TypeError, ValueError, ImportError):
+        return REALTIME_RETENTION_DAYS
+
+
+def _get_summary_retention_days() -> int:
+    """读取按天汇总保留天数配置，非法值回退默认 90 天。"""
+    try:
+        from config import export_config
+
+        value = int(export_config.get("usage_summary_retention_days") or SUMMARY_RETENTION_DAYS)
+        return value if value >= 1 else SUMMARY_RETENTION_DAYS
+    except (TypeError, ValueError, ImportError):
+        return SUMMARY_RETENTION_DAYS
+
+
 @dataclass
 class TimeRangeWindow:
     summary_start: Optional[datetime]
@@ -29,13 +51,13 @@ class UsageRollupService:
     @staticmethod
     def get_realtime_boundary(now: Optional[datetime] = None) -> datetime:
         now = now or datetime.utcnow()
-        boundary_date = (now - timedelta(days=REALTIME_RETENTION_DAYS)).date()
+        boundary_date = (now - timedelta(days=_get_realtime_retention_days())).date()
         return datetime.combine(boundary_date, time.min)
 
     @staticmethod
     def get_summary_boundary(now: Optional[datetime] = None) -> datetime:
         now = now or datetime.utcnow()
-        boundary_date = (now - timedelta(days=SUMMARY_RETENTION_DAYS)).date()
+        boundary_date = (now - timedelta(days=_get_summary_retention_days())).date()
         return datetime.combine(boundary_date, time.min)
 
     @staticmethod
@@ -117,7 +139,6 @@ class UsageRollupService:
             select(
                 func.date(UsageLog.request_time).label("summary_date"),
                 UsageLog.api_key_id.label("api_key_id"),
-                UsageLog.user_id.label("user_id"),
                 func.count(UsageLog.id).label("total_requests"),
                 func.sum(case((UsageLog.status == "success", 1), else_=0)).label("success_requests"),
                 func.sum(case((UsageLog.status == "error", 1), else_=0)).label("error_requests"),
@@ -135,7 +156,7 @@ class UsageRollupService:
             )
             .where(UsageLog.request_time < cls.get_realtime_boundary(now))
             .where(UsageLog.request_time >= cls.get_summary_boundary(now))
-            .group_by(func.date(UsageLog.request_time), UsageLog.api_key_id, UsageLog.user_id)
+            .group_by(func.date(UsageLog.request_time), UsageLog.api_key_id)
         )
 
         result = await db.execute(query)
@@ -145,7 +166,7 @@ class UsageRollupService:
                 UsageDailySummary(
                     summary_date=datetime.strptime(str(row.summary_date), "%Y-%m-%d").date(),
                     api_key_id=row.api_key_id,
-                    user_id=getattr(row, "user_id", None),
+                    user_id=None,
                     total_requests=row.total_requests or 0,
                     success_requests=row.success_requests or 0,
                     error_requests=row.error_requests or 0,
@@ -168,6 +189,7 @@ class UsageRollupService:
 
     @staticmethod
     async def cleanup_old_data(db: AsyncSession, *, now: Optional[datetime] = None):
+        """按保留期清理历史用量，仅由显式维护任务调用。"""
         from models import UsageDailySummary, UsageLog
 
         now = now or datetime.utcnow()
@@ -183,7 +205,6 @@ class UsageRollupService:
     async def maintain(cls, db: AsyncSession, *, now: Optional[datetime] = None):
         now = now or datetime.utcnow()
         await cls.rebuild_recent_summaries(db, now=now)
-        await cls.cleanup_old_data(db, now=now)
 
 
 usage_rollup_service = UsageRollupService()

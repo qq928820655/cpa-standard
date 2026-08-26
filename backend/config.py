@@ -20,6 +20,7 @@ DEFAULT_EXPORT_CONFIG = {
     "image_auto_refresh_interval_seconds": 30,
     "image_auto_refresh_max_attempts": 10,
     "image_stale_task_cleanup_interval_seconds": 60,
+    "openai_plus_proxy_url": "",
     # provider 扩展配置：{ "bb": { "password": "xxx" }, ... }
     "provider_ext": {},
     # 是否向管理员显示实际使用的模型（格式：请求模型/映射模型），默认关闭
@@ -60,6 +61,13 @@ DEFAULT_EXPORT_CONFIG = {
     "provider_model_compat_overrides": [],
     # 透传错误码：命中这些状态码时直接返回上游响应，不切换 Key、不冷却、不重试
     "pass_through_error_codes": [],
+    # 用量实时明细保留天数：超过后 usage_logs 明细清理，默认 7 天，可配置
+    "usage_log_retention_days": 7,
+    # 用量按天汇总保留天数：超过后 usage_daily_summaries 清理，默认 90 天，可配置
+    "usage_summary_retention_days": 90,
+    "model_price_display_currency": "USD",
+    "model_price_exchange_rate_mode": "fixed",
+    "model_price_usd_cny_rate": 7.2,
     # 模型种子回填开关：关闭后 list_models 不再用 DEFAULT_MODELS 种子自动插入/更新模型
     "model_seed_enabled": True,
     # 代理调试追踪：默认关闭，只记录轻量决策信息
@@ -69,6 +77,10 @@ DEFAULT_EXPORT_CONFIG = {
     "proxy_trace_only_failures": False,
     "proxy_trace_target_provider": "",
     "proxy_trace_target_model": "",
+    # 运行日志页面：默认关闭，开启后使用 3MB 内存循环缓冲
+    "runtime_log_enabled": False,
+    # 运行日志滚动信息：默认关闭，开启后按页面宽度自动换行显示
+    "runtime_log_wrap": False,
     # 上游内容安全防护：默认关闭，开启后扫描广告与危险代码片段
     "content_guard": {
         "enabled": False,
@@ -119,7 +131,7 @@ def load_export_config() -> dict:
 class Settings(BaseSettings):
     # 应用配置
     app_name: str = "CPA - API Key 中转系统"
-    debug: bool = True
+    debug: bool = False
 
     # 数据库配置
     database_url: str = f"sqlite+aiosqlite:///{DEFAULT_DATABASE_PATH.as_posix()}"

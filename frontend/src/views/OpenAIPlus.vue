@@ -6,7 +6,19 @@
           <div>
             <div class="panel-title">OpenAI</div>
           </div>
-          <el-button type="primary" @click="loadAccounts">刷新</el-button>
+          <div class="header-actions">
+            <input
+              ref="cpaToSub2ApiInput"
+              class="hidden-file-input"
+              type="file"
+              accept=".json,application/json"
+              multiple
+              @change="handleCpaToSub2ApiFiles"
+            />
+            <el-button @click="openCpaToSub2ApiPicker">cpa→sub2api</el-button>
+            <el-button @click="openPlusProxyDialog">代理设置</el-button>
+            <el-button type="primary" @click="loadAccounts">刷新</el-button>
+          </div>
         </div>
       </template>
 
@@ -65,6 +77,7 @@
                   <span class="quota-card__toggle">{{ isQuotaCardCollapsed(account.id) ? '展开' : '折叠' }}</span>
                 </div>
               </div>
+              <div class="quota-card__account-id">Account ID：{{ account.account_id || '-' }}</div>
               <div class="quota-card__meta">套餐：{{ getDisplayPlan(account) }} / 过期：{{ formatTime(account.expires_at) }}</div>
               <div v-if="quotaLoading" class="quota-card__quota">官方配额加载中...</div>
               <div v-else-if="hasQuotaDetail(account)" class="quota-card__quota">
@@ -105,6 +118,7 @@
                 <div class="panel-title">OpenAI 账号列表</div>
                 <div class="account-actions">
                   <el-button size="small" :disabled="!pagedAccounts.length" @click="selectCurrentPage401Accounts">勾选401异常</el-button>
+                  <el-button size="small" :disabled="!filteredAccounts.length" @click="openExistingAccountExportDialog">导出账号</el-button>
                   <el-button size="small" :disabled="!selectedAccounts.length" @click="batchSetAccountsDisabled(false)">批量启用</el-button>
                   <el-button size="small" :disabled="!selectedAccounts.length" @click="batchSetAccountsDisabled(true)">批量禁用</el-button>
                   <el-button size="small" type="danger" :disabled="!selectedAccounts.length" @click="batchDeleteAccounts">批量删除</el-button>
@@ -112,7 +126,78 @@
                 </div>
               </div>
             </template>
-            <el-table ref="accountTableRef" :data="pagedAccounts" stripe border v-loading="loading" size="small" @selection-change="handleAccountSelectionChange">
+            <!-- 窄屏：10 列账号表格改卡片流，详细字段折叠在「详情」里 -->
+            <div v-if="isMobile" class="acct-card-list" v-loading="loading">
+              <div class="acct-card-toolbar">
+                <el-checkbox :model-value="mobileAllAccountsSelected" @change="toggleMobileSelectAllAccounts">
+                  全选本页
+                </el-checkbox>
+                <span class="acct-card-toolbar__count">共 {{ filteredAccounts.length }} 个</span>
+              </div>
+
+              <div v-if="!pagedAccounts.length" class="acct-card-empty">暂无数据</div>
+
+              <div
+                v-for="row in pagedAccounts"
+                :key="row.id"
+                class="acct-card"
+                :class="{ 'is-selected': isAccountSelected(row) }"
+              >
+                <div class="acct-card__head">
+                  <el-checkbox :model-value="isAccountSelected(row)" @change="() => toggleAccountSelect(row)" />
+                  <span class="acct-card__email">{{ row.email || `#${row.id}` }}</span>
+                  <button type="button" class="acct-card__toggle" @click="toggleAccountExpand(row.id)">
+                    <span>{{ isAccountExpanded(row.id) ? '收起' : '详情' }}</span>
+                    <el-icon :class="{ 'is-open': isAccountExpanded(row.id) }"><ArrowDown /></el-icon>
+                  </button>
+                </div>
+
+                <div class="acct-card__tags">
+                  <el-tag size="small" type="info">#{{ row.id }}</el-tag>
+                  <el-tag :type="row.disabled ? 'danger' : 'success'" size="small">
+                    {{ row.disabled ? '禁用' : '启用' }}
+                  </el-tag>
+                  <el-tag v-if="row.plan_type" size="small" type="info">{{ row.plan_type }}</el-tag>
+                </div>
+
+                <div v-show="isAccountExpanded(row.id)" class="acct-card__rows">
+                  <div class="acct-card__row">
+                    <span class="acct-card__label">过期时间</span>
+                    <span class="acct-card__value">{{ formatTime(row.expires_at) }}</span>
+                  </div>
+                  <div class="acct-card__row">
+                    <span class="acct-card__label">Proxy Key</span>
+                    <span class="acct-card__value acct-card__value--key">
+                      <code>{{ row.proxy_key }}</code>
+                      <el-button link type="primary" @click="copyToClipboard(row.proxy_key)">复制</el-button>
+                    </span>
+                  </div>
+                  <div class="acct-card__row">
+                    <span class="acct-card__label">统计</span>
+                    <span class="acct-card__value">
+                      {{ row.success_count || 0 }}/{{ row.request_count || 0 }} 成功 ·
+                      {{ formatToken(row.total_tokens) }} token
+                    </span>
+                  </div>
+                  <div class="acct-card__row">
+                    <span class="acct-card__label">检测结果</span>
+                    <span class="acct-card__value">{{ row.last_check_message || '-' }}</span>
+                  </div>
+                </div>
+
+                <div class="acct-card__actions">
+                  <el-button size="small" type="primary" :loading="checkingId === row.id" @click="checkAccount(row)">
+                    测试
+                  </el-button>
+                  <el-button size="small" :type="row.disabled ? 'success' : 'warning'" @click="toggleAccount(row)">
+                    {{ row.disabled ? '启用' : '禁用' }}
+                  </el-button>
+                  <el-button size="small" type="danger" @click="deleteAccount(row)">删除</el-button>
+                </div>
+              </div>
+            </div>
+
+            <el-table v-else ref="accountTableRef" :data="pagedAccounts" stripe border v-loading="loading" size="small" @selection-change="handleAccountSelectionChange">
               <el-table-column type="selection" width="42" />
               <el-table-column prop="id" label="ID" width="54" />
               <el-table-column prop="email" label="邮箱" width="143" />
@@ -161,7 +246,8 @@
                 v-model:page-size="accountPageSize"
                 :page-sizes="[60, 100, 200]"
                 :total="filteredAccounts.length"
-                layout="sizes, prev, pager, next, jumper"
+                :pager-count="isMobile ? 5 : 7"
+                :layout="isMobile ? 'prev, pager, next, sizes' : 'sizes, prev, pager, next, jumper'"
                 small
               />
             </div>
@@ -169,6 +255,15 @@
         </el-tab-pane>
 
         <el-tab-pane label="用量管理" name="usage">
+          <div class="usage-summary-bar">
+            <span>请求 {{ usageSummary.success_count || 0 }}/{{ usageSummary.request_count || 0 }}</span>
+            <span>失败 {{ usageSummary.error_count || 0 }}</span>
+            <span>输入 {{ formatToken(usageSummary.prompt_tokens) }}</span>
+            <span>缓存 {{ formatToken(usageSummary.cache_tokens) }}</span>
+            <span>输出 {{ formatToken(usageSummary.completion_tokens) }}</span>
+            <span>总量 {{ formatToken(usageSummary.total_tokens) }}</span>
+            <span>平均耗时 {{ formatLatency(usageSummary.avg_latency_ms) }}</span>
+          </div>
           <div class="usage-toolbar">
             <el-button size="small" @click="moveUsageColumn(-1)">列左移</el-button>
             <el-button size="small" @click="moveUsageColumn(1)">列右移</el-button>
@@ -187,15 +282,92 @@
             >
               <template #default="{ row }">
                 <el-tag v-if="column.prop === 'success'" :type="row.success ? 'success' : 'danger'" size="small">{{ row.success ? '成功' : '失败' }}</el-tag>
-                <span v-else-if="column.prop === 'stream'">{{ row.stream ? '流式' : '非流式' }}</span>
+                <span v-else-if="column.prop === 'endpoint'">{{ formatEndpoint(row) }}</span>
+                <span v-else-if="['prompt_tokens', 'cache_tokens', 'completion_tokens', 'total_tokens'].includes(column.prop)">{{ formatToken(row[column.prop]) }}</span>
+                <span v-else-if="column.prop === 'latency_ms'">{{ formatLatency(row.latency_ms) }}</span>
                 <span v-else-if="column.prop === 'created_at'">{{ formatTime(row.created_at) }}</span>
                 <span v-else>{{ row[column.prop] ?? '-' }}</span>
               </template>
             </el-table-column>
           </el-table>
+          <div class="usage-pagination">
+            <span>共 {{ usagePagination.total }} 条记录</span>
+            <el-pagination
+              v-model:current-page="usagePagination.page"
+              v-model:page-size="usagePagination.page_size"
+              :page-sizes="[20, 40, 60]"
+              :total="usagePagination.total"
+              layout="sizes, prev, pager, next, jumper"
+              small
+              @current-change="loadUsageLogs"
+              @size-change="handleUsagePageSizeChange"
+            />
+          </div>
+          <div class="usage-subtitle">账户累计</div>
+          <el-table :data="usageAccountSummaries" stripe border size="small" class="usage-account-table">
+            <el-table-column prop="id" label="ID" width="60" />
+            <el-table-column prop="email" label="账号" min-width="180" show-overflow-tooltip />
+            <el-table-column prop="account_id" label="Account ID" min-width="180" show-overflow-tooltip />
+            <el-table-column label="请求" width="100">
+              <template #default="{ row }">{{ row.success_count || 0 }}/{{ row.request_count || 0 }}</template>
+            </el-table-column>
+            <el-table-column prop="error_count" label="失败" width="80" />
+            <el-table-column label="输入" width="100">
+              <template #default="{ row }">{{ formatToken(row.prompt_tokens) }}</template>
+            </el-table-column>
+            <el-table-column label="缓存" width="100">
+              <template #default="{ row }">{{ formatToken(row.cache_tokens) }}</template>
+            </el-table-column>
+            <el-table-column label="输出" width="100">
+              <template #default="{ row }">{{ formatToken(row.completion_tokens) }}</template>
+            </el-table-column>
+            <el-table-column label="总量" width="100">
+              <template #default="{ row }">{{ formatToken(row.total_tokens) }}</template>
+            </el-table-column>
+          </el-table>
         </el-tab-pane>
       </el-tabs>
     </el-card>
+
+      <el-dialog v-model="plusProxyDialogVisible" title="OpenAI Plus 代理设置" width="560px">
+        <el-form label-width="96px">
+          <el-form-item label="代理地址">
+            <el-input v-model="plusProxyForm.openai_plus_proxy_url" clearable placeholder="例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7890" />
+          </el-form-item>
+          <el-form-item label="缓存友好">
+            <el-switch v-model="plusProxyForm.openai_plus_cache_friendly" active-text="开启" inactive-text="关闭" />
+          </el-form-item>
+          <div class="form-tip">为空表示直连。缓存友好模式会默认启用 store，以提升 OpenAI Plus 上游缓存命中率。</div>
+        </el-form>
+        <template #footer>
+          <el-button @click="plusProxyDialogVisible = false">取消</el-button>
+          <el-button type="primary" :loading="plusProxySaving" @click="savePlusProxyConfig">保存</el-button>
+        </template>
+      </el-dialog>
+
+      <el-dialog v-model="exportDialogVisible" title="导出 OpenAI 账号" width="460px">
+        <el-form label-width="92px">
+          <el-form-item label="导出范围">
+            <span>{{ selectedAccounts.length ? `当前勾选 ${selectedAccounts.length} 个账号` : `当前筛选全部 ${filteredAccounts.length} 个账号` }}</span>
+          </el-form-item>
+          <el-form-item label="导出格式">
+            <el-radio-group v-model="exportForm.format">
+              <el-radio label="cpa">通用 CPA</el-radio>
+              <el-radio label="sub2api">sub2api</el-radio>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item label="导出方式">
+            <el-radio-group v-model="exportForm.mode">
+              <el-radio label="merged">合并为一个文件</el-radio>
+              <el-radio label="separate">每个账号独立文件</el-radio>
+            </el-radio-group>
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="exportDialogVisible = false">取消</el-button>
+          <el-button type="primary" :loading="exportingAccounts" @click="handleExistingAccountExport">确认导出</el-button>
+        </template>
+      </el-dialog>
 
       <el-dialog v-model="importDialogVisible" title="导入 OpenAI 账号" width="680px">
         <div class="import-file-box">
@@ -227,9 +399,29 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { ArrowDown } from '@element-plus/icons-vue'
 import { adminApi, copyText } from '../api'
+
+// 手机竖屏改用卡片流，桌面端保持原表格
+const MOBILE_QUERY = '(max-width: 768px)'
+const isMobile = ref(false)
+let mobileMediaQuery = null
+const syncMobile = (event) => {
+  isMobile.value = event.matches
+}
+
+// 账号卡片的详细字段按需展开
+const expandedAccountIds = ref(new Set())
+const isAccountExpanded = (id) => expandedAccountIds.value.has(Number(id))
+const toggleAccountExpand = (id) => {
+  const next = new Set(expandedAccountIds.value)
+  const key = Number(id)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedAccountIds.value = next
+}
 
 const accounts = ref([])
 const quotas = ref(null)
@@ -249,14 +441,24 @@ const loading = ref(false)
 const importing = ref(false)
 const checkingId = ref(null)
 const importDialogVisible = ref(false)
+const exportDialogVisible = ref(false)
+const exportingAccounts = ref(false)
+const exportForm = ref({ format: 'cpa', mode: 'merged' })
+const plusProxyDialogVisible = ref(false)
+const plusProxySaving = ref(false)
+const plusProxyForm = ref({ openai_plus_proxy_url: '', openai_plus_cache_friendly: false })
 const importContent = ref('')
 const importFiles = ref([])
 const importFileInput = ref(null)
+const cpaToSub2ApiInput = ref(null)
 const accountTableRef = ref(null)
 const selectedAccounts = ref([])
 const activeTab = ref('accounts')
 const usageLoading = ref(false)
 const usageLogs = ref([])
+const usageSummary = ref({})
+const usageAccountSummaries = ref([])
+const usagePagination = ref({ page: 1, page_size: 60, total: 0 })
 const selectedUsageRow = ref(null)
 const filteredAccounts = computed(() => {
   const keyword = accountKeyword.value.trim().toLowerCase()
@@ -279,14 +481,17 @@ const selectedAccountIds = computed(() => new Set(selectedAccounts.value.map((it
 const usageColumns = ref([
   { prop: 'id', label: 'ID', width: 70 },
   { prop: 'account_email', label: '账号', width: 210 },
+  { prop: 'account_openai_id', label: 'Account ID', width: 260 },
   { prop: 'model', label: '模型', width: 120 },
-  { prop: 'endpoint', label: '接口', width: 120 },
-  { prop: 'stream', label: '模式', width: 80 },
+  { prop: 'endpoint', label: '接口', width: 130 },
   { prop: 'prompt_tokens', label: '输入', width: 80 },
+  { prop: 'cache_tokens', label: '缓存', width: 80 },
   { prop: 'completion_tokens', label: '输出', width: 80 },
   { prop: 'total_tokens', label: '总量', width: 80 },
+  { prop: 'latency_ms', label: '耗时', width: 90 },
   { prop: 'success', label: '状态', width: 80 },
   { prop: 'status_code', label: 'HTTP', width: 80 },
+  { prop: 'error_message', label: '错误', width: 220 },
   { prop: 'created_at', label: '时间', width: 160 },
 ])
 
@@ -393,8 +598,14 @@ const refreshAccountQuota = async (account) => refreshSingleAccountStatus(accoun
 const loadUsageLogs = async () => {
   usageLoading.value = true
   try {
-    const res = await adminApi.listOpenAIPlusUsageLogs({ limit: 200 })
+    const res = await adminApi.listOpenAIPlusUsageLogs({
+      page: usagePagination.value.page,
+      page_size: usagePagination.value.page_size,
+    })
     usageLogs.value = res.items || []
+    usageSummary.value = res.summary || {}
+    usageAccountSummaries.value = res.account_summaries || []
+    usagePagination.value = { ...usagePagination.value, ...(res.pagination || {}) }
   } catch (error) {
     ElMessage.error(error.message || '用量加载失败')
   } finally {
@@ -405,6 +616,13 @@ const loadUsageLogs = async () => {
 const handleUsageCurrentChange = (row) => {
   selectedUsageRow.value = row
 }
+
+const handleUsagePageSizeChange = () => {
+  usagePagination.value.page = 1
+  loadUsageLogs()
+}
+
+const formatEndpoint = (row) => `${row.endpoint || '-'}${row.stream ? '(流式)' : '(非流式)'}`
 
 const moveUsageColumn = (direction) => {
   if (!usageColumns.value.length) return
@@ -439,6 +657,213 @@ const openImportDialog = () => {
 
 const handleImportFilesChange = (event) => {
   importFiles.value = Array.from(event.target.files || [])
+}
+
+const openCpaToSub2ApiPicker = () => {
+  if (cpaToSub2ApiInput.value) {
+    cpaToSub2ApiInput.value.value = ''
+    cpaToSub2ApiInput.value.click()
+  }
+}
+
+const openPlusProxyDialog = async () => {
+  plusProxyDialogVisible.value = true
+  try {
+    const data = await adminApi.getOpenAIPlusProxyConfig()
+    plusProxyForm.value.openai_plus_proxy_url = data.openai_plus_proxy_url || ''
+    plusProxyForm.value.openai_plus_cache_friendly = !!data.openai_plus_cache_friendly
+  } catch (error) {
+    ElMessage.error(error.message || '加载 Plus 代理配置失败')
+  }
+}
+
+const savePlusProxyConfig = async () => {
+  plusProxySaving.value = true
+  try {
+    const data = await adminApi.updateOpenAIPlusProxyConfig(plusProxyForm.value)
+    plusProxyForm.value.openai_plus_proxy_url = data.openai_plus_proxy_url || ''
+    plusProxyForm.value.openai_plus_cache_friendly = !!data.openai_plus_cache_friendly
+    ElMessage.success('Plus 代理配置已保存')
+    plusProxyDialogVisible.value = false
+  } catch (error) {
+    ElMessage.error(error.message || '保存失败')
+  } finally {
+    plusProxySaving.value = false
+  }
+}
+
+const readJsonFile = (file) => new Promise((resolve, reject) => {
+  const reader = new FileReader()
+  reader.onload = () => {
+    try {
+      resolve(JSON.parse(String(reader.result || '')))
+    } catch {
+      reject(new Error(`${file.name} 不是有效 JSON`))
+    }
+  }
+  reader.onerror = () => reject(new Error(`${file.name} 读取失败`))
+  reader.readAsText(file)
+})
+
+const decodeJwtPayload = (token) => {
+  try {
+    const payload = String(token || '').split('.')[1]
+    if (!payload) return {}
+    const normalized = payload.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=')
+    return JSON.parse(decodeURIComponent(escape(window.atob(padded))))
+  } catch {
+    return {}
+  }
+}
+
+const normalizeEmailKey = (email) => String(email || '').replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '').toLowerCase()
+
+const toIsoTime = (value, fallback = new Date().toISOString()) => {
+  if (!value) return fallback
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? fallback : date.toISOString()
+}
+
+const normalizeCpaAccount = (payload) => {
+  const accessToken = payload.access_token || payload.accessToken || payload.tokens?.access_token || payload.tokens?.accessToken || ''
+  if (!accessToken) throw new Error('缺少 access_token/accessToken')
+
+  const jwtPayload = decodeJwtPayload(accessToken)
+  const auth = jwtPayload['https://api.openai.com/auth'] || {}
+  const profile = jwtPayload['https://api.openai.com/profile'] || {}
+  const email = payload.email || payload.user?.email || profile.email || ''
+  const accountId = payload.chatgpt_account_id || payload.account_id || payload.account?.id || auth.chatgpt_account_id || ''
+  const userId = payload.chatgpt_user_id || payload.user_id || payload.user?.id || auth.chatgpt_user_id || auth.user_id || ''
+  const planType = payload.plan_type || payload.chatgpt_plan_type || payload.account?.planType || auth.chatgpt_plan_type || ''
+  const expiresAt = toIsoTime(payload.expires_at || payload.expired || payload.expires || (jwtPayload.exp ? jwtPayload.exp * 1000 : null))
+  const lastRefresh = toIsoTime(payload.last_refresh || payload.updated_at || payload.created_at)
+
+  if (!accountId) throw new Error('缺少 chatgpt_account_id/account_id')
+
+  return {
+    name: payload.name || email || accountId,
+    platform: 'openai',
+    type: 'oauth',
+    concurrency: 10,
+    priority: 1,
+    credentials: {
+      access_token: accessToken,
+      chatgpt_account_id: accountId,
+      chatgpt_user_id: userId,
+      email,
+      expires_at: expiresAt,
+      expires_in: Math.max(Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000), 0),
+      id_token: payload.id_token || payload.idToken || payload.tokens?.id_token || payload.tokens?.idToken || '',
+      plan_type: planType,
+    },
+    extra: {
+      email,
+      email_key: normalizeEmailKey(email),
+      last_refresh: lastRefresh,
+    },
+  }
+}
+
+const downloadJson = (filename, data) => {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
+
+const downloadBlob = (filename, blob) => {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
+
+const openExistingAccountExportDialog = () => {
+  exportForm.value = { format: 'cpa', mode: 'merged' }
+  exportDialogVisible.value = true
+}
+
+const handleExistingAccountExport = async () => {
+  const targetAccounts = selectedAccounts.value.length ? selectedAccounts.value : filteredAccounts.value
+  if (!targetAccounts.length) {
+    ElMessage.warning('没有可导出的账号')
+    return
+  }
+  exportingAccounts.value = true
+  try {
+    const payload = {
+      account_ids: targetAccounts.map((item) => item.id),
+      format: exportForm.value.format,
+      mode: exportForm.value.mode,
+    }
+    const result = await adminApi.exportOpenAIPlusAccounts(payload)
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const prefix = exportForm.value.format === 'sub2api' ? 'sub2api-openai' : 'openai-cpa'
+    if (exportForm.value.mode === 'separate') {
+      downloadBlob(`${prefix}-${stamp}.zip`, result)
+    } else {
+      downloadJson(`${prefix}-${stamp}.json`, result)
+    }
+    exportDialogVisible.value = false
+    ElMessage.success(`已导出 ${targetAccounts.length} 个账号`)
+  } catch (error) {
+    ElMessage.error(error.message || '导出失败')
+  } finally {
+    exportingAccounts.value = false
+  }
+}
+
+const handleCpaToSub2ApiFiles = async (event) => {
+  const files = Array.from(event.target.files || [])
+  if (!files.length) return
+
+  const accounts = []
+  const errors = []
+  const seen = new Set()
+
+  for (const file of files) {
+    try {
+      const payload = await readJsonFile(file)
+      const items = Array.isArray(payload) ? payload : [payload]
+      for (const item of items) {
+        const account = normalizeCpaAccount(item)
+        const key = account.credentials.chatgpt_account_id || `${account.credentials.email}:${account.credentials.access_token}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        accounts.push(account)
+      }
+    } catch (error) {
+      errors.push(`${file.name}: ${error.message || '转换失败'}`)
+    }
+  }
+
+  if (!accounts.length) {
+    ElMessage.error(errors[0] || '没有可转换的账号')
+    return
+  }
+
+  downloadJson(`sub2api-openai-${new Date().toISOString().replace(/[:.]/g, '-')}.json`, {
+    exported_at: new Date().toISOString(),
+    proxies: [],
+    accounts,
+  })
+
+  if (errors.length) {
+    console.warn('cpa→sub2api 部分文件转换失败', errors)
+    ElMessage.warning(`已导出 ${accounts.length} 个账号，${errors.length} 个文件失败，详情见控制台`)
+  } else {
+    ElMessage.success(`已导出 ${accounts.length} 个账号`)
+  }
 }
 
 const normalizeImportPayload = (payload) => {
@@ -528,6 +953,27 @@ const handleAccountSelectionChange = (rows) => {
   selectedAccounts.value = rows || []
 }
 
+// 窄屏卡片列表复用同一份 selectedAccounts，让批量操作按钮无需区分两端
+const isAccountSelected = (row) => selectedAccountIds.value.has(row.id)
+const toggleAccountSelect = (row) => {
+  selectedAccounts.value = isAccountSelected(row)
+    ? selectedAccounts.value.filter((item) => item.id !== row.id)
+    : [...selectedAccounts.value, row]
+}
+const mobileAllAccountsSelected = computed(
+  () => pagedAccounts.value.length > 0 && pagedAccounts.value.every((row) => isAccountSelected(row))
+)
+const toggleMobileSelectAllAccounts = () => {
+  if (mobileAllAccountsSelected.value) {
+    const pageIds = new Set(pagedAccounts.value.map((row) => row.id))
+    selectedAccounts.value = selectedAccounts.value.filter((item) => !pageIds.has(item.id))
+  } else {
+    const merged = new Map(selectedAccounts.value.map((item) => [item.id, item]))
+    pagedAccounts.value.forEach((row) => merged.set(row.id, row))
+    selectedAccounts.value = [...merged.values()]
+  }
+}
+
 const isAccount401Error = (account) => {
   const quota = quotas.value?.[account.id]
   const text = [
@@ -611,7 +1057,9 @@ const buildBaseUrl = () => `${window.location.origin}/plus/v1`
 
 const formatTime = (value) => {
   if (!value) return '-'
-  return new Date(value).toLocaleString('zh-CN', { hour12: false })
+  const text = String(value)
+  const normalized = /[zZ]|[+-]\d{2}:?\d{2}$/.test(text) ? text : `${text}Z`
+  return new Date(normalized).toLocaleString('zh-CN', { hour12: false })
 }
 
 
@@ -620,6 +1068,13 @@ const formatToken = (value) => {
   if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M`
   if (num >= 1000) return `${(num / 1000).toFixed(1)}k`
   return String(num)
+}
+
+const formatLatency = (value) => {
+  const num = Number(value || 0)
+  if (!num) return '-'
+  if (num >= 1000) return `${(num / 1000).toFixed(1)}s`
+  return `${num}ms`
 }
 
 const toggleAllCards = () => {
@@ -690,8 +1145,19 @@ const formatCredits = (credits) => {
   return credits.has_credits ? '有' : '-'
 }
 
+watch(activeTab, (tab) => {
+  if (tab === 'usage') loadUsageLogs()
+})
+
 onMounted(() => {
+  mobileMediaQuery = window.matchMedia(MOBILE_QUERY)
+  isMobile.value = mobileMediaQuery.matches
+  mobileMediaQuery.addEventListener('change', syncMobile)
   loadAccounts()
+})
+
+onBeforeUnmount(() => {
+  mobileMediaQuery?.removeEventListener('change', syncMobile)
 })
 </script>
 
@@ -710,6 +1176,16 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.hidden-file-input {
+  display: none;
 }
 
 .panel-title {
@@ -865,6 +1341,16 @@ onMounted(() => {
   white-space: nowrap;
 }
 
+.quota-card__account-id {
+  margin-top: 6px;
+  overflow: hidden;
+  color: #48617d;
+  font-size: 12px;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .quota-card__meta,
 .quota-card__check {
   margin-top: 8px;
@@ -925,6 +1411,41 @@ onMounted(() => {
   margin-top: 10px;
   color: #40566f;
   font-size: 12px;
+}
+
+.usage-summary-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border: 1px solid #dbe7f5;
+  border-radius: 8px;
+  background: #f6faff;
+  color: #203a59;
+  font-size: 13px;
+}
+
+.usage-pagination {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin: 10px 0 12px;
+  color: #50657f;
+  font-size: 12px;
+}
+
+.usage-subtitle {
+  margin: 12px 0 8px;
+  color: #203a59;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.usage-account-table {
+  margin-top: 0;
 }
 
 .usage-toolbar {
@@ -995,5 +1516,159 @@ onMounted(() => {
   line-height: 18px;
   font-size: 12px;
   color: #40566f;
+}
+
+/* ── 移动端：账号列表卡片流 ── */
+.acc-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.acc-card-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 2px 2px;
+  font-size: 12px;
+  color: #6b7c93;
+}
+
+.acc-card-empty {
+  padding: 20px 0;
+  text-align: center;
+  font-size: 12px;
+  color: #8ba0ba;
+}
+
+.acc-card {
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.acc-card.is-selected {
+  border-color: #3b82f6;
+  background: rgba(59, 130, 246, 0.04);
+}
+
+.acc-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.acc-card__email {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 700;
+  color: #10233f;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.acc-card__toggle {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 0;
+  border: none;
+  background: none;
+  font-size: 11px;
+  color: #7f93ad;
+  cursor: pointer;
+}
+
+.acc-card__toggle .el-icon {
+  transition: transform 0.2s;
+}
+
+.acc-card__toggle .el-icon.is-open {
+  transform: rotate(180deg);
+}
+
+.acc-card__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.acc-card__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(148, 163, 184, 0.24);
+}
+
+.acc-card__row {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.acc-card__label {
+  color: #8ba0ba;
+}
+
+.acc-card__value {
+  min-width: 0;
+  color: #40566f;
+  word-break: break-all;
+}
+
+.acc-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(148, 163, 184, 0.24);
+}
+
+@media (max-width: 768px) {
+  /* 头部按钮组在窄屏换行，避免右侧按钮被裁 */
+  .panel-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .account-actions {
+    flex-wrap: wrap;
+    width: 100%;
+    row-gap: 6px;
+  }
+
+  .account-pagination {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  /* 用量两张表靠「列左移/右移」调顺序，改卡片会丢掉这个能力，
+     这里保留表格并靠自身横向滚动，只收紧字号换取更多可见列 */
+  .usage-toolbar :deep(.el-button) {
+    flex: 1 1 calc(50% - 4px);
+    margin-left: 0;
+  }
+
+  .usage-summary-bar {
+    gap: 8px 12px;
+    padding: 8px 10px;
+    font-size: 12px;
+  }
+
+  .usage-pagination {
+    align-items: flex-start;
+    flex-direction: column;
+  }
 }
 </style>

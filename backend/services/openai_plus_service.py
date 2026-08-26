@@ -1,10 +1,12 @@
 """
 OpenAI Plus account service
 """
+import asyncio
 import base64
 import hashlib
 import json
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -31,6 +33,23 @@ PLUS_SESSION_STICKY_ENABLED = True
 PLUS_SESSION_STICKY_TTL_SECONDS = 6 * 3600
 
 _session_sticky_map: dict[str, tuple[int, float]] = {}
+_session_response_map: dict[str, tuple[int, str, float]] = {}
+_account_cooldown_until: dict[int, float] = {}
+
+
+def set_account_cooldown(account_id: int, seconds: int = 300):
+    if account_id:
+        _account_cooldown_until[int(account_id)] = time.time() + max(1, seconds)
+
+
+def is_account_cooled_down(account_id: int) -> bool:
+    until = _account_cooldown_until.get(int(account_id))
+    if not until:
+        return False
+    if until <= time.time():
+        _account_cooldown_until.pop(int(account_id), None)
+        return False
+    return True
 
 
 def extract_session_key(headers: dict, body: Optional[dict] = None) -> Optional[str]:
@@ -74,6 +93,39 @@ def cleanup_expired_sticky():
     expired = [k for k, (_, ts) in _session_sticky_map.items() if now - ts > PLUS_SESSION_STICKY_TTL_SECONDS]
     for k in expired:
         _session_sticky_map.pop(k, None)
+    expired_responses = [k for k, (_, _, ts) in _session_response_map.items() if now - ts > PLUS_SESSION_STICKY_TTL_SECONDS]
+    for k in expired_responses:
+        _session_response_map.pop(k, None)
+
+
+def get_previous_response_id(session_key: Optional[str], account_id: int) -> Optional[str]:
+    if not session_key or not account_id:
+        return None
+    entry = _session_response_map.get(session_key)
+    if not entry:
+        return None
+    stored_account_id, response_id, ts = entry
+    if time.time() - ts > PLUS_SESSION_STICKY_TTL_SECONDS:
+        _session_response_map.pop(session_key, None)
+        return None
+    if int(stored_account_id) != int(account_id):
+        return None
+    return response_id
+
+
+def set_previous_response_id(session_key: Optional[str], account_id: int, response_id: Optional[str]):
+    response_id = str(response_id or "").strip()
+    if not session_key or not account_id or not response_id:
+        return
+    _session_response_map[session_key] = (int(account_id), response_id, time.time())
+
+
+def extract_response_id(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    response = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+    response_id = response.get("id") if isinstance(response, dict) else None
+    return str(response_id).strip() if response_id else None
 
 
 def mask_token(value: Optional[str]) -> str:
@@ -154,18 +206,22 @@ def build_import_identities(
     account_id: str,
 ) -> list[tuple[str, str]]:
     identities: list[tuple[str, str]] = []
+    normalized_email = email.lower() if email else ""
+    normalized_account_id = account_id.lower() if account_id else ""
+    if normalized_email and normalized_account_id:
+        return [("email_account_id", f"{normalized_email}\n{normalized_account_id}")]
+    if normalized_email:
+        identities.append(("email", normalized_email))
+    elif normalized_account_id:
+        identities.append(("account_id", normalized_account_id))
     if chatgpt_user_id:
         identities.append(("chatgpt_user_id", chatgpt_user_id.lower()))
-    if email:
-        identities.append(("email", email.lower()))
     refresh_fp = token_fingerprint(refresh_token)
     if refresh_fp:
         identities.append(("refresh_token", refresh_fp))
     access_fp = token_fingerprint(access_token)
     if access_fp:
         identities.append(("access_token", access_fp))
-    if account_id and not identities:
-        identities.append(("account_id", account_id.lower()))
     return identities
 
 
@@ -176,13 +232,29 @@ async def find_existing_import_account(
     account_id: str,
 ) -> Optional[OpenAIPlusAccount]:
     for kind, value in identities:
-        if kind == "chatgpt_user_id":
-            result = await db.execute(select(OpenAIPlusAccount).where(func.lower(OpenAIPlusAccount.chatgpt_user_id) == value))
+        if kind == "email_account_id":
+            email_value, account_id_value = value.split("\n", 1)
+            result = await db.execute(
+                select(OpenAIPlusAccount).where(
+                    func.lower(OpenAIPlusAccount.email) == email_value,
+                    func.lower(OpenAIPlusAccount.account_id) == account_id_value,
+                )
+            )
             account = result.scalars().first()
             if account:
                 return account
         elif kind == "email":
             result = await db.execute(select(OpenAIPlusAccount).where(func.lower(OpenAIPlusAccount.email) == value))
+            account = result.scalars().first()
+            if account:
+                return account
+        elif kind == "account_id" and account_id:
+            result = await db.execute(select(OpenAIPlusAccount).where(func.lower(OpenAIPlusAccount.account_id) == value))
+            account = result.scalars().first()
+            if account:
+                return account
+        elif kind == "chatgpt_user_id":
+            result = await db.execute(select(OpenAIPlusAccount).where(func.lower(OpenAIPlusAccount.chatgpt_user_id) == value))
             account = result.scalars().first()
             if account:
                 return account
@@ -192,11 +264,6 @@ async def find_existing_import_account(
                 token_value = account.refresh_token if kind == "refresh_token" else account.access_token
                 if token_fingerprint(token_value) == value:
                     return account
-        elif kind == "account_id" and account_id:
-            result = await db.execute(select(OpenAIPlusAccount).where(OpenAIPlusAccount.account_id == account_id))
-            account = result.scalars().first()
-            if account:
-                return account
     return None
 
 
@@ -236,6 +303,7 @@ def serialize_account(account: OpenAIPlusAccount, include_token: bool = False) -
         "success_count": int(account.success_count or 0),
         "error_count": int(account.error_count or 0),
         "prompt_tokens": int(account.prompt_tokens or 0),
+        "cache_tokens": int(getattr(account, "cache_tokens", 0) or 0),
         "completion_tokens": int(account.completion_tokens or 0),
         "total_tokens": int(account.total_tokens or 0),
         "created_at": account.created_at.isoformat() if account.created_at else None,
@@ -248,18 +316,27 @@ async def get_account_by_proxy_key(db: AsyncSession, proxy_key: str) -> Optional
     return result.scalar_one_or_none()
 
 
-async def get_next_available_account(db: AsyncSession, session_key: Optional[str] = None) -> Optional[OpenAIPlusAccount]:
+async def get_next_available_account(db: AsyncSession, session_key: Optional[str] = None, excluded_account_ids: Optional[set[int]] = None) -> Optional[OpenAIPlusAccount]:
     now = datetime.utcnow()
+    excluded_account_ids = excluded_account_ids or set()
     if session_key:
         sticky_id = get_sticky_account_id(session_key)
-        if sticky_id:
+        if sticky_id and sticky_id not in excluded_account_ids and not is_account_cooled_down(sticky_id):
             account = await db.get(OpenAIPlusAccount, sticky_id)
             if account and not account.disabled and (not account.expires_at or account.expires_at > now):
                 return account
-    result = await db.execute(
+    cooled_down_ids = {account_id for account_id in list(_account_cooldown_until) if is_account_cooled_down(account_id)}
+    query = (
         select(OpenAIPlusAccount)
         .where(OpenAIPlusAccount.disabled == False)
         .where((OpenAIPlusAccount.expires_at == None) | (OpenAIPlusAccount.expires_at > now))
+    )
+    if cooled_down_ids:
+        excluded_account_ids = set(excluded_account_ids) | cooled_down_ids
+    if excluded_account_ids:
+        query = query.where(OpenAIPlusAccount.id.notin_(excluded_account_ids))
+    result = await db.execute(
+        query
         .order_by(OpenAIPlusAccount.request_count.asc(), OpenAIPlusAccount.updated_at.asc(), OpenAIPlusAccount.id.asc())
         .limit(1)
     )
@@ -317,26 +394,31 @@ def parse_import_account_payload(payload: dict, index: int) -> dict:
 
 async def build_existing_account_indexes(db: AsyncSession) -> dict[str, dict[str, OpenAIPlusAccount]]:
     indexes: dict[str, dict[str, OpenAIPlusAccount]] = {
-        "chatgpt_user_id": {},
+        "email_account_id": {},
         "email": {},
+        "account_id": {},
+        "chatgpt_user_id": {},
         "refresh_token": {},
         "access_token": {},
-        "account_id": {},
     }
     result = await db.execute(select(OpenAIPlusAccount))
     for account in result.scalars().all():
+        email = account.email.lower() if account.email else ""
+        account_id = account.account_id.lower() if account.account_id else ""
+        if email and account_id:
+            indexes["email_account_id"][f"{email}\n{account_id}"] = account
+        elif email:
+            indexes["email"][email] = account
+        elif account_id:
+            indexes["account_id"][account_id] = account
         if account.chatgpt_user_id:
             indexes["chatgpt_user_id"][account.chatgpt_user_id.lower()] = account
-        if account.email:
-            indexes["email"][account.email.lower()] = account
         refresh_fp = token_fingerprint(account.refresh_token)
         if refresh_fp:
             indexes["refresh_token"][refresh_fp] = account
         access_fp = token_fingerprint(account.access_token)
         if access_fp:
             indexes["access_token"][access_fp] = account
-        if account.account_id:
-            indexes["account_id"][account.account_id.lower()] = account
     return indexes
 
 
@@ -684,85 +766,156 @@ def build_sse(data: Any, event: Optional[str] = None) -> bytes:
     return f"data: {payload}\n\n".encode("utf-8")
 
 
-async def responses_stream_to_chat_stream(stream, model: str, db: Optional[AsyncSession] = None, account: Optional[OpenAIPlusAccount] = None, success: bool = True):
+def extract_responses_stream_error(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    event_type = payload.get("type") or ""
+    error_payload = payload.get("error")
+    if not isinstance(error_payload, dict) and isinstance(payload.get("response"), dict):
+        error_payload = payload["response"].get("error")
+    if isinstance(error_payload, dict):
+        return str(error_payload.get("message") or error_payload.get("type") or event_type or "upstream stream error")
+    if event_type in {"response.failed", "response.incomplete", "error"}:
+        response_payload = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+        incomplete_details = response_payload.get("incomplete_details") if isinstance(response_payload.get("incomplete_details"), dict) else None
+        if incomplete_details:
+            return str(incomplete_details.get("reason") or event_type)
+        return event_type
+    return None
+
+
+def format_stream_exception(exc: Exception) -> str:
+    text = str(exc).strip() or type(exc).__name__
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None:
+        cause_text = str(cause).strip()
+        if cause_text and cause_text not in text:
+            text = f"{text} ({type(cause).__name__}: {cause_text})"
+    return f"cpa_plus_stream_error: {text}"
+
+
+async def responses_stream_to_chat_stream(stream, model: str, db: Optional[AsyncSession] = None, account: Optional[OpenAIPlusAccount] = None, success: bool = True, session_key: Optional[str] = None):
+    start_time = time.monotonic()
     chat_id = f"chatcmpl_{int(datetime.utcnow().timestamp() * 1000)}"
     created = int(datetime.utcnow().timestamp())
     buffer = ""
-    usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    usage_totals = {"prompt_tokens": 0, "cache_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    final_success = success
+    error_message = None
+    completed_seen = False
+    response_id = None
     try:
-        async for chunk in stream:
-            buffer += chunk.decode("utf-8", "ignore")
-            while "\n\n" in buffer:
-                block, buffer = buffer.split("\n\n", 1)
-                data_lines = [line[5:].strip() for line in block.splitlines() if line.startswith("data:")]
-                if not data_lines:
-                    continue
-                data_text = "\n".join(data_lines)
-                if data_text == "[DONE]":
-                    continue
-                try:
-                    payload = json.loads(data_text)
-                except json.JSONDecodeError:
-                    continue
-                usage_totals = merge_usage_totals(usage_totals, extract_usage_from_responses_payload(payload))
-                event_type = payload.get("type") if isinstance(payload, dict) else ""
-                delta_text = None
-                if event_type in {"response.output_text.delta", "response.text.delta"}:
-                    delta_text = payload.get("delta")
-                elif event_type == "response.output_item.done" and isinstance(payload.get("item"), dict):
-                    item = payload["item"]
-                    if item.get("type") == "message":
-                        for content in item.get("content") or []:
-                            if isinstance(content, dict) and content.get("text"):
-                                delta_text = content["text"]
-                elif event_type == "response.completed":
-                    yield build_sse({
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                        "usage": usage_totals or None,
-                    })
-                    yield b"data: [DONE]\n\n"
-                    continue
-                if delta_text:
-                    yield build_sse({
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
-                    })
-        if buffer.strip():
+        try:
+            async for chunk in stream:
+                buffer += chunk.decode("utf-8", "ignore")
+                while "\n\n" in buffer:
+                    block, buffer = buffer.split("\n\n", 1)
+                    data_lines = [line[5:].strip() for line in block.splitlines() if line.startswith("data:")]
+                    if not data_lines:
+                        continue
+                    data_text = "\n".join(data_lines)
+                    if data_text == "[DONE]":
+                        continue
+                    try:
+                        payload = json.loads(data_text)
+                    except json.JSONDecodeError:
+                        continue
+                    usage_totals = merge_usage_totals(usage_totals, extract_usage_from_responses_payload(payload))
+                    stream_error = extract_responses_stream_error(payload)
+                    if stream_error:
+                        final_success = False
+                        error_message = stream_error
+                        yield build_sse({"error": {"message": stream_error, "type": "upstream_stream_error"}})
+                        yield b"data: [DONE]\n\n"
+                        return
+                    event_type = payload.get("type") if isinstance(payload, dict) else ""
+                    delta_text = None
+                    if event_type in {"response.output_text.delta", "response.text.delta"}:
+                        delta_text = payload.get("delta")
+                    elif event_type == "response.output_item.done" and isinstance(payload.get("item"), dict):
+                        item = payload["item"]
+                        if item.get("type") == "message":
+                            for content in item.get("content") or []:
+                                if isinstance(content, dict) and content.get("text"):
+                                    delta_text = content["text"]
+                    elif event_type == "response.completed":
+                        completed_seen = True
+                        response_id = extract_response_id(payload)
+                        yield build_sse({
+                            "id": chat_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            "usage": usage_totals or None,
+                        })
+                        yield b"data: [DONE]\n\n"
+                        continue
+                    if delta_text:
+                        yield build_sse({
+                            "id": chat_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
+                        })
+            if not completed_seen and final_success:
+                final_success = False
+                error_message = "stream closed before response.completed"
+                yield build_sse({"error": {"message": error_message, "type": "incomplete_stream"}})
+                yield b"data: [DONE]\n\n"
+            elif buffer.strip():
+                yield b"data: [DONE]\n\n"
+        except Exception as exc:
+            final_success = False
+            error_message = format_stream_exception(exc)
+            yield build_sse({"error": {"message": error_message, "type": "stream_error"}})
             yield b"data: [DONE]\n\n"
     finally:
+        if final_success and completed_seen and response_id and account is not None:
+            set_previous_response_id(session_key, account.id, response_id)
+        latency_ms = int((time.monotonic() - start_time) * 1000)
         if account is not None:
             if db is not None:
-                await add_account_usage(db, account, usage_totals, success)
-                await add_usage_log_by_id(account.id, model, "chat.completions", True, None, usage_totals, success)
+                await add_account_usage(db, account, usage_totals, final_success)
+                await add_usage_log_by_id(account.id, model, "chat.completions", True, None, usage_totals, final_success, error_message, latency_ms)
             else:
-                await add_account_usage_by_id(account.id, usage_totals, success)
-                await add_usage_log_by_id(account.id, model, "chat.completions", True, None, usage_totals, success)
+                await add_account_usage_by_id(account.id, usage_totals, final_success)
+                await add_usage_log_by_id(account.id, model, "chat.completions", True, None, usage_totals, final_success, error_message, latency_ms)
 
 
 def extract_usage_from_responses_payload(payload: Any) -> dict:
     if not isinstance(payload, dict):
-        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return {"prompt_tokens": 0, "cache_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     usage = payload.get("usage")
     if not isinstance(usage, dict) and isinstance(payload.get("response"), dict):
         usage = payload["response"].get("usage")
     if not isinstance(usage, dict):
-        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    prompt = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+        return {"prompt_tokens": 0, "cache_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    raw_prompt = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
     completion = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
-    total = int(usage.get("total_tokens") or (prompt + completion))
-    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    total = int(usage.get("total_tokens") or (raw_prompt + completion))
+    input_details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+    prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    cache_read_details = usage.get("cache_read_input_tokens")
+    cached_input_tokens = usage.get("cached_input_tokens")
+    cache_tokens = int(
+        input_details.get(
+            "cached_tokens",
+            prompt_details.get(
+                "cached_tokens",
+                usage.get("cache_tokens", cache_read_details if cache_read_details is not None else cached_input_tokens),
+            ),
+        ) or 0
+    )
+    prompt = max(raw_prompt - cache_tokens, 0)
+    return {"prompt_tokens": prompt, "cache_tokens": cache_tokens, "completion_tokens": completion, "total_tokens": total}
 
 
 def merge_usage_totals(current: dict, incoming: dict) -> dict:
     return {
         "prompt_tokens": max(int(current.get("prompt_tokens") or 0), int(incoming.get("prompt_tokens") or 0)),
+        "cache_tokens": max(int(current.get("cache_tokens") or 0), int(incoming.get("cache_tokens") or 0)),
         "completion_tokens": max(int(current.get("completion_tokens") or 0), int(incoming.get("completion_tokens") or 0)),
         "total_tokens": max(int(current.get("total_tokens") or 0), int(incoming.get("total_tokens") or 0)),
     }
@@ -770,11 +923,15 @@ def merge_usage_totals(current: dict, incoming: dict) -> dict:
 
 async def collect_responses_stream(stream) -> dict:
     response_data = None
+    error_message = None
     output_text_parts = []
-    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    usage = {"prompt_tokens": 0, "cache_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     buffer = ""
+    raw_parts = []
     async for chunk in stream:
-        buffer += chunk.decode("utf-8", "ignore")
+        text = chunk.decode("utf-8", "ignore")
+        raw_parts.append(text)
+        buffer += text
         while "\n\n" in buffer:
             block, buffer = buffer.split("\n\n", 1)
             data_lines = [line[5:].strip() for line in block.splitlines() if line.startswith("data:")]
@@ -788,12 +945,20 @@ async def collect_responses_stream(stream) -> dict:
             except json.JSONDecodeError:
                 continue
             usage = merge_usage_totals(usage, extract_usage_from_responses_payload(payload))
+            stream_error = extract_responses_stream_error(payload)
+            if stream_error:
+                error_message = stream_error
             event_type = payload.get("type") if isinstance(payload, dict) else ""
             if event_type in {"response.output_text.delta", "response.text.delta"} and payload.get("delta"):
                 output_text_parts.append(str(payload["delta"]))
             if event_type == "response.completed" and isinstance(payload.get("response"), dict):
                 response_data = payload["response"]
+    if error_message:
+        return {"error": {"message": error_message, "type": "upstream_error"}, "usage": usage}
     if response_data is None:
+        raw_text = "".join(raw_parts).strip()
+        if raw_text and not output_text_parts:
+            return {"error": {"message": raw_text[:1000], "type": "upstream_error"}, "usage": usage}
         response_data = {"id": f"resp_{int(datetime.utcnow().timestamp() * 1000)}", "output_text": "".join(output_text_parts), "usage": usage}
     elif "output_text" not in response_data and output_text_parts:
         response_data = dict(response_data)
@@ -804,6 +969,7 @@ async def collect_responses_stream(stream) -> dict:
             "input_tokens": usage["prompt_tokens"],
             "output_tokens": usage["completion_tokens"],
             "total_tokens": usage["total_tokens"],
+            "input_tokens_details": {"cached_tokens": usage["cache_tokens"]},
         }
     return response_data
 
@@ -815,6 +981,7 @@ async def add_account_usage(db: AsyncSession, account: OpenAIPlusAccount, usage:
     else:
         account.error_count = int(account.error_count or 0) + 1
     account.prompt_tokens = int(account.prompt_tokens or 0) + int(usage.get("prompt_tokens") or 0)
+    account.cache_tokens = int(getattr(account, "cache_tokens", 0) or 0) + int(usage.get("cache_tokens") or 0)
     account.completion_tokens = int(account.completion_tokens or 0) + int(usage.get("completion_tokens") or 0)
     account.total_tokens = int(account.total_tokens or 0) + int(usage.get("total_tokens") or 0)
     account.updated_at = datetime.utcnow()
@@ -830,6 +997,7 @@ async def add_usage_log_by_id(
     usage: dict,
     success: bool,
     error_message: Optional[str] = None,
+    latency_ms: int = 0,
 ):
     async with async_session_maker() as db:
         account = await db.get(OpenAIPlusAccount, account_id)
@@ -842,11 +1010,66 @@ async def add_usage_log_by_id(
             success=success,
             status_code=status_code,
             prompt_tokens=int(usage.get("prompt_tokens") or 0),
+            cache_tokens=int(usage.get("cache_tokens") or 0),
             completion_tokens=int(usage.get("completion_tokens") or 0),
             total_tokens=int(usage.get("total_tokens") or 0),
+            latency_ms=int(latency_ms or 0),
             error_message=error_message,
         )
         db.add(log)
+        await db.commit()
+
+
+async def create_usage_log_by_id(
+    account_id: int,
+    model: Optional[str],
+    endpoint: str,
+    stream: bool,
+    status_code: Optional[int],
+) -> Optional[int]:
+    async with async_session_maker() as db:
+        account = await db.get(OpenAIPlusAccount, account_id)
+        log = OpenAIPlusUsageLog(
+            account_id=account_id,
+            account_email=account.email if account else None,
+            model=model,
+            endpoint=endpoint,
+            stream=stream,
+            success=False,
+            status_code=status_code,
+            prompt_tokens=0,
+            cache_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            latency_ms=0,
+            error_message="in_progress",
+        )
+        db.add(log)
+        await db.commit()
+        await db.refresh(log)
+        return log.id
+
+
+async def update_usage_log_by_id(
+    log_id: Optional[int],
+    usage: dict,
+    success: bool,
+    error_message: Optional[str] = None,
+    latency_ms: int = 0,
+):
+    if not log_id:
+        return
+    async with async_session_maker() as db:
+        log = await db.get(OpenAIPlusUsageLog, log_id)
+        if not log:
+            return
+        log.success = success
+        log.prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        log.cache_tokens = int(usage.get("cache_tokens") or 0)
+        log.completion_tokens = int(usage.get("completion_tokens") or 0)
+        log.total_tokens = int(usage.get("total_tokens") or 0)
+        log.latency_ms = int(latency_ms or 0)
+        log.error_message = error_message
         await db.commit()
 
 
@@ -857,28 +1080,113 @@ async def add_account_usage_by_id(account_id: int, usage: dict, success: bool):
             await add_account_usage(db, account, usage, success)
 
 
-async def tracked_responses_stream(stream, account_id: int, success: bool, model: Optional[str] = None, endpoint: str = "responses", status_code: Optional[int] = None):
-    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+async def finalize_usage_by_id(
+    account_id: int,
+    log_id: Optional[int],
+    usage: dict,
+    success: bool,
+    error_message: Optional[str] = None,
+    latency_ms: int = 0,
+):
+    async with async_session_maker() as db:
+        account = await db.get(OpenAIPlusAccount, account_id)
+        if account:
+            account.request_count = int(account.request_count or 0) + 1
+            if success:
+                account.success_count = int(account.success_count or 0) + 1
+            else:
+                account.error_count = int(account.error_count or 0) + 1
+            account.prompt_tokens = int(account.prompt_tokens or 0) + int(usage.get("prompt_tokens") or 0)
+            account.cache_tokens = int(getattr(account, "cache_tokens", 0) or 0) + int(usage.get("cache_tokens") or 0)
+            account.completion_tokens = int(account.completion_tokens or 0) + int(usage.get("completion_tokens") or 0)
+            account.total_tokens = int(account.total_tokens or 0) + int(usage.get("total_tokens") or 0)
+            account.updated_at = datetime.utcnow()
+        if log_id:
+            log = await db.get(OpenAIPlusUsageLog, log_id)
+            if log:
+                log.success = success
+                log.prompt_tokens = int(usage.get("prompt_tokens") or 0)
+                log.cache_tokens = int(usage.get("cache_tokens") or 0)
+                log.completion_tokens = int(usage.get("completion_tokens") or 0)
+                log.total_tokens = int(usage.get("total_tokens") or 0)
+                log.latency_ms = int(latency_ms or 0)
+                log.error_message = error_message
+        await db.commit()
+
+
+async def tracked_responses_stream(stream, account_id: int, success: bool, model: Optional[str] = None, endpoint: str = "responses", status_code: Optional[int] = None, session_key: Optional[str] = None):
+    start_time = time.monotonic()
+    log_id = await create_usage_log_by_id(account_id, model, endpoint, True, status_code)
+    usage = {"prompt_tokens": 0, "cache_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     buffer = ""
+    final_success = success
+    error_message = None
+    completed_seen = False
+    done_seen = False
+    response_id = None
     try:
-        async for chunk in stream:
-            text = chunk.decode("utf-8", "ignore")
-            buffer += text
-            while "\n\n" in buffer:
-                block, buffer = buffer.split("\n\n", 1)
-                data_lines = [line[5:].strip() for line in block.splitlines() if line.startswith("data:")]
-                if data_lines:
-                    data_text = "\n".join(data_lines)
-                    if data_text != "[DONE]":
+        try:
+            async for chunk in stream:
+                text = chunk.decode("utf-8", "ignore")
+                buffer += text
+                while "\n\n" in buffer:
+                    block, buffer = buffer.split("\n\n", 1)
+                    event_name = next((line[6:].strip() for line in block.splitlines() if line.startswith("event:")), "")
+                    data_lines = [line[5:].strip() for line in block.splitlines() if line.startswith("data:")]
+                    data_text = "\n".join(data_lines) if data_lines else ""
+                    if data_text == "[DONE]":
+                        done_seen = True
+                        if completed_seen:
+                            yield f"{block}\n\n".encode("utf-8")
+                        continue
+                    if data_lines:
                         try:
                             payload = json.loads(data_text)
                             usage = merge_usage_totals(usage, extract_usage_from_responses_payload(payload))
+                            event_type = payload.get("type") if isinstance(payload, dict) else ""
+                            event_type = event_type or event_name
+                            if event_type == "response.completed":
+                                completed_seen = True
+                                response_id = extract_response_id(payload)
+                            stream_error = extract_responses_stream_error(payload)
+                            if stream_error:
+                                final_success = False
+                                error_message = stream_error
                         except json.JSONDecodeError:
                             pass
-            yield chunk
+                    yield f"{block}\n\n".encode("utf-8")
+        except Exception as exc:
+            final_success = False
+            error_message = format_stream_exception(exc)
+        if buffer:
+            yield buffer.encode("utf-8")
+        if not completed_seen:
+            if final_success:
+                final_success = False
+                error_message = "stream closed before response.completed"
+            yield build_sse({
+                "type": "response.completed",
+                "response": {
+                    "id": f"resp_{int(datetime.utcnow().timestamp() * 1000)}",
+                    "object": "response",
+                    "created_at": int(datetime.utcnow().timestamp()),
+                    "status": "completed",
+                    "model": model,
+                    "output": [],
+                    "usage": {
+                        "input_tokens": usage["prompt_tokens"],
+                        "output_tokens": usage["completion_tokens"],
+                        "total_tokens": usage["total_tokens"],
+                        "input_tokens_details": {"cached_tokens": usage["cache_tokens"]},
+                    },
+                },
+            }, "response.completed")
+            yield b"data: [DONE]\n\n"
     finally:
-        await add_account_usage_by_id(account_id, usage, success)
-        await add_usage_log_by_id(account_id, model, endpoint, True, status_code, usage, success)
+        if final_success and completed_seen and response_id:
+            set_previous_response_id(session_key, account_id, response_id)
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        await asyncio.shield(finalize_usage_by_id(account_id, log_id, usage, final_success, error_message, latency_ms))
 
 
 def claude_content_to_text(content: Any) -> str:
@@ -895,6 +1203,20 @@ def claude_content_to_text(content: Any) -> str:
     return "\n".join(part for part in parts if part)
 
 
+def claude_tools_to_responses_tools(tools: Any) -> list:
+    converted = []
+    for tool in tools or []:
+        if not isinstance(tool, dict) or not tool.get("name"):
+            continue
+        converted.append({
+            "type": "function",
+            "name": tool.get("name"),
+            "description": tool.get("description") or "",
+            "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+        })
+    return converted
+
+
 def claude_messages_to_responses_input(messages: list) -> list:
     input_items = []
     for message in messages or []:
@@ -902,22 +1224,48 @@ def claude_messages_to_responses_input(messages: list) -> list:
             continue
         role = message.get("role") or "user"
         role = "assistant" if role == "assistant" else "user"
+        text_type = "output_text" if role == "assistant" else "input_text"
         content = message.get("content")
         if isinstance(content, str):
-            content_items = [{"type": "input_text", "text": content}]
+            content_items = [{"type": text_type, "text": content}]
         else:
             content_items = []
             for item in content or []:
                 if isinstance(item, dict) and item.get("type") == "text":
-                    content_items.append({"type": "input_text", "text": item.get("text", "")})
-                elif isinstance(item, dict) and item.get("type") == "image":
+                    content_items.append({"type": text_type, "text": item.get("text", "")})
+                elif role == "assistant" and isinstance(item, dict) and item.get("type") == "tool_use":
+                    if content_items:
+                        input_items.append({"role": role, "content": content_items})
+                        content_items = []
+                    input_items.append({
+                        "type": "function_call",
+                        "call_id": item.get("id") or item.get("tool_use_id") or f"call_{len(input_items)}",
+                        "name": item.get("name") or "tool",
+                        "arguments": json.dumps(item.get("input") or {}, ensure_ascii=False),
+                    })
+                elif role == "user" and isinstance(item, dict) and item.get("type") == "tool_result":
+                    if content_items:
+                        input_items.append({"role": role, "content": content_items})
+                        content_items = []
+                    result_content = item.get("content")
+                    if isinstance(result_content, list):
+                        output = claude_content_to_text(result_content)
+                    else:
+                        output = str(result_content or "")
+                    input_items.append({
+                        "type": "function_call_output",
+                        "call_id": item.get("tool_use_id") or item.get("id") or f"call_{len(input_items)}",
+                        "output": output,
+                    })
+                elif role == "user" and isinstance(item, dict) and item.get("type") == "image":
                     source = item.get("source") if isinstance(item.get("source"), dict) else {}
                     if source.get("type") == "base64" and source.get("data"):
                         media_type = source.get("media_type") or "image/png"
                         content_items.append({"type": "input_image", "image_url": f"data:{media_type};base64,{source['data']}"})
                     elif source.get("type") == "url" and source.get("url"):
                         content_items.append({"type": "input_image", "image_url": source["url"]})
-        input_items.append({"role": role, "content": content_items})
+        if content_items:
+            input_items.append({"role": role, "content": content_items})
     return input_items
 
 
@@ -936,37 +1284,132 @@ def responses_to_claude_message(response_data: Any, model: str) -> Any:
     }
 
 
-async def responses_stream_to_claude_stream(stream, model: str, account_id: int, success: bool, status_code: Optional[int] = None):
+async def responses_stream_to_claude_stream(stream, model: str, account_id: int, success: bool, status_code: Optional[int] = None, session_key: Optional[str] = None):
+    start_time = time.monotonic()
     message_id = f"msg_{int(datetime.utcnow().timestamp() * 1000)}"
-    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    usage = {"prompt_tokens": 0, "cache_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     buffer = ""
+    final_success = success
+    error_message = None
+    completed_seen = False
+    response_id = None
+    tool_used = False
+    text_block_open = True
+    content_index = 0
+    if not success:
+        try:
+            error_parts = []
+            async for chunk in stream:
+                text = chunk.decode("utf-8", "ignore")
+                error_parts.append(text)
+                for block in text.split("\n\n"):
+                    data_lines = [line[5:].strip() for line in block.splitlines() if line.startswith("data:")]
+                    if not data_lines:
+                        continue
+                    data_text = "\n".join(data_lines)
+                    if data_text == "[DONE]":
+                        continue
+                    try:
+                        payload = json.loads(data_text)
+                    except json.JSONDecodeError:
+                        continue
+                    usage = merge_usage_totals(usage, extract_usage_from_responses_payload(payload))
+                    stream_error = extract_responses_stream_error(payload)
+                    if stream_error:
+                        error_message = stream_error
+            if not error_message:
+                error_message = "".join(error_parts).strip()[:500] or f"upstream HTTP {status_code}"
+        except Exception as exc:
+            error_message = format_stream_exception(exc)
+        final_success = False
+        yield build_sse({"type": "error", "error": {"type": "upstream_error", "message": error_message}}, "error")
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        await add_account_usage_by_id(account_id, usage, final_success)
+        await add_usage_log_by_id(account_id, model, "messages", True, status_code, usage, final_success, error_message, latency_ms)
+        return
     yield build_sse({"type": "message_start", "message": {"id": message_id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}}, "message_start")
     yield build_sse({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}, "content_block_start")
     try:
-        async for chunk in stream:
-            buffer += chunk.decode("utf-8", "ignore")
-            while "\n\n" in buffer:
-                block, buffer = buffer.split("\n\n", 1)
-                data_lines = [line[5:].strip() for line in block.splitlines() if line.startswith("data:")]
-                if not data_lines:
-                    continue
-                data_text = "\n".join(data_lines)
-                if data_text == "[DONE]":
-                    continue
-                try:
-                    payload = json.loads(data_text)
-                except json.JSONDecodeError:
-                    continue
-                usage = merge_usage_totals(usage, extract_usage_from_responses_payload(payload))
-                event_type = payload.get("type") if isinstance(payload, dict) else ""
-                if event_type in {"response.output_text.delta", "response.text.delta"} and payload.get("delta"):
-                    yield build_sse({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": payload["delta"]}}, "content_block_delta")
-                elif event_type == "response.completed":
-                    yield build_sse({"type": "content_block_stop", "index": 0}, "content_block_stop")
-                    yield build_sse({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]}}, "message_delta")
-                    yield build_sse({"type": "message_stop"}, "message_stop")
+        try:
+            async for chunk in stream:
+                buffer += chunk.decode("utf-8", "ignore")
+                while "\n\n" in buffer:
+                    block, buffer = buffer.split("\n\n", 1)
+                    data_lines = [line[5:].strip() for line in block.splitlines() if line.startswith("data:")]
+                    if not data_lines:
+                        continue
+                    data_text = "\n".join(data_lines)
+                    if data_text == "[DONE]":
+                        continue
+                    try:
+                        payload = json.loads(data_text)
+                    except json.JSONDecodeError:
+                        continue
+                    usage = merge_usage_totals(usage, extract_usage_from_responses_payload(payload))
+                    stream_error = extract_responses_stream_error(payload)
+                    if stream_error:
+                        final_success = False
+                        error_message = stream_error
+                        yield build_sse({"type": "error", "error": {"type": "upstream_stream_error", "message": stream_error}}, "error")
+                        return
+                    event_type = payload.get("type") if isinstance(payload, dict) else ""
+                    if event_type in {"response.output_text.delta", "response.text.delta"} and payload.get("delta"):
+                        yield build_sse({"type": "content_block_delta", "index": content_index, "delta": {"type": "text_delta", "text": payload["delta"]}}, "content_block_delta")
+                    elif event_type == "response.output_item.done" and isinstance(payload.get("item"), dict):
+                        item = payload["item"]
+                        if item.get("type") == "function_call":
+                            if text_block_open:
+                                yield build_sse({"type": "content_block_stop", "index": content_index}, "content_block_stop")
+                                text_block_open = False
+                                content_index += 1
+                            arguments = item.get("arguments") or "{}"
+                            try:
+                                tool_input = json.loads(arguments) if isinstance(arguments, str) else (arguments or {})
+                            except json.JSONDecodeError:
+                                tool_input = {"arguments": arguments}
+                            yield build_sse({
+                                "type": "content_block_start",
+                                "index": content_index,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": item.get("call_id") or item.get("id") or f"toolu_{content_index}",
+                                    "name": item.get("name") or "tool",
+                                    "input": {},
+                                },
+                            }, "content_block_start")
+                            yield build_sse({
+                                "type": "content_block_delta",
+                                "index": content_index,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": json.dumps(tool_input, ensure_ascii=False),
+                                },
+                            }, "content_block_delta")
+                            yield build_sse({"type": "content_block_stop", "index": content_index}, "content_block_stop")
+                            tool_used = True
+                            content_index += 1
+                    elif event_type == "response.completed":
+                        completed_seen = True
+                        response_id = extract_response_id(payload)
+                        if text_block_open:
+                            yield build_sse({"type": "content_block_stop", "index": content_index}, "content_block_stop")
+                            text_block_open = False
+                        stop_reason = "tool_use" if tool_used else "end_turn"
+                        yield build_sse({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"input_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"]}}, "message_delta")
+                        yield build_sse({"type": "message_stop"}, "message_stop")
+            if not completed_seen and final_success:
+                final_success = False
+                error_message = "stream closed before response.completed"
+                yield build_sse({"type": "error", "error": {"type": "incomplete_stream", "message": error_message}}, "error")
+        except Exception as exc:
+            final_success = False
+            error_message = format_stream_exception(exc)
+            yield build_sse({"type": "error", "error": {"type": "stream_error", "message": error_message}}, "error")
     finally:
-        await add_account_usage_by_id(account_id, usage, success)
-        await add_usage_log_by_id(account_id, model, "messages", True, status_code, usage, success)
+        if final_success and completed_seen and response_id:
+            set_previous_response_id(session_key, account_id, response_id)
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        await add_account_usage_by_id(account_id, usage, final_success)
+        await add_usage_log_by_id(account_id, model, "messages", True, status_code, usage, final_success, error_message, latency_ms)
 
 

@@ -27,6 +27,7 @@ const routes = [
     path: '/keys',
     name: 'KeyManage',
     component: () => import('./views/KeyManage.vue'),
+    meta: { requiresAdmin: true },
   },
   {
     path: '/usage',
@@ -37,6 +38,13 @@ const routes = [
     path: '/security-events',
     name: 'SecurityEvents',
     component: () => import('./views/SecurityEvents.vue'),
+    meta: { requiresAdmin: true },
+  },
+  {
+    path: '/runtime-logs',
+    name: 'RuntimeLogs',
+    component: () => import('./views/RuntimeLogs.vue'),
+    meta: { requiresAdmin: true },
   },
   {
     path: '/models',
@@ -47,6 +55,7 @@ const routes = [
     path: '/provider-model-mappings',
     name: 'ProviderModelMapping',
     component: () => import('./views/ProviderModelMapping.vue'),
+    meta: { requiresAdmin: true },
   },
   {
     path: '/images',
@@ -57,11 +66,19 @@ const routes = [
     path: '/openai-plus',
     name: 'OpenAIPlus',
     component: () => import('./views/OpenAIPlus.vue'),
+    meta: { requiresAdmin: true },
+  },
+  {
+    path: '/grok-pool',
+    name: 'GrokPool',
+    component: () => import('./views/GrokPool.vue'),
+    meta: { requiresAdmin: true },
   },
   {
     path: '/settings',
     name: 'Settings',
     component: () => import('./views/Settings.vue'),
+    meta: { requiresAdmin: true },
   },
   {
     path: '/users',
@@ -98,6 +115,24 @@ router.beforeEach(async (to, from, next) => {
 
     // 登录已启用，检查是否已登录
     if (authApi.isLoggedIn()) {
+      // 管理页需要管理员角色，普通用户重定向到仪表盘
+      if (to.meta.requiresAdmin && !authApi.isAdmin()) {
+        next({ path: '/dashboard' })
+        return
+      }
+      // 图片广场由管理员按用户授权，未授权时禁止手工访问路由
+      if (to.path === '/images' && !authApi.isAdmin()) {
+        try {
+          const user = await authApi.getMe()
+          if (!user.show_image_square) {
+            next({ path: '/dashboard' })
+            return
+          }
+        } catch {
+          next({ path: '/dashboard' })
+          return
+        }
+      }
       next()
       return
     }

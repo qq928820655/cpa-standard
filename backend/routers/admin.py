@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select, func, or_, and_, delete as sql_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +33,7 @@ from services.pool_manager import pool_manager
 from services.proxy_service import proxy_service
 from services.key_check_task_service import key_check_task_service
 from services.proxy_trace_service import proxy_trace_service, normalize_trace_config
+from services.runtime_log_service import DEFAULT_LINE_LIMIT, runtime_log_buffer
 
 
 router = APIRouter()
@@ -127,6 +128,13 @@ class ApiKeyResponse(BaseModel):
     fake_ip: Optional[str] = None
     security_violation_count: int = 0
     last_security_violation: Optional[str] = None
+    request_count: int = 0
+    success_count: int = 0
+    error_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cache_tokens: int = 0
     supported_models: List[str] = Field(default_factory=list)
     remark: Optional[str]
     password: Optional[str] = None
@@ -222,6 +230,10 @@ class ApiKeyBatchUpdateModelsRequest(BaseModel):
     supported_models_mode: str = "replace"
     new_provider: Optional[str] = None  # 批量变更提供商
     api_type: Optional[str] = None
+    enable_proxy: Optional[bool] = None
+    proxy_url: Optional[str] = None
+    proxy_username: Optional[str] = None
+    proxy_password: Optional[str] = None
 
 
 class ApiKeyBatchUpdateModelsResponse(BaseModel):
@@ -268,6 +280,8 @@ class ApiKeyCheckProbeResult(BaseModel):
 
 
 class ApiKeyCheckItem(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     key_id: int
     name: str
     provider: str
@@ -294,6 +308,8 @@ class ApiKeyBatchCheckResponse(BaseModel):
 
 
 class ApiKeyCheckTaskResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     id: int
     scope: str
     provider: Optional[str] = None
@@ -358,6 +374,14 @@ class ImageModelListResponse(BaseModel):
     items: List[ImageModelOption]
 
 
+class ImageModelCreateRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=120)
+    display_name: str = Field(min_length=1, max_length=120)
+    provider: str = Field(default="openai", min_length=1, max_length=80)
+    request_formats: List[str] = Field(default_factory=lambda: ["images"])
+    max_count: int = Field(default=1, ge=1, le=4)
+
+
 IMAGE_INPUT_ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "image/webp"}
 IMAGE_INPUT_MAX_COUNT = 4
 IMAGE_INPUT_MAX_SIZE_BYTES = 5 * 1024 * 1024
@@ -384,8 +408,12 @@ class ImageInput(BaseModel):
 class ImageGenerationRequest(BaseModel):
     model: str
     prompt: str
+    provider: Optional[str] = None
+    api_key_id: Optional[int] = None
+    source: Optional[str] = None
     size: Optional[str] = None
     quality: Optional[str] = "auto"
+    resolution: Optional[str] = None
     count: int = Field(default=1, ge=1, le=4)
     request_format: Optional[str] = None
     mode: Optional[str] = "text_to_image"
@@ -531,6 +559,16 @@ class OpenAIPlusQuotaRefreshConfigUpdate(BaseModel):
     openai_plus_quota_token_refresh_timeout_seconds: int = Field(ge=5, le=300)
 
 
+class OpenAIPlusProxyConfigResponse(BaseModel):
+    openai_plus_proxy_url: str = ""
+    openai_plus_cache_friendly: bool = False
+
+
+class OpenAIPlusProxyConfigUpdate(BaseModel):
+    openai_plus_proxy_url: str = ""
+    openai_plus_cache_friendly: bool = False
+
+
 class ImageAutoRefreshConfigResponse(BaseModel):
     image_auto_refresh_delay_seconds: int
     image_auto_refresh_interval_seconds: int
@@ -587,12 +625,16 @@ class QuickCreateModelsResponse(BaseModel):
 
 
 class ModelCatalogBase(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     model_id: str
     display_name: str
     provider: str
     protocol: str = "openai_chat"
     input_price: float = 0
     output_price: float = 0
+    cache_read_price: float = 0
+    cache_write_price: float = 0
     is_active: bool = True
     is_recommended: bool = False
     supports_codex: bool = False
@@ -612,6 +654,8 @@ class ModelCatalogUpdate(BaseModel):
     protocol: Optional[str] = None
     input_price: Optional[float] = None
     output_price: Optional[float] = None
+    cache_read_price: Optional[float] = None
+    cache_write_price: Optional[float] = None
     is_active: Optional[bool] = None
     is_recommended: Optional[bool] = None
     supports_codex: Optional[bool] = None
@@ -622,6 +666,8 @@ class ModelCatalogUpdate(BaseModel):
 
 
 class ModelCatalogResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     id: int
     model_id: str
     display_name: str
@@ -629,6 +675,8 @@ class ModelCatalogResponse(BaseModel):
     protocol: str
     input_price: float
     output_price: float
+    cache_read_price: float = 0
+    cache_write_price: float = 0
     is_active: bool
     is_recommended: bool
     supports_codex: bool
@@ -790,6 +838,8 @@ class ProviderModelPriorityKeyOption(BaseModel):
 
 
 class ProviderModelPriorityItem(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     model: str
     model_display_name: str
     provider: str
@@ -928,6 +978,59 @@ async def verify_admin_key(authorization: str = Header(None), db=Depends(get_db)
         await db.commit()
 
     raise HTTPException(status_code=403, detail="无效的认证凭证")
+
+
+async def require_admin_access(auth=Depends(verify_admin_key)):
+    """强制要求管理员身份，用于包含敏感运行信息的接口。"""
+    if not auth.get("is_admin"):
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return auth
+
+
+async def require_image_square_access(db: AsyncSession, auth_info: dict) -> Optional[set[str]]:
+    """校验图片广场权限，返回普通用户的生图模型白名单。"""
+    if auth_info.get("is_admin"):
+        return None
+
+    from models.admin_user import AdminUser
+
+    user_id = auth_info.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=403, detail="没有图片广场访问权限")
+
+    result = await db.execute(select(AdminUser).where(AdminUser.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user or not bool(getattr(user, "show_image_square", False)):
+        raise HTTPException(status_code=403, detail="没有图片广场访问权限")
+
+    supported_models = user.get_supported_image_models()
+    if not supported_models:
+        return None
+    return {normalize_image_model_alias(str(model)) for model in supported_models if str(model).strip()}
+
+
+async def get_image_result_with_access(
+    result_id: int,
+    db: AsyncSession,
+    auth_info: dict,
+):
+    """读取图片结果，并校验普通用户只能访问自己的任务结果。"""
+    from models import ImageGenerationTask, ImageGenerationTaskResult
+
+    result = await db.execute(
+        select(ImageGenerationTaskResult, ImageGenerationTask)
+        .join(ImageGenerationTask, ImageGenerationTask.id == ImageGenerationTaskResult.task_id)
+        .where(ImageGenerationTaskResult.id == result_id)
+        .where(ImageGenerationTask.is_deleted.is_(False))
+    )
+    row = result.one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="图片结果不存在")
+
+    image_result, task = row
+    if not auth_info.get("is_admin") and task.user_id != auth_info.get("user_id"):
+        raise HTTPException(status_code=404, detail="图片结果不存在")
+    return image_result, task
 
 
 # ============ 辅助函数 ============
@@ -1198,6 +1301,13 @@ def to_response(key: Any) -> ApiKeyResponse:
         fake_ip=getattr(key, "fake_ip", None),
         security_violation_count=int(getattr(key, "security_violation_count", 0) or 0),
         last_security_violation=getattr(key, "last_security_violation", None),
+        request_count=int(getattr(key, "request_count", 0) or 0),
+        success_count=int(getattr(key, "success_count", 0) or 0),
+        error_count=int(getattr(key, "error_count", 0) or 0),
+        prompt_tokens=int(getattr(key, "prompt_tokens", 0) or 0),
+        completion_tokens=int(getattr(key, "completion_tokens", 0) or 0),
+        total_tokens=int(getattr(key, "total_tokens", 0) or 0),
+        cache_tokens=int(getattr(key, "cache_tokens", 0) or 0),
         supported_models=loads_json_list(getattr(key, "supported_models", None)),
         remark=key.remark,
         password=getattr(key, "password", None),
@@ -1240,6 +1350,8 @@ def to_model_response(model: Any) -> ModelCatalogResponse:
         protocol=model.protocol,
         input_price=model.input_price,
         output_price=model.output_price,
+        cache_read_price=float(getattr(model, "cache_read_price", 0) or 0),
+        cache_write_price=float(getattr(model, "cache_write_price", 0) or 0),
         is_active=model.is_active,
         is_recommended=model.is_recommended,
         supports_codex=model.supports_codex,
@@ -1261,6 +1373,8 @@ def build_model_import_item(model: Any) -> ModelCatalogBatchImportItem:
         protocol=model.protocol,
         input_price=model.input_price,
         output_price=model.output_price,
+        cache_read_price=float(getattr(model, "cache_read_price", 0) or 0),
+        cache_write_price=float(getattr(model, "cache_write_price", 0) or 0),
         is_active=model.is_active,
         is_recommended=model.is_recommended,
         supports_codex=model.supports_codex,
@@ -3110,16 +3224,16 @@ def to_check_task_response(task: Any) -> ApiKeyCheckTaskResponse:
 
 IMAGE_MODEL_OPTIONS = [
     {
-        "model": "gpt-image-2-pro",
-        "display_name": "GPT Image 2 Pro",
+        "model": "gpt-image-2",
+        "display_name": "GPT Image 2",
         "provider": "openai",
         "request_formats": ["images", "chat"],
         "candidate_request_formats": ["images", "chat", "responses"],
         "max_count": 4,
     },
     {
-        "model": "gpt-image-2",
-        "display_name": "GPT Image 2",
+        "model": "gpt-image-2-pro",
+        "display_name": "GPT Image 2 Pro",
         "provider": "openai",
         "request_formats": ["images", "chat"],
         "candidate_request_formats": ["images", "chat", "responses"],
@@ -3157,10 +3271,34 @@ IMAGE_MODEL_OPTIONS = [
         "candidate_request_formats": ["images", "chat", "responses"],
         "max_count": 4,
     },
+    {
+        "model": "grok-imagine-image",
+        "display_name": "Grok Imagine Image",
+        "provider": "xAI",
+        "request_formats": ["images"],
+        "candidate_request_formats": ["images"],
+        "max_count": 4,
+    },
+    {
+        "model": "grok-imagine-image-quality",
+        "display_name": "Grok Imagine Image Quality",
+        "provider": "xAI",
+        "request_formats": ["images"],
+        "candidate_request_formats": ["images"],
+        "max_count": 4,
+    },
 ]
 
 
-IMAGE_MODEL_VALIDATE_MODELS = {"gpt-image-2", "gpt-image-2-pro", "gpt-image-1", "nano-banana-pro", "nano-banana-pro-4k"}
+IMAGE_MODEL_VALIDATE_MODELS = {
+    "gpt-image-2",
+    "gpt-image-2-pro",
+    "gpt-image-1",
+    "nano-banana-pro",
+    "nano-banana-pro-4k",
+    "grok-imagine-image",
+    "grok-imagine-image-quality",
+}
 IMAGE_MODEL_VALIDATE_PROMPT = "Generate a simple blue square on a white background for API validation."
 IMAGE_KEY_INITIAL_AMOUNT_UNITS = 1
 IMAGE_MODEL_PRICE_UNITS = {
@@ -3170,19 +3308,48 @@ IMAGE_MODEL_PRICE_UNITS = {
     "gpt-image-1": 0.04,
     "nano-banana-pro": 0.06,
     "nano-banana-pro-4k": 0.08,
+    "grok-imagine-image": 0.02,
+    "grok-imagine-image-quality": 0.05,
 }
 
 
-IMAGE_MODEL_MAP = {
-    item["model"].lower(): item
-    for item in IMAGE_MODEL_OPTIONS
-}
+def get_custom_image_model_options() -> list[dict]:
+    """读取管理员新增的生图模型配置。"""
+    raw_items = export_config.get("custom_image_models") or []
+    if not isinstance(raw_items, list):
+        return []
+
+    items = []
+    seen = {item["model"].lower() for item in IMAGE_MODEL_OPTIONS}
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        model = normalize_model_name(str(raw.get("model") or ""))
+        display_name = str(raw.get("display_name") or "").strip()
+        provider = str(raw.get("provider") or "openai").strip()
+        formats = [str(item).strip().lower() for item in raw.get("request_formats") or [] if str(item).strip().lower() in {"images", "chat", "responses"}]
+        if not model or not display_name or not provider or not formats or model in seen:
+            continue
+        seen.add(model)
+        items.append({
+            "model": model,
+            "display_name": display_name,
+            "provider": provider,
+            "request_formats": formats,
+            "candidate_request_formats": formats,
+            "max_count": min(max(int(raw.get("max_count") or 1), 1), 4),
+        })
+    return items
+
+
+def get_all_image_model_options() -> list[dict]:
+    return [*IMAGE_MODEL_OPTIONS, *get_custom_image_model_options()]
 
 
 def get_image_model_config(model: str) -> dict:
     """获取图片模型配置"""
     model_name = normalize_model_name(model)
-    config = IMAGE_MODEL_MAP.get(model_name)
+    config = next((item for item in get_all_image_model_options() if item["model"].lower() == model_name), None)
     if not config:
         raise HTTPException(status_code=400, detail="暂不支持该图片模型")
     return config
@@ -3832,11 +3999,26 @@ async def apply_image_failure_policy(db: AsyncSession, api_key: Any) -> tuple[in
 # ============ 路由 ============
 
 @router.get("/master-key", response_model=MasterKeyResponse)
-async def get_master_key():
+async def get_master_key(
+    authorization: str = Header(None),
+    db: AsyncSession = Depends(get_db),
+):
     """
-    获取 Master Key（仅用于首次配置）
-    生产环境应禁用此接口
+    获取 Master Key
+
+    安全策略：
+    - 登录验证未开启（开放模式）时，Master Key 是系统的既定认证方式，前端需要它才能工作，故放行。
+    - 登录验证已开启时，必须是已认证的管理员才能获取，避免任意访客拉取 Master Key 后越权为管理员。
     """
+    from routers.auth import _read_login_config, get_current_user_info
+
+    login_enabled = _read_login_config().get("login_enabled", False)
+    if login_enabled:
+        # 登录模式下要求管理员身份；非管理员或未认证一律拒绝
+        info = await get_current_user_info(authorization, db)
+        if not info.get("is_admin"):
+            raise HTTPException(status_code=403, detail="需要管理员权限")
+
     return MasterKeyResponse(master_key=settings.master_key)
 
 
@@ -3866,11 +4048,14 @@ def parse_pagination(page: Optional[int], limit: int, offset: Optional[int]) -> 
 @router.get("/image/models", response_model=ImageModelListResponse)
 async def list_image_models(
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    auth_info: dict = Depends(verify_admin_key),
 ):
     """获取图片广场模型列表"""
+    allowed_models = await require_image_square_access(db, auth_info)
     items = []
-    for config in IMAGE_MODEL_OPTIONS:
+    for config in get_all_image_model_options():
+        if allowed_models is not None and normalize_image_model_alias(config["model"]) not in allowed_models:
+            continue
         keys = await pool_manager.get_all_keys(
             db,
             active_only=True,
@@ -3891,11 +4076,56 @@ async def list_image_models(
     return ImageModelListResponse(items=items)
 
 
+@router.post("/image/models", response_model=ImageModelOption)
+async def create_image_model(
+    data: ImageModelCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin_access),
+):
+    """新增图片广场模型配置。"""
+    model = normalize_model_name(data.model)
+    display_name = data.display_name.strip()
+    provider = data.provider.strip()
+    formats = []
+    for item in data.request_formats:
+        value = str(item).strip().lower()
+        if value in {"images", "chat", "responses"} and value not in formats:
+            formats.append(value)
+    if not model or not display_name or not provider or not formats:
+        raise HTTPException(status_code=400, detail="模型、显示名称、提供商和请求格式不能为空")
+    if any(item["model"].lower() == model for item in get_all_image_model_options()):
+        raise HTTPException(status_code=400, detail="图片模型已存在")
+
+    custom_models = list(export_config.get("custom_image_models") or [])
+    custom_models.append({
+        "model": model,
+        "display_name": display_name,
+        "provider": provider,
+        "request_formats": formats,
+        "max_count": data.max_count,
+    })
+    export_config["custom_image_models"] = custom_models
+    persist_export_config()
+
+    keys = await pool_manager.get_all_keys(db, active_only=True)
+    available_keys = [key for key in keys if key_supports_image_model(key, model)]
+    return ImageModelOption(
+        model=model,
+        display_name=display_name,
+        provider=provider,
+        request_formats=formats,
+        candidate_request_formats=formats,
+        max_count=data.max_count,
+        available_key_count=len(available_keys),
+        total_remaining_image_count=await calculate_total_remaining_image_count(db, available_keys, model),
+    )
+
+
 @router.post("/image/validate", response_model=ImageGenerationValidateResponse)
 async def validate_image_generation(
     data: ImageGenerationValidateRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(verify_admin_key),
 ):
     """验证指定 Key 的图片生成能力"""
     model_config = get_image_model_config(data.model)
@@ -4140,10 +4370,13 @@ async def run_image_generation_task(
     prompt: str,
     size: Optional[str],
     quality: Optional[str],
+    resolution: Optional[str],
     count: int,
     request_format: str,
     mode: str,
     input_images: list[dict],
+    provider_filter: Optional[str] = None,
+    lock_key: bool = False,
 ):
     """后台执行图片生成任务"""
     from database import async_session_maker
@@ -4174,6 +4407,7 @@ async def run_image_generation_task(
                 prompt=prompt,
                 size=size,
                 quality=quality,
+                resolution=resolution,
                 n=count,
                 request_format=request_format,
                 mode=mode,
@@ -4188,10 +4422,10 @@ async def run_image_generation_task(
                 error_message = generation_result.get("error_message") or ""
                 is_cf = is_cloudflare_image_timeout(error_message, generation_result.get("response_data"), status_code)
                 is_non_key = is_non_key_image_failure(category, status_code, error_message)
-                if not is_cf and is_non_key:
+                if not lock_key and not is_cf and is_non_key:
                     for retry_idx in range(max_key_retries):
                         new_key = await pool_manager.get_next_key(
-                            db, provider=None, model=model,
+                            db, provider=provider_filter, model=model,
                             exclude_key_ids=tried_key_ids, randomize_start=True,
                         )
                         if not new_key:
@@ -4207,6 +4441,7 @@ async def run_image_generation_task(
                             prompt=prompt,
                             size=size,
                             quality=quality,
+                            resolution=resolution,
                             n=count,
                             request_format=request_format,
                             mode=mode,
@@ -4502,15 +4737,61 @@ async def create_image_generation(
     count = min(int(data.count or 1), int(model_config["max_count"] or 1))
     mode, input_images, input_image_meta = normalize_image_inputs(data.mode, data.input_images)
 
-    api_key = await pool_manager.get_next_key(db, provider=None, model=model, randomize_start=True)
+    allowed_image_models = await require_image_square_access(db, auth_info)
+    if allowed_image_models is not None and normalize_image_model_alias(model) not in allowed_image_models:
+        raise HTTPException(status_code=403, detail="没有权限使用该图片模型")
+
+    source_value = normalize_optional_text(data.source)
+    provider_filter = normalize_optional_text(data.provider)
+    requested_key_name = None
+    if source_value:
+        source_parts = [part.strip() for part in source_value.split("|", 1)]
+        provider_filter = source_parts[0] or None
+        requested_key_name = source_parts[1] if len(source_parts) > 1 else None
+        if not provider_filter:
+            raise HTTPException(status_code=400, detail="来源格式应为提供商或提供商|Key名称")
+
+    if not auth_info.get("is_admin") and data.api_key_id is not None:
+        raise HTTPException(status_code=403, detail="普通用户不支持按 Key ID 指定")
+
+    if requested_key_name:
+        available_keys = await pool_manager.get_all_keys(db, active_only=True)
+        api_key = next(
+            (
+                key for key in available_keys
+                if key.provider == provider_filter
+                and key.name == requested_key_name
+                and key_supports_image_model(key, model)
+            ),
+            None,
+        )
+        if not api_key:
+            raise HTTPException(status_code=404, detail="指定提供商下没有启用且支持该图片模型的 Key")
+    elif data.api_key_id is not None:
+        api_key = await pool_manager.get_key_by_id(db, int(data.api_key_id))
+        if not api_key or not api_key.is_active:
+            raise HTTPException(status_code=404, detail="指定的 Key 不存在或未启用")
+        if provider_filter and api_key.provider != provider_filter:
+            raise HTTPException(status_code=400, detail="指定的 Key 与提供商不匹配")
+        if not key_supports_image_model(api_key, model):
+            raise HTTPException(status_code=400, detail="指定的 Key 不支持该图片模型")
+    else:
+        api_key = await pool_manager.get_next_key(
+            db,
+            provider=provider_filter,
+            model=model,
+            randomize_start=True,
+        )
     if not api_key:
-        raise HTTPException(status_code=404, detail="没有启用且支持该图片模型的 Key")
+        message = "指定提供商没有启用且支持该图片模型的 Key" if provider_filter else "没有启用且支持该图片模型的 Key"
+        raise HTTPException(status_code=404, detail=message)
 
     api_key_snapshot = build_api_key_snapshot(api_key)
     now = datetime.utcnow()
     request_params = {
         "size": data.size,
         "quality": data.quality,
+        "resolution": data.resolution,
         "count": count,
         "request_format": request_format,
         "mode": mode,
@@ -4566,10 +4847,13 @@ async def create_image_generation(
             prompt=prompt,
             size=data.size,
             quality=data.quality,
+            resolution=data.resolution,
             count=count,
             request_format=request_format,
             mode=mode,
             input_images=input_images,
+            provider_filter=provider_filter,
+            lock_key=data.api_key_id is not None,
         )
     )
 
@@ -4578,7 +4862,7 @@ async def create_image_generation(
 
 @router.get("/image/auto-refresh-config", response_model=ImageAutoRefreshConfigResponse)
 async def get_image_auto_refresh_config_api(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(verify_admin_key),
 ):
     """获取图片自动回填配置"""
     return get_image_auto_refresh_config()
@@ -4587,7 +4871,7 @@ async def get_image_auto_refresh_config_api(
 @router.put("/image/auto-refresh-config", response_model=ImageAutoRefreshConfigResponse)
 async def update_image_auto_refresh_config(
     data: ImageAutoRefreshConfigUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新图片自动回填配置"""
     payload = data.model_dump()
@@ -4598,7 +4882,7 @@ async def update_image_auto_refresh_config(
 
 @router.get("/image/stale-task-cleanup-config", response_model=StaleTaskCleanupConfigResponse)
 async def get_stale_task_cleanup_config_api(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(verify_admin_key),
 ):
     """获取过期任务回收配置"""
     return get_stale_task_cleanup_config()
@@ -4607,7 +4891,7 @@ async def get_stale_task_cleanup_config_api(
 @router.put("/image/stale-task-cleanup-config", response_model=StaleTaskCleanupConfigResponse)
 async def update_stale_task_cleanup_config(
     data: StaleTaskCleanupConfigUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新过期任务回收配置"""
     payload = data.model_dump()
@@ -4618,7 +4902,7 @@ async def update_stale_task_cleanup_config(
 
 @router.get("/image/capabilities", response_model=ImageCapabilityResponse)
 async def get_image_capabilities(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(verify_admin_key),
 ):
     """获取图片增强能力状态"""
     return ImageCapabilityResponse(psd_enabled=has_psd_enhancement())
@@ -4626,7 +4910,7 @@ async def get_image_capabilities(
 
 @router.get("/image/storage-config", response_model=ImageStorageConfigResponse)
 async def get_image_storage_config(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(verify_admin_key),
 ):
     """获取图片存储配置"""
     if not has_psd_enhancement():
@@ -4646,7 +4930,7 @@ async def get_image_storage_config(
 @router.put("/image/storage-config", response_model=ImageStorageConfigResponse)
 async def update_image_storage_config(
     data: ImageStorageConfigUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新图片存储配置"""
     if not has_psd_enhancement():
@@ -4668,6 +4952,7 @@ async def delete_image_task(
     auth_info: dict = Depends(verify_admin_key),
 ):
     """删除图片历史任务"""
+    await require_image_square_access(db, auth_info)
     from models import ImageGenerationTask, ImageGenerationTaskResult
 
     task_result = await db.execute(
@@ -4758,15 +5043,10 @@ async def get_input_image_file(
 async def save_image_result_local(
     result_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    auth_info: dict = Depends(verify_admin_key),
 ):
     """保存图片结果到本地"""
-    from models import ImageGenerationTaskResult
-
-    result = await db.execute(select(ImageGenerationTaskResult).where(ImageGenerationTaskResult.id == result_id))
-    row = result.scalar_one_or_none()
-    if not row:
-        raise HTTPException(status_code=404, detail="图片结果不存在")
+    row, _ = await get_image_result_with_access(result_id, db, auth_info)
     if row.status != "success":
         raise HTTPException(status_code=400, detail="只能保存成功的图片结果")
 
@@ -4803,7 +5083,7 @@ async def save_image_result_local(
 async def open_image_result_folder(
     result_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """打开图片所在文件夹"""
     from models import ImageGenerationTaskResult
@@ -4822,7 +5102,7 @@ async def open_image_result_folder(
 async def reveal_image_result_file(
     result_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """定位图片文件"""
     from models import ImageGenerationTaskResult
@@ -4841,9 +5121,10 @@ async def reveal_image_result_file(
 async def get_image_result_psd(
     result_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    auth_info: dict = Depends(verify_admin_key),
 ):
     """导出图片结果为 PSD（Photoshop 图层文件）"""
+    await get_image_result_with_access(result_id, db, auth_info)
     if not has_psd_enhancement():
         raise HTTPException(status_code=503, detail="PSD 导出需要增强包，请安装图像增强组件后重试")
 
@@ -4873,6 +5154,7 @@ async def list_image_tasks(
     auth_info: dict = Depends(verify_admin_key),
 ):
     """查询图片生成历史任务"""
+    await require_image_square_access(db, auth_info)
     from models import ImageGenerationTask
 
     # 普通用户只能看自己的任务
@@ -4917,6 +5199,7 @@ async def get_image_task(
     auth_info: dict = Depends(verify_admin_key),
 ):
     """查询图片生成任务详情"""
+    await require_image_square_access(db, auth_info)
     from models import ImageGenerationTask, ImageGenerationTaskResult
 
     task_result = await db.execute(
@@ -4947,6 +5230,7 @@ async def refresh_image_task(
     auth_info: dict = Depends(verify_admin_key),
 ):
     """重新抓取图片生成任务结果"""
+    await require_image_square_access(db, auth_info)
     from models import ImageGenerationTask, ImageGenerationTaskResult
 
     task_result = await db.execute(
@@ -4981,6 +5265,7 @@ async def refresh_image_task_by_upstream_id(
     auth_info: dict = Depends(verify_admin_key),
 ):
     """按用户提供的上游任务 ID，通过 magic666 任务日志精确查询并回填"""
+    await require_image_square_access(db, auth_info)
     from models import ImageGenerationTask, ImageGenerationTaskResult
 
     upstream_task_id = normalize_optional_text(data.upstream_task_id)
@@ -5018,17 +5303,21 @@ async def list_image_task_results(
     limit: int = 20,
     offset: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    auth_info: dict = Depends(verify_admin_key),
 ):
     """查询图片生成任务结果"""
+    await require_image_square_access(db, auth_info)
     from models import ImageGenerationTask, ImageGenerationTaskResult
 
-    exists_result = await db.execute(
-        select(ImageGenerationTask.id)
+    task_result = await db.execute(
+        select(ImageGenerationTask)
         .where(ImageGenerationTask.id == task_id)
         .where(ImageGenerationTask.is_deleted.is_(False))
     )
-    if not exists_result.scalar_one_or_none():
+    task = task_result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="图片生成任务不存在")
+    if not auth_info.get("is_admin") and task.user_id != auth_info.get("user_id"):
         raise HTTPException(status_code=404, detail="图片生成任务不存在")
 
     page_value, limit_value, offset_value = parse_pagination(page, limit, offset)
@@ -5054,7 +5343,7 @@ async def list_image_task_results(
 async def get_image_key_stats(
     model: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """查询每个 Key 的图片生成成功率"""
     from models import ApiKey, ImageKeyModelStats
@@ -5162,7 +5451,7 @@ async def get_image_key_stats(
 
 @router.get("/key-cooldown-config", response_model=KeyCooldownConfigResponse)
 async def get_key_cooldown_config(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取 Key 冷却配置"""
     return KeyCooldownConfigResponse(**pool_manager.get_cooldown_config())
@@ -5171,7 +5460,7 @@ async def get_key_cooldown_config(
 @router.put("/key-cooldown-config", response_model=KeyCooldownConfigResponse)
 async def update_key_cooldown_config(
     data: KeyCooldownConfigUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新 Key 冷却配置"""
     pool_manager.update_cooldown_config(**data.model_dump())
@@ -5180,7 +5469,7 @@ async def update_key_cooldown_config(
 
 @router.get("/proxy-timeout-config", response_model=ProxyTimeoutConfigResponse)
 async def get_proxy_timeout_config(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取代理超时配置"""
     return ProxyTimeoutConfigResponse(
@@ -5194,7 +5483,7 @@ async def get_proxy_timeout_config(
 @router.put("/proxy-timeout-config", response_model=ProxyTimeoutConfigResponse)
 async def update_proxy_timeout_config(
     data: ProxyTimeoutConfigUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新代理超时配置"""
     payload = data.model_dump()
@@ -5207,7 +5496,7 @@ async def update_proxy_timeout_config(
 
 @router.get("/content-guard-config", response_model=ContentGuardConfigResponse)
 async def get_content_guard_config(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取上游内容安全防护配置"""
     from services.content_guard_service import content_guard_service
@@ -5218,7 +5507,7 @@ async def get_content_guard_config(
 @router.put("/content-guard-config", response_model=ContentGuardConfigResponse)
 async def update_content_guard_config(
     data: ContentGuardConfigUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新上游内容安全防护配置"""
     payload = data.model_dump()
@@ -5242,7 +5531,7 @@ async def list_content_guard_events(
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=20, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取上游内容安全事件列表"""
     from models import ContentGuardEvent
@@ -5297,7 +5586,7 @@ def normalize_openai_plus_quota_refresh_config(data: Optional[dict] = None) -> d
 
 @router.get("/openai-plus/quota-refresh-config", response_model=OpenAIPlusQuotaRefreshConfigResponse)
 async def get_openai_plus_quota_refresh_config(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取 OpenAI Plus 配额刷新配置"""
     return OpenAIPlusQuotaRefreshConfigResponse(**normalize_openai_plus_quota_refresh_config())
@@ -5306,7 +5595,7 @@ async def get_openai_plus_quota_refresh_config(
 @router.put("/openai-plus/quota-refresh-config", response_model=OpenAIPlusQuotaRefreshConfigResponse)
 async def update_openai_plus_quota_refresh_config(
     data: OpenAIPlusQuotaRefreshConfigUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新 OpenAI Plus 配额刷新配置"""
     payload = normalize_openai_plus_quota_refresh_config(data.model_dump())
@@ -5315,9 +5604,32 @@ async def update_openai_plus_quota_refresh_config(
     return OpenAIPlusQuotaRefreshConfigResponse(**payload)
 
 
+@router.get("/openai-plus/proxy-config", response_model=OpenAIPlusProxyConfigResponse)
+async def get_openai_plus_proxy_config(
+    _: dict = Depends(require_admin_access),
+):
+    return OpenAIPlusProxyConfigResponse(
+        openai_plus_proxy_url=str(export_config.get("openai_plus_proxy_url") or ""),
+        openai_plus_cache_friendly=bool(export_config.get("openai_plus_cache_friendly", False)),
+    )
+
+
+@router.put("/openai-plus/proxy-config", response_model=OpenAIPlusProxyConfigResponse)
+async def update_openai_plus_proxy_config(
+    data: OpenAIPlusProxyConfigUpdate,
+    _: dict = Depends(require_admin_access),
+):
+    proxy_url = (data.openai_plus_proxy_url or "").strip()
+    cache_friendly = bool(data.openai_plus_cache_friendly)
+    export_config["openai_plus_proxy_url"] = proxy_url
+    export_config["openai_plus_cache_friendly"] = cache_friendly
+    persist_export_config()
+    return OpenAIPlusProxyConfigResponse(openai_plus_proxy_url=proxy_url, openai_plus_cache_friendly=cache_friendly)
+
+
 @router.get("/key-check-default-config", response_model=KeyCheckDefaultConfigResponse)
 async def get_key_check_default_config(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取默认一键检测模型配置"""
     return KeyCheckDefaultConfigResponse(
@@ -5328,7 +5640,7 @@ async def get_key_check_default_config(
 @router.put("/key-check-default-config", response_model=KeyCheckDefaultConfigResponse)
 async def update_key_check_default_config(
     data: KeyCheckDefaultConfigUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新默认一键检测模型配置"""
     normalized_model = normalize_optional_text(data.default_key_check_model) or ""
@@ -5339,7 +5651,7 @@ async def update_key_check_default_config(
 
 @router.get("/key-check-shortcut-models", response_model=KeyCheckShortcutModelsResponse)
 async def get_key_check_shortcut_models(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取一键检测快捷模型配置"""
     shortcut_models = normalize_string_list(export_config.get("default_key_check_models") if isinstance(export_config, dict) else None)
@@ -5358,7 +5670,7 @@ async def get_key_check_shortcut_models(
 @router.put("/key-check-shortcut-models", response_model=KeyCheckShortcutModelsResponse)
 async def update_key_check_shortcut_models(
     data: KeyCheckShortcutModelsUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新一键检测快捷模型配置"""
     default_model = normalize_optional_text(data.default_key_check_model) or ""
@@ -5392,7 +5704,7 @@ async def list_keys(
     limit: int = 50,
     offset: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取所有 API Key 列表"""
     provider_values = normalize_string_list(providers) or ([] if not provider else [provider])
@@ -5475,7 +5787,7 @@ async def list_keys(
 @router.get("/keys/export", response_model=ApiKeyBatchExportResponse)
 async def export_keys(
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """导出全部 API Key"""
     from models import ApiKey
@@ -5489,7 +5801,7 @@ async def export_keys(
 async def create_key(
     data: ApiKeyCreate,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """创建新的 API Key"""
     from models import ApiKey
@@ -5529,7 +5841,7 @@ async def create_key(
 async def import_keys(
     data: ApiKeyBatchImportRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """批量导入 API Key"""
     from models import ApiKey
@@ -5638,7 +5950,7 @@ async def import_keys(
 async def batch_update_key_models(
     data: ApiKeyBatchUpdateModelsRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """批量调整 Key 请求地址与支持模型"""
     from models import ApiKey
@@ -5684,19 +5996,22 @@ async def batch_update_key_models(
     should_update_supported_models = "supported_models" in provided_fields
     should_update_provider = bool(data.new_provider and data.new_provider.strip())
     should_update_api_type = "api_type" in provided_fields
+    proxy_fields_set = {"enable_proxy", "proxy_url", "proxy_username", "proxy_password"}
+    should_update_proxy = bool(provided_fields & proxy_fields_set)
 
     normalized_base_url = data.base_url.strip() if isinstance(data.base_url, str) else None
     normalized_api_type = normalize_api_type(data.api_type) if should_update_api_type else None
-    if not should_update_base_url and not should_update_weight and not should_update_supported_models and not should_update_provider and not should_update_api_type:
+    proxy_fields = build_proxy_fields(data) if should_update_proxy else None
+    if not should_update_base_url and not should_update_weight and not should_update_supported_models and not should_update_provider and not should_update_api_type and not should_update_proxy:
         raise HTTPException(status_code=400, detail="请至少选择一项要调整的内容")
-    if should_update_base_url and not normalized_base_url and not should_update_weight and not should_update_supported_models and not should_update_provider and not should_update_api_type:
+    if should_update_base_url and not normalized_base_url and not should_update_weight and not should_update_supported_models and not should_update_provider and not should_update_api_type and not should_update_proxy:
         raise HTTPException(status_code=400, detail="请求地址不能为空")
 
     supported_models = []
     created_models = []
     serialized_models = None
     supported_models_mode = (data.supported_models_mode or "replace").strip().lower()
-    if supported_models_mode not in {"replace", "append", "clear"}:
+    if supported_models_mode not in {"replace", "append", "remove", "clear"}:
         raise HTTPException(status_code=400, detail="无效的模型调整方式")
     if should_update_supported_models:
         if data.supported_models is None:
@@ -5717,6 +6032,11 @@ async def batch_update_key_models(
         if should_update_supported_models:
             if supported_models_mode == "append":
                 key.supported_models = dumps_json_list(loads_json_list(key.supported_models) + supported_models)
+            elif supported_models_mode == "remove":
+                removed_models = set(supported_models)
+                key.supported_models = dumps_json_list(
+                    [model for model in loads_json_list(key.supported_models) if model not in removed_models]
+                )
             else:
                 key.supported_models = serialized_models
         if should_update_provider:
@@ -5724,6 +6044,11 @@ async def batch_update_key_models(
             key.provider = new_provider_value
         if should_update_api_type:
             key.api_type = normalized_api_type
+        if should_update_proxy:
+            key.enable_proxy = proxy_fields["enable_proxy"]
+            key.proxy_url = proxy_fields["proxy_url"]
+            key.proxy_username = proxy_fields["proxy_username"]
+            key.proxy_password = proxy_fields["proxy_password"]
         key.updated_at = datetime.utcnow()
         touched_providers.add(key.provider)
 
@@ -5748,7 +6073,7 @@ async def batch_update_key_models(
 async def create_key_check_task(
     data: ApiKeyBatchCheckRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """创建 Key 检测任务"""
     from models import ApiKeyCheckTask
@@ -5773,7 +6098,7 @@ async def list_key_check_tasks(
     limit: int = 20,
     status: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """查询 Key 检测任务列表"""
     from models import ApiKeyCheckTask
@@ -5797,7 +6122,7 @@ async def list_key_check_tasks(
 async def get_key_check_task(
     task_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """查询 Key 检测任务详情"""
     from models import ApiKeyCheckTask
@@ -5815,7 +6140,7 @@ async def list_key_check_task_results(
     limit: int = 50,
     status: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """查询 Key 检测任务结果"""
     from models import ApiKeyCheckTask, ApiKeyCheckTaskResult
@@ -5841,7 +6166,7 @@ async def list_key_check_task_results(
 async def get_key_check_task_stats(
     task_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """查询 Key 检测任务统计"""
     from models import ApiKeyCheckTask, ApiKeyCheckTaskResult
@@ -5863,7 +6188,7 @@ async def get_key_check_task_stats(
 async def batch_check_key_endpoints(
     data: ApiKeyBatchCheckRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """批量检测 Key 请求地址与目标模型"""
     target_model = (data.target_model or "").strip()
@@ -5928,7 +6253,7 @@ async def check_single_key(
     key_id: int,
     data: ApiKeySingleCheckRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """检测单个 Key 的请求地址与目标模型"""
     target_model = data.target_model.strip()
@@ -5951,7 +6276,7 @@ async def check_single_key(
 async def batch_delete_keys(
     data: ApiKeyBatchDeleteRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """批量删除 API Key"""
     from models import ApiKey
@@ -5983,7 +6308,7 @@ async def batch_delete_keys(
 async def batch_set_keys_fake_ip(
     data: ApiKeyBatchFakeIpRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """批量设置 Key 独立 fake IP"""
     from models import ApiKey
@@ -6031,7 +6356,7 @@ async def batch_set_keys_fake_ip(
 async def get_key(
     key_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取单个 API Key"""
     key = await pool_manager.get_key_by_id(db, key_id)
@@ -6045,7 +6370,7 @@ async def update_key(
     key_id: int,
     data: ApiKeyUpdate,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新 API Key"""
     key = await pool_manager.get_key_by_id(db, key_id)
@@ -6101,7 +6426,7 @@ async def update_key(
 async def delete_key(
     key_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """删除 API Key"""
     key = await pool_manager.get_key_by_id(db, key_id)
@@ -6124,7 +6449,7 @@ async def delete_key(
 async def batch_set_keys_active(
     data: ApiKeyBatchSetActiveRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """批量设置 API Key 启用状态"""
     from models import ApiKey
@@ -6155,7 +6480,7 @@ async def batch_set_keys_active(
 async def batch_clear_keys_cooldown(
     data: ApiKeyBatchClearCooldownRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """批量解除 Key 冷却"""
     from models import ApiKey
@@ -6179,7 +6504,7 @@ async def batch_clear_keys_cooldown(
 async def clear_key_cooldown(
     key_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """手动解除 Key 冷却"""
     key = await pool_manager.get_key_by_id(db, key_id)
@@ -6194,7 +6519,7 @@ async def clear_key_cooldown(
 async def toggle_key(
     key_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """切换 API Key 启用状态"""
     key = await pool_manager.get_key_by_id(db, key_id)
@@ -6214,7 +6539,7 @@ async def toggle_key(
 @router.get("/providers", response_model=ProviderListResponse)
 async def list_key_providers(
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取 Key 已使用的提供商列表"""
     from models import ApiKey
@@ -6231,7 +6556,7 @@ async def list_provider_model_mappings(
     real_model: Optional[str] = Query(default=None),
     enabled: Optional[bool] = Query(default=None),
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """查询提供商模型映射"""
     from models import ProviderModelMapping
@@ -6267,7 +6592,7 @@ async def list_provider_model_mappings(
 @router.get("/provider-model-mappings/export", response_model=ProviderModelMappingExportResponse)
 async def export_provider_model_mappings(
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """导出全部提供商模型映射"""
     from models import ProviderModelMapping
@@ -6286,7 +6611,7 @@ async def export_provider_model_mappings(
 async def import_provider_model_mappings(
     data: ProviderModelMappingImportRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """批量导入提供商模型映射"""
     from models import ProviderModelMapping
@@ -6333,7 +6658,7 @@ async def import_provider_model_mappings(
 async def create_provider_model_mapping(
     data: ProviderModelMappingCreate,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """新增或更新提供商模型映射"""
     from models import ProviderModelMapping
@@ -6362,7 +6687,7 @@ async def update_provider_model_mapping(
     mapping_id: int,
     data: ProviderModelMappingUpdate,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新提供商模型映射"""
     from models import ProviderModelMapping
@@ -6391,7 +6716,7 @@ async def update_provider_model_mapping(
 async def batch_set_provider_model_mappings_enabled(
     data: ProviderModelMappingBatchEnabledRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """批量设置提供商模型映射启用状态"""
     from models import ProviderModelMapping
@@ -6417,7 +6742,7 @@ async def batch_set_provider_model_mappings_enabled(
 async def delete_provider_model_mapping(
     mapping_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """删除提供商模型映射"""
     from models import ProviderModelMapping
@@ -6434,7 +6759,7 @@ async def delete_provider_model_mapping(
 async def list_provider_model_priorities(
     provider: str = Query(...),
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取指定 provider 的模型优先 Key 配置"""
     provider_value = provider.strip()
@@ -6449,7 +6774,7 @@ async def list_provider_model_priorities(
 async def list_provider_model_priority_key_options(
     provider: str = Query(...),
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取指定 provider 的模型优先 Key 候选项"""
     provider_value = provider.strip()
@@ -6462,7 +6787,7 @@ async def list_provider_model_priority_key_options(
 async def save_provider_model_priority(
     data: ProviderModelPriorityUpsertRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """保存指定 provider-model 的优先 Key"""
     provider_value, model_value = await upsert_provider_priority_binding(
@@ -6482,7 +6807,7 @@ async def save_provider_model_priority(
 async def delete_provider_model_priority(
     data: ProviderModelPriorityClearRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """清空指定 provider-model 的优先 Key"""
     provider_value, model_value, _ = await clear_provider_priority_binding(
@@ -6500,7 +6825,7 @@ async def delete_provider_model_priority(
 @router.get("/model-providers", response_model=ProviderListResponse)
 async def list_model_providers(
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取模型已使用的提供商列表"""
     from models import ModelCatalog
@@ -6517,16 +6842,36 @@ async def list_models(
     limit: int = 50,
     offset: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    auth_info: dict = Depends(verify_admin_key),
 ):
-    """获取模型广场列表"""
+    """获取模型广场列表
+
+    管理员：可见全部模型并触发种子回填；
+    普通用户：只读可见，仅返回其可用模型（未设置则返回全部）。
+    """
     from models import ModelCatalog
+    from models.admin_user import AdminUser
+
+    is_admin_request = auth_info.get("is_admin", False)
+
+    # 普通用户按其可用模型白名单过滤，未设置白名单则可见全部
+    allowed_model_ids: Optional[set] = None
+    if not is_admin_request:
+        user_id = auth_info.get("user_id")
+        if user_id:
+            user_result = await db.execute(select(AdminUser).where(AdminUser.id == user_id))
+            current_user = user_result.scalar_one_or_none()
+            if current_user:
+                supported = current_user.get_supported_models()
+                if supported:
+                    allowed_model_ids = {str(m).strip() for m in supported if str(m).strip()}
 
     existing_result = await db.execute(select(ModelCatalog))
     existing_models = {item.model_id: item for item in existing_result.scalars().all()}
 
     # 种子回填开关：一键还原后关闭，避免已删除的模型被种子数据重新插入
-    seed_enabled = export_config.get("model_seed_enabled", True)
+    # 仅管理员请求触发种子写入，避免普通用户只读访问产生写库副作用
+    seed_enabled = is_admin_request and export_config.get("model_seed_enabled", True)
     changed = False
     if seed_enabled:
         for item in DEFAULT_MODELS:
@@ -6570,12 +6915,16 @@ async def list_models(
     count_query = select(func.count(ModelCatalog.id))
     if provider:
         count_query = count_query.where(ModelCatalog.provider == provider)
+    if allowed_model_ids is not None:
+        count_query = count_query.where(ModelCatalog.model_id.in_(allowed_model_ids))
     count_result = await db.execute(count_query)
     total = int(count_result.scalar() or 0)
 
     query = select(ModelCatalog).order_by(ModelCatalog.is_recommended.desc(), ModelCatalog.model_id.asc())
     if provider:
         query = query.where(ModelCatalog.provider == provider)
+    if allowed_model_ids is not None:
+        query = query.where(ModelCatalog.model_id.in_(allowed_model_ids))
     query = query.offset(offset_value).limit(limit_value)
 
     result = await db.execute(query)
@@ -6589,10 +6938,103 @@ async def list_models(
     }
 
 
+class ModelPriceDisplayConfig(BaseModel):
+    currency: str = Field(default="USD", pattern="^(USD|CNY)$")
+    exchange_rate_mode: str = Field(default="fixed", pattern="^(manual|fixed)$")
+    usd_cny_rate: float = Field(default=7.2, gt=0, le=100)
+
+
+class ModelsDevPricingSyncResponse(BaseModel):
+    updated_count: int
+    unmatched_model_ids: List[str] = Field(default_factory=list)
+    source_url: str
+
+
+def normalize_model_id_for_pricing(model_id: str) -> str:
+    """将模型名称转换为 models.dev 价格匹配键。"""
+    value = str(model_id or "").rsplit("/", 1)[-1].split(":", 1)[0].replace("@", "-").strip().lower()
+    return value.removesuffix("[1m]").strip()
+
+
+@router.get("/models/pricing-config", response_model=ModelPriceDisplayConfig)
+async def get_model_price_display_config(
+    _: dict = Depends(require_admin_access),
+):
+    return ModelPriceDisplayConfig(
+        currency=str(export_config.get("model_price_display_currency") or "USD").upper(),
+        exchange_rate_mode=str(export_config.get("model_price_exchange_rate_mode") or "fixed"),
+        usd_cny_rate=float(export_config.get("model_price_usd_cny_rate") or 7.2),
+    )
+
+
+@router.put("/models/pricing-config", response_model=ModelPriceDisplayConfig)
+async def update_model_price_display_config(
+    data: ModelPriceDisplayConfig,
+    _: dict = Depends(require_admin_access),
+):
+    export_config["model_price_display_currency"] = data.currency
+    export_config["model_price_exchange_rate_mode"] = data.exchange_rate_mode
+    export_config["model_price_usd_cny_rate"] = data.usd_cny_rate
+    persist_export_config()
+    return data
+
+
+@router.post("/models/pricing/models-dev/sync", response_model=ModelsDevPricingSyncResponse)
+async def sync_models_dev_pricing(
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin_access),
+):
+    """按当前模型目录从 models.dev 同步美元定价。"""
+    from models import ModelCatalog
+
+    source_url = "https://models.dev/api.json"
+    request = urllib.request.Request(source_url, headers={"Accept": "application/json", "User-Agent": "CPA"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            source_data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+        raise HTTPException(status_code=502, detail=f"cpa_获取 models.dev 定价失败: {exc}") from exc
+
+    pricing_by_model: dict[str, dict] = {}
+    if isinstance(source_data, dict):
+        for provider in source_data.values():
+            if not isinstance(provider, dict):
+                continue
+            for model_id, item in (provider.get("models") or {}).items():
+                if not isinstance(item, dict) or not isinstance(item.get("cost"), dict):
+                    continue
+                cost = item["cost"]
+                if not isinstance(cost.get("input"), (int, float)) and not isinstance(cost.get("output"), (int, float)):
+                    continue
+                pricing_by_model.setdefault(normalize_model_id_for_pricing(model_id), cost)
+
+    models = (await db.execute(select(ModelCatalog))).scalars().all()
+    updated_count = 0
+    unmatched_model_ids = []
+    for model in models:
+        cost = pricing_by_model.get(normalize_model_id_for_pricing(model.model_id))
+        if cost is None:
+            unmatched_model_ids.append(model.model_id)
+            continue
+        model.input_price = float(cost.get("input") or 0)
+        model.output_price = float(cost.get("output") or 0)
+        model.cache_read_price = float(cost.get("cache_read") or 0)
+        model.cache_write_price = float(cost.get("cache_write") or 0)
+        model.updated_at = datetime.utcnow()
+        updated_count += 1
+
+    await db.commit()
+    return ModelsDevPricingSyncResponse(
+        updated_count=updated_count,
+        unmatched_model_ids=unmatched_model_ids,
+        source_url=source_url,
+    )
+
+
 @router.get("/models/export", response_model=ModelCatalogBatchExportResponse)
 async def export_models(
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """导出全部模型"""
     from models import ModelCatalog
@@ -6608,7 +7050,7 @@ async def export_models(
 async def create_model(
     data: ModelCatalogCreate,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """创建模型"""
     from models import ModelCatalog
@@ -6624,6 +7066,8 @@ async def create_model(
         protocol=data.protocol,
         input_price=data.input_price,
         output_price=data.output_price,
+        cache_read_price=data.cache_read_price,
+        cache_write_price=data.cache_write_price,
         is_active=data.is_active,
         is_recommended=data.is_recommended,
         supports_codex=data.supports_codex,
@@ -6642,7 +7086,7 @@ async def create_model(
 async def import_models(
     data: ModelCatalogBatchImportRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """批量导入模型"""
     from models import ModelCatalog
@@ -6660,6 +7104,8 @@ async def import_models(
             protocol=item.protocol,
             input_price=item.input_price,
             output_price=item.output_price,
+            cache_read_price=item.cache_read_price,
+            cache_write_price=item.cache_write_price,
             is_active=item.is_active,
             is_recommended=item.is_recommended,
             supports_codex=item.supports_codex,
@@ -6686,7 +7132,7 @@ async def import_models(
 async def quick_create_models(
     data: QuickCreateModelsRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """快捷批量创建模型"""
     names, created_names = await ensure_models_exist(db, data.names)
@@ -6704,7 +7150,7 @@ async def update_model(
     model_id: int,
     data: ModelCatalogUpdate,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新模型"""
     from models import ModelCatalog
@@ -6731,7 +7177,7 @@ async def update_model(
 async def delete_model(
     model_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """删除模型"""
     from models import ModelCatalog
@@ -6751,7 +7197,7 @@ async def get_export_config(
     request: Request,
     model: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """导出 CC Switch 元信息"""
     from models import ModelCatalog
@@ -6804,7 +7250,7 @@ class ProviderExtConfigMap(BaseModel):
 
 @router.get("/provider-ext-config", response_model=ProviderExtConfigMap)
 async def get_provider_ext_config(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取 provider 扩展配置（密码脱敏返回）"""
     raw: dict = export_config.get("provider_ext") or {}
@@ -6822,7 +7268,7 @@ async def get_provider_ext_config(
 @router.put("/provider-ext-config", response_model=ProviderExtConfigMap)
 async def update_provider_ext_config(
     data: ProviderExtConfigMap,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新 provider 扩展配置"""
     current: dict = export_config.get("provider_ext") or {}
@@ -6857,7 +7303,7 @@ async def update_provider_ext_config(
 async def get_provider_balance(
     key_id: int = Query(...),
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """查询指定 Key 的余额（通过 New API 登录接口，复用 Key 的代理和 fake IP 配置）"""
     import httpx as _httpx
@@ -7015,7 +7461,7 @@ class BalanceDowngradeRulesUpdate(BaseModel):
 
 @router.get("/balance-downgrade-rules", response_model=BalanceDowngradeRulesResponse)
 async def get_balance_downgrade_rules(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取余额不足降权规则"""
     raw = export_config.get("balance_downgrade_rules") or []
@@ -7036,7 +7482,7 @@ async def get_balance_downgrade_rules(
 @router.put("/balance-downgrade-rules", response_model=BalanceDowngradeRulesResponse)
 async def update_balance_downgrade_rules(
     data: BalanceDowngradeRulesUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新余额不足降权规则"""
     rules = []
@@ -7081,7 +7527,7 @@ class StreamBufferRulesUpdate(BaseModel):
 
 @router.get("/stream-buffer-rules", response_model=StreamBufferRulesResponse)
 async def get_stream_buffer_rules(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取流式缓冲规则"""
     raw = export_config.get("stream_buffer_rules") or []
@@ -7092,7 +7538,7 @@ async def get_stream_buffer_rules(
 @router.put("/stream-buffer-rules", response_model=StreamBufferRulesResponse)
 async def update_stream_buffer_rules(
     data: StreamBufferRulesUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新流式缓冲规则"""
     rules = []
@@ -7117,7 +7563,7 @@ class ShowActualModelResponse(BaseModel):
 
 @router.get("/show-actual-model", response_model=ShowActualModelResponse)
 async def get_show_actual_model(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取是否向管理员显示实际模型的配置"""
     return ShowActualModelResponse(show_actual_model=bool(export_config.get("show_actual_model", False)))
@@ -7126,7 +7572,7 @@ async def get_show_actual_model(
 @router.put("/show-actual-model", response_model=ShowActualModelResponse)
 async def update_show_actual_model(
     data: ShowActualModelResponse,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新是否向管理员显示实际模型的配置"""
     export_config["show_actual_model"] = bool(data.show_actual_model)
@@ -7151,11 +7597,12 @@ class UserQuotaUsageResponse(BaseModel):
 async def get_user_quota_usage(
     user_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """查询指定用户当前周期的 token 用量"""
     from models.admin_user import AdminUser
-    from models import UsageLog
+    from models import UsageDailySummary, UsageLog
+    from services import usage_rollup_service
     from sqlalchemy import func
     from datetime import datetime, timedelta
 
@@ -7170,14 +7617,30 @@ async def get_user_quota_usage(
         effective_start = start
         if quota_reset_at and quota_reset_at > start:
             effective_start = quota_reset_at
-        result = await db.execute(
-            select(func.coalesce(func.sum(UsageLog.total_tokens), 0)).where(
-                UsageLog.user_id == user_id,
-                UsageLog.request_time >= effective_start,
-                UsageLog.status == "success",
+
+        window = usage_rollup_service.split_time_range(0, effective_start, now)
+        total = 0
+        if window.summary_start and window.summary_end:
+            result = await db.execute(
+                select(func.coalesce(func.sum(UsageDailySummary.total_tokens), 0)).where(
+                    UsageDailySummary.user_id == user_id,
+                    UsageDailySummary.summary_date >= window.summary_start.date(),
+                    UsageDailySummary.summary_date <= window.summary_end.date(),
+                )
             )
-        )
-        return int(result.scalar() or 0)
+            total += int(result.scalar() or 0)
+
+        if window.realtime_start and window.realtime_end:
+            result = await db.execute(
+                select(func.coalesce(func.sum(UsageLog.total_tokens), 0)).where(
+                    UsageLog.user_id == user_id,
+                    UsageLog.request_time >= window.realtime_start,
+                    UsageLog.request_time <= window.realtime_end,
+                    UsageLog.status == "success",
+                )
+            )
+            total += int(result.scalar() or 0)
+        return total
 
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -7207,7 +7670,7 @@ async def get_user_quota_usage(
 async def reset_user_quota(
     user_id: int,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """重置用户额度（将 quota_reset_at 设为当前时间，之后的请求才计入用量）"""
     from models.admin_user import AdminUser
@@ -7242,7 +7705,7 @@ class ProviderMigrationRulesUpdate(BaseModel):
 
 @router.get("/provider-migration-rules", response_model=ProviderMigrationRulesResponse)
 async def get_provider_migration_rules(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取供应商迁移规则"""
     raw = export_config.get("provider_migration_rules") or []
@@ -7263,7 +7726,7 @@ async def get_provider_migration_rules(
 @router.put("/provider-migration-rules", response_model=ProviderMigrationRulesResponse)
 async def update_provider_migration_rules(
     data: ProviderMigrationRulesUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新供应商迁移规则"""
     rules = []
@@ -7295,7 +7758,7 @@ class PassThroughErrorCodesUpdate(BaseModel):
 
 @router.get("/pass-through-error-codes", response_model=PassThroughErrorCodesResponse)
 async def get_pass_through_error_codes(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取透传错误码配置"""
     codes = export_config.get("pass_through_error_codes") or []
@@ -7305,7 +7768,7 @@ async def get_pass_through_error_codes(
 @router.put("/pass-through-error-codes", response_model=PassThroughErrorCodesResponse)
 async def update_pass_through_error_codes(
     data: PassThroughErrorCodesUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新透传错误码配置"""
     valid_codes = [int(c) for c in data.pass_through_error_codes if 400 <= int(c) < 600]
@@ -7374,7 +7837,7 @@ def normalize_provider_continue_error_rules(rules: Optional[list] = None) -> lis
 
 @router.get("/provider-continue-error-rules", response_model=ProviderContinueErrorRulesResponse)
 async def get_provider_continue_error_rules(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取同 Key 继续错误规则"""
     return ProviderContinueErrorRulesResponse(rules=[ProviderContinueErrorRule(**item) for item in normalize_provider_continue_error_rules()])
@@ -7383,7 +7846,7 @@ async def get_provider_continue_error_rules(
 @router.put("/provider-continue-error-rules", response_model=ProviderContinueErrorRulesResponse)
 async def update_provider_continue_error_rules(
     data: ProviderContinueErrorRulesUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新同 Key 继续错误规则"""
     payload = normalize_provider_continue_error_rules([item.model_dump() for item in data.rules])
@@ -7395,16 +7858,20 @@ async def update_provider_continue_error_rules(
 # ============ 模型种子配置 ============
 
 class ModelSeedConfigResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     model_seed_enabled: bool
 
 
 class ModelSeedConfigUpdate(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     model_seed_enabled: bool
 
 
 @router.get("/model-seed-config", response_model=ModelSeedConfigResponse)
 async def get_model_seed_config(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取模型种子回填配置"""
     return ModelSeedConfigResponse(model_seed_enabled=bool(export_config.get("model_seed_enabled", True)))
@@ -7413,7 +7880,7 @@ async def get_model_seed_config(
 @router.put("/model-seed-config", response_model=ModelSeedConfigResponse)
 async def update_model_seed_config(
     data: ModelSeedConfigUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新模型种子回填配置"""
     export_config["model_seed_enabled"] = bool(data.model_seed_enabled)
@@ -7421,6 +7888,80 @@ async def update_model_seed_config(
     return ModelSeedConfigResponse(model_seed_enabled=bool(data.model_seed_enabled))
 
 
+# ============ 运行日志配置与查询 ============
+
+class RuntimeLogConfigResponse(BaseModel):
+    enabled: bool
+    wrap: bool = False
+    default_line_limit: int = DEFAULT_LINE_LIMIT
+    max_bytes: int
+
+
+class RuntimeLogConfigUpdate(BaseModel):
+    enabled: bool
+    wrap: bool = False
+
+
+@router.get("/runtime-log-config", response_model=RuntimeLogConfigResponse)
+async def get_runtime_log_config(
+    _: dict = Depends(require_admin_access),
+):
+    """获取运行日志显示配置"""
+    return RuntimeLogConfigResponse(
+        enabled=bool(export_config.get("runtime_log_enabled", False)),
+        wrap=bool(export_config.get("runtime_log_wrap", False)),
+        max_bytes=runtime_log_buffer.max_bytes,
+    )
+
+
+@router.put("/runtime-log-config", response_model=RuntimeLogConfigResponse)
+async def update_runtime_log_config(
+    data: RuntimeLogConfigUpdate,
+    _: dict = Depends(require_admin_access),
+):
+    """更新运行日志显示配置"""
+    export_config["runtime_log_enabled"] = bool(data.enabled)
+    export_config["runtime_log_wrap"] = bool(data.wrap)
+    persist_export_config()
+    if not data.enabled:
+        runtime_log_buffer.clear()
+    logger.info("运行日志显示已%s", "开启" if data.enabled else "关闭")
+    return RuntimeLogConfigResponse(
+        enabled=bool(data.enabled),
+        wrap=bool(data.wrap),
+        max_bytes=runtime_log_buffer.max_bytes,
+    )
+
+
+@router.get("/runtime-logs")
+async def list_runtime_logs(
+    limit: int = Query(default=DEFAULT_LINE_LIMIT, ge=1, le=5000),
+    keyword: str = Query(default="", max_length=200),
+    after_id: int = Query(default=0, ge=0),
+    _: dict = Depends(require_admin_access),
+):
+    """读取运行日志，支持关键词和增量游标"""
+    if not bool(export_config.get("runtime_log_enabled", False)):
+        return {
+            "enabled": False,
+            "items": [],
+            "latest_id": 0,
+            "total_bytes": 0,
+            "max_bytes": runtime_log_buffer.max_bytes,
+        }
+    return {
+        "enabled": True,
+        **runtime_log_buffer.list(limit=limit, keyword=keyword, after_id=after_id),
+    }
+
+
+@router.delete("/runtime-logs")
+async def clear_runtime_logs(
+    _: dict = Depends(require_admin_access),
+):
+    """清空当前进程运行日志"""
+    runtime_log_buffer.clear()
+    return {"success": True}
 
 
 # ============ 代理调试追踪配置 ============
@@ -7501,7 +8042,7 @@ def _to_trace_summary(item) -> ProxyTraceSummaryResponse:
 
 @router.get("/proxy-trace-config", response_model=ProxyTraceConfigResponse)
 async def get_proxy_trace_config(
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取代理调试追踪配置"""
     return ProxyTraceConfigResponse(**normalize_trace_config())
@@ -7510,7 +8051,7 @@ async def get_proxy_trace_config(
 @router.put("/proxy-trace-config", response_model=ProxyTraceConfigResponse)
 async def update_proxy_trace_config(
     data: ProxyTraceConfigUpdate,
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """更新代理调试追踪配置"""
     normalized = normalize_trace_config(data.model_dump())
@@ -7524,7 +8065,7 @@ async def list_proxy_traces(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取代理调试追踪列表"""
     items = await proxy_trace_service.list_traces(db, limit=limit, offset=offset)
@@ -7535,7 +8076,7 @@ async def list_proxy_traces(
 async def get_proxy_trace(
     trace_id: str,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """获取代理调试追踪详情"""
     item = await proxy_trace_service.get_trace(db, trace_id)
@@ -7552,7 +8093,7 @@ async def get_proxy_trace(
 @router.delete("/proxy-traces/cleanup", response_model=ProxyTraceCleanupResponse)
 async def cleanup_proxy_traces(
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """清理过期代理调试追踪"""
     deleted_count = await proxy_trace_service.cleanup_expired(db)
@@ -7582,7 +8123,7 @@ class FactoryResetResponse(BaseModel):
 async def factory_reset(
     data: FactoryResetRequest,
     db: AsyncSession = Depends(get_db),
-    _: bool = Depends(verify_admin_key),
+    _: dict = Depends(require_admin_access),
 ):
     """一键还原：清除非保留提供商的数据，保留用户信息和指定提供商"""
     if data.confirmation != "确认还原":
@@ -7707,11 +8248,12 @@ async def factory_reset(
 
     await db.commit()
 
-    print(
-        f"[CPA FACTORY RESET] deleted_keys={counts['keys']} "
-        f"deleted_models={counts['models']} "
-        f"deleted_usage_logs={counts['usage_logs']} "
-        f"kept_providers={keep_providers}"
+    logger.warning(
+        "[CPA FACTORY RESET] deleted_keys=%s deleted_models=%s deleted_usage_logs=%s kept_providers=%s",
+        counts["keys"],
+        counts["models"],
+        counts["usage_logs"],
+        keep_providers,
     )
 
     return FactoryResetResponse(
@@ -7727,3 +8269,136 @@ async def factory_reset(
         deleted_provider_model_mappings=counts["provider_model_mappings"],
         message=f"还原完成：删除 {counts['keys']} 个 Key，{counts['models']} 个模型，{counts['usage_logs']} 条使用记录",
     )
+
+
+# ============ DeepSeek 思考模式配置 ============
+
+class ThinkingModeRule(BaseModel):
+    """单条思考模式规则"""
+    enabled: bool = True
+    force: bool = False
+    providers: Optional[List[str]] = None
+    models: Optional[List[str]] = None
+    thinking_type: str = "enabled"
+    reasoning_effort: str = ""
+
+
+class ThinkingModeConfigResponse(BaseModel):
+    rules: List[ThinkingModeRule]
+
+
+class ThinkingModeConfigUpdate(BaseModel):
+    rules: List[ThinkingModeRule]
+
+
+@router.get("/thinking-mode-config", response_model=ThinkingModeConfigResponse)
+async def get_thinking_mode_config(
+    _: dict = Depends(require_admin_access),
+):
+    """获取 DeepSeek 思考模式配置"""
+    raw = export_config.get("thinking_mode_rules") or []
+    rules = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        rules.append(ThinkingModeRule(
+            enabled=bool(item.get("enabled", True)),
+            force=bool(item.get("force", False)),
+            providers=item.get("providers"),
+            models=item.get("models"),
+            thinking_type=str(item.get("thinking_type") or "enabled"),
+            reasoning_effort=str(item.get("reasoning_effort") or ""),
+        ))
+    return ThinkingModeConfigResponse(rules=rules)
+
+
+@router.put("/thinking-mode-config", response_model=ThinkingModeConfigResponse)
+async def update_thinking_mode_config(
+    data: ThinkingModeConfigUpdate,
+    _: dict = Depends(require_admin_access),
+):
+    """更新 DeepSeek 思考模式配置"""
+    rules = []
+    for rule in data.rules:
+        rules.append({
+            "enabled": bool(rule.enabled),
+            "force": bool(rule.force),
+            "providers": rule.providers,
+            "models": rule.models,
+            "thinking_type": (rule.thinking_type or "enabled").strip(),
+            "reasoning_effort": (rule.reasoning_effort or "").strip(),
+        })
+    export_config["thinking_mode_rules"] = rules
+    persist_export_config()
+    return ThinkingModeConfigResponse(
+        rules=[ThinkingModeRule(**r) for r in rules]
+    )
+
+
+# ============ 用量保留期配置 ============
+
+class UsageRetentionConfigResponse(BaseModel):
+    usage_log_retention_days: int
+    usage_summary_retention_days: int
+
+
+class UsageRetentionConfigUpdate(BaseModel):
+    usage_log_retention_days: int = Field(ge=1, le=3650)
+    usage_summary_retention_days: int = Field(ge=1, le=3650)
+
+
+@router.get("/usage-retention-config", response_model=UsageRetentionConfigResponse)
+async def get_usage_retention_config(
+    _: dict = Depends(require_admin_access),
+):
+    """获取用量明细与按天汇总保留天数。"""
+    return UsageRetentionConfigResponse(
+        usage_log_retention_days=max(int(export_config.get("usage_log_retention_days") or 7), 1),
+        usage_summary_retention_days=max(int(export_config.get("usage_summary_retention_days") or 90), 1),
+    )
+
+
+@router.put("/usage-retention-config", response_model=UsageRetentionConfigResponse)
+async def update_usage_retention_config(
+    data: UsageRetentionConfigUpdate,
+    _: dict = Depends(require_admin_access),
+):
+    """更新用量明细与按天汇总保留天数。"""
+    export_config["usage_log_retention_days"] = int(data.usage_log_retention_days)
+    export_config["usage_summary_retention_days"] = int(data.usage_summary_retention_days)
+    persist_export_config()
+    return UsageRetentionConfigResponse(
+        usage_log_retention_days=export_config["usage_log_retention_days"],
+        usage_summary_retention_days=export_config["usage_summary_retention_days"],
+    )
+
+
+# ============ 同 Key 重试配置 ============
+
+class RetrySameKeyConfigResponse(BaseModel):
+    providers: List[str]
+
+
+class RetrySameKeyConfigUpdate(BaseModel):
+    providers: List[str]
+
+
+@router.get("/retry-same-key-config", response_model=RetrySameKeyConfigResponse)
+async def get_retry_same_key_config(
+    _: dict = Depends(require_admin_access),
+):
+    """获取同 Key 重试配置"""
+    providers = export_config.get("retry_same_key_providers") or []
+    return RetrySameKeyConfigResponse(providers=providers)
+
+
+@router.put("/retry-same-key-config", response_model=RetrySameKeyConfigResponse)
+async def update_retry_same_key_config(
+    data: RetrySameKeyConfigUpdate,
+    _: dict = Depends(require_admin_access),
+):
+    """更新同 Key 重试配置"""
+    providers = [p.strip().lower() for p in data.providers if p.strip()]
+    export_config["retry_same_key_providers"] = providers
+    persist_export_config()
+    return RetrySameKeyConfigResponse(providers=providers)

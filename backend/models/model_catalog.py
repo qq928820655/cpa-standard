@@ -19,6 +19,8 @@ class ModelCatalog(Base):
     protocol: Mapped[str] = mapped_column(String(50), nullable=False, default="openai_chat")
     input_price: Mapped[float] = mapped_column(Float, default=0)
     output_price: Mapped[float] = mapped_column(Float, default=0)
+    cache_read_price: Mapped[float] = mapped_column(Float, default=0)
+    cache_write_price: Mapped[float] = mapped_column(Float, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_recommended: Mapped[bool] = mapped_column(Boolean, default=False)
     supports_codex: Mapped[bool] = mapped_column(Boolean, default=False)

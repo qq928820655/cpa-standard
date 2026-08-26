@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Header
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -73,9 +73,13 @@ class AuthResponse(BaseModel):
 
 
 class UserCreateRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     username: str
     password: str
     supported_models: list[str] | None = None
+    show_image_square: bool = False
+    supported_image_models: list[str] | None = None
     daily_token_limit: int | None = None
     weekly_token_limit: int | None = None
     monthly_token_limit: int | None = None
@@ -86,10 +90,14 @@ class UserCreateRequest(BaseModel):
 
 
 class UserUpdateRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     username: str | None = None
     password: str | None = None
     role: str | None = None
     supported_models: list[str] | None = None
+    show_image_square: bool | None = None
+    supported_image_models: list[str] | None = None
     daily_token_limit: int | None = None
     weekly_token_limit: int | None = None
     monthly_token_limit: int | None = None
@@ -103,11 +111,15 @@ class UserUpdateRequest(BaseModel):
 
 
 class UserResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     id: int
     username: str
     role: str
     api_key: str | None
     supported_models: list[str]
+    show_image_square: bool
+    supported_image_models: list[str]
     daily_token_limit: int | None
     weekly_token_limit: int | None
     monthly_token_limit: int | None
@@ -115,6 +127,13 @@ class UserResponse(BaseModel):
     quota_exceeded_message: str | None
     model_mapping: dict[str, Any]
     show_quota_to_user: bool
+    lifetime_request_count: int = 0
+    lifetime_success_count: int = 0
+    lifetime_error_count: int = 0
+    lifetime_prompt_tokens: int = 0
+    lifetime_completion_tokens: int = 0
+    lifetime_total_tokens: int = 0
+    lifetime_cache_tokens: int = 0
     created_at: datetime | None
 
 
@@ -160,6 +179,8 @@ def _user_to_response(user: AdminUser) -> UserResponse:
         role=user.role or "user",
         api_key=user.api_key,
         supported_models=_parse_supported_models(user.supported_models),
+        show_image_square=bool(getattr(user, "show_image_square", False)),
+        supported_image_models=_parse_supported_models(getattr(user, "supported_image_models", None)),
         daily_token_limit=getattr(user, "daily_token_limit", None),
         weekly_token_limit=getattr(user, "weekly_token_limit", None),
         monthly_token_limit=getattr(user, "monthly_token_limit", None),
@@ -167,6 +188,13 @@ def _user_to_response(user: AdminUser) -> UserResponse:
         quota_exceeded_message=getattr(user, "quota_exceeded_message", None),
         model_mapping=_parse_model_mapping(getattr(user, "model_mapping", None)),
         show_quota_to_user=bool(getattr(user, "show_quota_to_user", False)),
+        lifetime_request_count=int(getattr(user, "request_count", 0) or 0),
+        lifetime_success_count=int(getattr(user, "success_count", 0) or 0),
+        lifetime_error_count=int(getattr(user, "error_count", 0) or 0),
+        lifetime_prompt_tokens=int(getattr(user, "prompt_tokens", 0) or 0),
+        lifetime_completion_tokens=int(getattr(user, "completion_tokens", 0) or 0),
+        lifetime_total_tokens=int(getattr(user, "total_tokens", 0) or 0),
+        lifetime_cache_tokens=int(getattr(user, "cache_tokens", 0) or 0),
         created_at=user.created_at,
     )
 
@@ -485,6 +513,8 @@ async def create_user(
         role="user",
         api_key=AdminUser.generate_api_key(),
         supported_models=supported_models_json,
+        show_image_square=int(req.show_image_square),
+        supported_image_models=json.dumps(req.supported_image_models, ensure_ascii=False) if req.supported_image_models else None,
         daily_token_limit=req.daily_token_limit,
         weekly_token_limit=req.weekly_token_limit,
         monthly_token_limit=req.monthly_token_limit,
@@ -544,6 +574,12 @@ async def update_user(
 
     if req.supported_models is not None:
         user.supported_models = json.dumps(req.supported_models, ensure_ascii=False)
+
+    if req.show_image_square is not None:
+        user.show_image_square = int(req.show_image_square)
+
+    if req.supported_image_models is not None:
+        user.supported_image_models = json.dumps(req.supported_image_models, ensure_ascii=False) if req.supported_image_models else None
 
     # 限额字段：有值则更新，clear_xxx=True 则清空
     if req.clear_daily_limit:

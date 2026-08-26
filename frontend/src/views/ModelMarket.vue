@@ -5,9 +5,15 @@
         <div class="page-kicker">Models</div>
         <h2 class="page-title">模型广场</h2>
       </div>
-      <div class="header-actions">
+      <div v-if="isAdmin" class="header-actions">
         <el-button @click="importDialogVisible = true">JSON 批量导入</el-button>
         <el-button :loading="exportingAllModels" @click="exportAllModels">导出全部</el-button>
+        <el-button :loading="pricingSyncing" @click="syncModelsDevPricing">同步 models.dev 定价</el-button>
+        <el-select v-model="pricingConfig.currency" class="price-currency-select" @change="savePricingConfig">
+          <el-option label="美元" value="USD" />
+          <el-option label="人民币" value="CNY" />
+        </el-select>
+        <el-button @click="pricingDialogVisible = true">汇率</el-button>
         <el-button @click="quickCreateDialogVisible = true">快捷批量创建</el-button>
         <el-button type="primary" @click="showAddDialog">
           <el-icon><Plus /></el-icon>
@@ -33,16 +39,66 @@
     </el-card>
 
     <el-card shadow="never">
-      <el-table :data="sortedFilteredModels" stripe v-loading="loading" height="600" size="small" class="models-table" @sort-change="handleModelSortChange">
+      <!-- 窄屏：9 列表格改卡片流，价格与协议折叠在「详情」里 -->
+      <div v-if="isMobile" class="model-card-list" v-loading="loading">
+        <div v-if="!sortedFilteredModels.length" class="model-card-empty">暂无数据</div>
+
+        <div v-for="row in sortedFilteredModels" :key="row.model_id" class="model-card">
+          <div class="model-card__head">
+            <span class="model-card__name">{{ row.model_id }}</span>
+            <button type="button" class="model-card__toggle" @click="toggleModelExpand(row.model_id)">
+              <span>{{ isModelExpanded(row.model_id) ? '收起' : '详情' }}</span>
+              <el-icon :class="{ 'is-open': isModelExpanded(row.model_id) }"><ArrowDown /></el-icon>
+            </button>
+          </div>
+
+          <div class="model-card__tags">
+            <el-tag size="small" type="info">{{ row.provider }}</el-tag>
+            <el-tag :type="row.is_active ? 'success' : 'info'" size="small">
+              {{ row.is_active ? '启用' : '停用' }}
+            </el-tag>
+            <el-tag v-if="row.supports_codex" type="success" size="small">codex</el-tag>
+            <el-tag v-if="row.supports_claudecode" type="warning" size="small">claude</el-tag>
+            <el-tag v-if="row.supports_gemini" type="info" size="small">gemini</el-tag>
+            <el-tag v-if="row.is_recommended" type="primary" size="small">推荐</el-tag>
+          </div>
+
+          <div v-show="isModelExpanded(row.model_id)" class="model-card__rows">
+            <div class="model-card__row">
+              <span class="model-card__label">显示名称</span>
+              <span class="model-card__value">{{ row.display_name || '-' }}</span>
+            </div>
+            <div class="model-card__row">
+              <span class="model-card__label">协议</span>
+              <span class="model-card__value">{{ row.protocol || '-' }}</span>
+            </div>
+            <div class="model-card__row">
+              <span class="model-card__label">价格</span>
+              <span class="model-card__value">入 {{ formatPrice(row.input_price) }} / 出 {{ formatPrice(row.output_price) }}</span>
+            </div>
+          </div>
+
+          <div v-if="isAdmin" class="model-card__actions">
+            <el-button size="small" type="primary" @click="showEditDialog(row)">编辑</el-button>
+            <el-popconfirm title="确定删除此模型？" @confirm="removeModel(row)">
+              <template #reference>
+                <el-button size="small" type="danger" plain>删除</el-button>
+              </template>
+            </el-popconfirm>
+          </div>
+        </div>
+      </div>
+
+      <el-table v-else :data="sortedFilteredModels" stripe v-loading="loading" height="600" size="small" class="models-table" @sort-change="handleModelSortChange">
         <el-table-column prop="model_id" label="模型 ID" min-width="190" show-overflow-tooltip sortable="custom" />
         <el-table-column prop="display_name" label="显示名称" min-width="150" show-overflow-tooltip sortable="custom" />
         <el-table-column prop="provider" label="提供商" width="100" sortable="custom" />
         <el-table-column prop="protocol" label="协议" width="132" show-overflow-tooltip sortable="custom" />
         <el-table-column prop="input_price" label="输入价格" width="96" align="right" sortable="custom">
-          <template #default="{ row }">{{ row.input_price }}</template>
+          <template #default="{ row }">{{ formatPrice(row.input_price) }}</template>
         </el-table-column>
         <el-table-column prop="output_price" label="输出价格" width="96" align="right" sortable="custom">
-          <template #default="{ row }">{{ row.output_price }}</template>
+          <template #default="{ row }">{{ formatPrice(row.output_price) }}</template>
         </el-table-column>
         <el-table-column label="兼容" min-width="140">
           <template #default="{ row }">
@@ -61,7 +117,7 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="140" fixed="right">
+        <el-table-column v-if="isAdmin" label="操作" width="140" fixed="right">
           <template #default="{ row }">
             <el-button type="primary" link @click="showEditDialog(row)">编辑</el-button>
             <el-popconfirm title="确定删除此模型？" @confirm="removeModel(row)">
@@ -79,7 +135,9 @@
           v-model:page-size="pageSize"
           :page-sizes="pageSizeOptions"
           :total="totalModels"
-          layout="total, sizes, prev, pager, next"
+          :small="isMobile"
+          :pager-count="isMobile ? 5 : 7"
+          :layout="isMobile ? 'prev, pager, next, sizes, total' : 'total, sizes, prev, pager, next'"
           @current-change="handlePageChange"
           @size-change="handlePageSizeChange"
         />
@@ -99,6 +157,31 @@
       <template #footer>
         <el-button @click="importDialogVisible = false">取消</el-button>
         <el-button type="primary" @click="submitImport" :loading="importing">导入</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="pricingDialogVisible" title="价格显示与汇率" width="460px">
+      <el-form label-width="110px">
+        <el-form-item label="显示币种">
+          <el-radio-group v-model="pricingConfig.currency">
+            <el-radio value="USD">美元</el-radio>
+            <el-radio value="CNY">人民币</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="汇率算法">
+          <el-radio-group v-model="pricingConfig.exchange_rate_mode">
+            <el-radio value="manual">手动汇率</el-radio>
+            <el-radio value="fixed">固定汇率</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="美元兑人民币">
+          <el-input-number v-model="pricingConfig.usd_cny_rate" :min="0.01" :max="100" :precision="4" :disabled="pricingConfig.exchange_rate_mode === 'fixed'" />
+          <span v-if="pricingConfig.exchange_rate_mode === 'fixed'" class="price-rate-hint">固定使用 7.2</span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="pricingDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="savePricingConfig">保存</el-button>
       </template>
     </el-dialog>
 
@@ -162,9 +245,32 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { adminApi } from '../api'
+import { ArrowDown } from '@element-plus/icons-vue'
+import { adminApi, authApi } from '../api'
+
+// 普通用户对模型广场只读可见：隐藏所有增删改导入导出入口
+const isAdmin = computed(() => !authApi.isLoggedIn() || authApi.isAdmin())
+
+// 手机竖屏改用卡片流，桌面端保持原表格
+const MOBILE_QUERY = '(max-width: 768px)'
+const isMobile = ref(false)
+let mobileMediaQuery = null
+const syncMobile = (event) => {
+  isMobile.value = event.matches
+}
+
+// 卡片次要字段按需展开
+const expandedModelIds = ref(new Set())
+const isModelExpanded = (id) => expandedModelIds.value.has(String(id))
+const toggleModelExpand = (id) => {
+  const next = new Set(expandedModelIds.value)
+  const key = String(id)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedModelIds.value = next
+}
 
 const loading = ref(false)
 const models = ref([])
@@ -173,6 +279,13 @@ const filterProvider = ref('')
 const dialogVisible = ref(false)
 const importDialogVisible = ref(false)
 const quickCreateDialogVisible = ref(false)
+const pricingDialogVisible = ref(false)
+const pricingSyncing = ref(false)
+const pricingConfig = reactive({
+  currency: 'USD',
+  exchange_rate_mode: 'fixed',
+  usd_cny_rate: 7.2,
+})
 const isEdit = ref(false)
 const submitting = ref(false)
 const importing = ref(false)
@@ -270,6 +383,47 @@ const handleModelSortChange = ({ prop, order }) => {
   modelSort.value = { prop, order }
 }
 
+const formatPrice = (value) => {
+  const usd = Number(value || 0)
+  const exchangeRate = pricingConfig.exchange_rate_mode === 'fixed' ? 7.2 : Number(pricingConfig.usd_cny_rate || 0)
+  const amount = pricingConfig.currency === 'CNY' ? usd * exchangeRate : usd
+  const prefix = pricingConfig.currency === 'CNY' ? '¥' : '$'
+  return `${prefix}${amount.toLocaleString('zh-CN', { maximumFractionDigits: 6 })} / 1M`
+}
+
+const loadPricingConfig = async () => {
+  if (!isAdmin.value) return
+  try {
+    Object.assign(pricingConfig, await adminApi.getModelPricingConfig())
+  } catch (error) {
+    ElMessage.error(error.message || '加载价格配置失败')
+  }
+}
+
+const savePricingConfig = async () => {
+  try {
+    const result = await adminApi.updateModelPricingConfig({ ...pricingConfig })
+    Object.assign(pricingConfig, result)
+    pricingDialogVisible.value = false
+    ElMessage.success('价格显示配置已保存')
+  } catch (error) {
+    ElMessage.error(error.message || '保存价格配置失败')
+  }
+}
+
+const syncModelsDevPricing = async () => {
+  pricingSyncing.value = true
+  try {
+    const result = await adminApi.syncModelsDevPricing()
+    ElMessage.success(`已同步 ${result.updated_count} 个模型定价，未匹配 ${result.unmatched_model_ids?.length || 0} 个`)
+    await loadModels()
+  } catch (error) {
+    ElMessage.error(error.message || '同步 models.dev 定价失败')
+  } finally {
+    pricingSyncing.value = false
+  }
+}
+
 const handleKeywordChange = () => {
   resetToFirstPage()
   loadModels()
@@ -336,6 +490,11 @@ const loadModels = async () => {
     } else {
       models.value = result.items || []
       totalModels.value = result.total || 0
+    }
+
+    if (!isAdmin.value) {
+      const visibleProviders = models.value.map((item) => item.provider).filter(Boolean)
+      modelProviderOptions.value = normalizeNames(visibleProviders.join(','))
     }
   } catch (error) {
     ElMessage.error(error.message)
@@ -579,8 +738,18 @@ const removeModel = async (row) => {
 }
 
 onMounted(() => {
-  loadProviderOptions()
+  if (isAdmin.value) {
+    loadProviderOptions()
+    loadPricingConfig()
+  }
   loadModels()
+  mobileMediaQuery = window.matchMedia(MOBILE_QUERY)
+  isMobile.value = mobileMediaQuery.matches
+  mobileMediaQuery.addEventListener('change', syncMobile)
+})
+
+onBeforeUnmount(() => {
+  mobileMediaQuery?.removeEventListener('change', syncMobile)
 })
 </script>
 
@@ -591,6 +760,16 @@ onMounted(() => {
 
 .header-actions {
   gap: 12px;
+}
+
+.price-currency-select {
+  width: 96px;
+}
+
+.price-rate-hint {
+  margin-left: 8px;
+  color: #8ba0ba;
+  font-size: 12px;
 }
 
 .import-actions {
@@ -629,4 +808,119 @@ onMounted(() => {
   display: flex;
   justify-content: flex-end;
 }
+
+/* ── 移动端：模型卡片流 ── */
+.model-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.model-card-empty {
+  padding: 20px 0;
+  text-align: center;
+  color: #8ba0ba;
+  font-size: 12px;
+}
+
+.model-card {
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.model-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.model-card__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 700;
+  color: #10233f;
+}
+
+.model-card__toggle {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 2px;
+  padding: 2px 0;
+  border: none;
+  background: none;
+  font-size: 11px;
+  color: #7f93ad;
+  cursor: pointer;
+}
+
+.model-card__toggle .el-icon {
+  transition: transform 0.2s;
+}
+
+.model-card__toggle .el-icon.is-open {
+  transform: rotate(180deg);
+}
+
+.model-card__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.model-card__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(148, 163, 184, 0.24);
+}
+
+.model-card__row {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.model-card__label {
+  color: #8ba0ba;
+}
+
+.model-card__value {
+  min-width: 0;
+  color: #40566f;
+  word-break: break-word;
+}
+
+.model-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(148, 163, 184, 0.24);
+}
+
+@media (max-width: 768px) {
+  /* 搜索框与提供商筛选窄屏各占一行 */
+  .filter-row {
+    grid-template-columns: 1fr;
+  }
+
+  .header-actions {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+}
+
 </style>

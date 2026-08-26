@@ -13,9 +13,12 @@
           <div>
             <div class="panel-title">筛选条件</div>
           </div>
+          <el-button v-if="isMobile" link type="primary" @click="filtersCollapsed = !filtersCollapsed">
+            {{ filtersCollapsed ? '展开' : '折叠' }}
+          </el-button>
         </div>
       </template>
-      <el-row :gutter="20">
+      <el-row v-show="!isMobile || !filtersCollapsed" :gutter="20">
         <el-col :xs="24" :sm="12" :lg="4">
           <el-select v-model="filterDays" placeholder="时间范围" @change="handleQuickRangeChange">
             <el-option :value="7" label="最近 7 天" />
@@ -24,7 +27,28 @@
             <el-option :value="90" label="最近 90 天" />
           </el-select>
         </el-col>
-        <el-col :xs="24" :sm="12" :lg="8">
+        <!-- 窄屏区间选择器的双面板弹层放不下，拆成起止两个单面板输入 -->
+        <template v-if="isMobile">
+          <el-col :xs="12">
+            <el-date-picker
+              v-model="customStartTime"
+              type="datetime"
+              placeholder="开始时间"
+              value-format="YYYY-MM-DDTHH:mm:ss"
+              clearable
+            />
+          </el-col>
+          <el-col :xs="12">
+            <el-date-picker
+              v-model="customEndTime"
+              type="datetime"
+              placeholder="结束时间"
+              value-format="YYYY-MM-DDTHH:mm:ss"
+              clearable
+            />
+          </el-col>
+        </template>
+        <el-col v-else :xs="24" :sm="12" :lg="8">
           <el-date-picker
             v-model="filterDateRange"
             type="datetimerange"
@@ -36,10 +60,10 @@
             @change="handleDateRangeChange"
           />
         </el-col>
-        <el-col :xs="24" :sm="12" :lg="4">
+        <el-col :xs="12" :sm="12" :lg="4">
           <el-select
             v-model="filterKeyId"
-            placeholder="筛选 Key / 输入 Key ID"
+            :placeholder="isMobile ? '筛选 Key' : '筛选 Key / 输入 Key ID'"
             filterable
             allow-create
             default-first-option
@@ -54,7 +78,7 @@
             />
           </el-select>
         </el-col>
-        <el-col :xs="24" :sm="12" :lg="4">
+        <el-col :xs="12" :sm="12" :lg="4">
           <el-select
             v-model="filterProviders"
             placeholder="筛选提供商"
@@ -75,7 +99,7 @@
             />
           </el-select>
         </el-col>
-        <el-col :xs="24" :sm="12" :lg="4">
+        <el-col :xs="12" :sm="12" :lg="4">
           <el-select
             v-model="filterModels"
             placeholder="筛选模型"
@@ -96,14 +120,14 @@
             />
           </el-select>
         </el-col>
-        <el-col :xs="24" :sm="12" :lg="4">
+        <el-col :xs="12" :sm="12" :lg="4">
           <el-select v-model="filterStatus" placeholder="筛选状态" clearable @change="() => { resetToFirstPage(); loadLogs() }">
             <el-option value="success" label="成功" />
             <el-option value="error" label="失败" />
             <el-option value="in_progress" label="进行中" />
           </el-select>
         </el-col>
-        <el-col v-if="showUserFilter" :xs="24" :sm="12" :lg="4">
+        <el-col v-if="showUserFilter" :xs="12" :sm="12" :lg="4">
           <el-select v-model="userIdFilter" placeholder="筛选用户" clearable filterable @change="() => loadData({ resetLogsPage: true })">
             <el-option
               v-for="item in userOptions"
@@ -116,7 +140,25 @@
       </el-row>
     </el-card>
 
-    <div class="summary-grid">
+    <!-- 窄屏：概览卡片压成一行 5 个的紧凑格子，并可整块折叠 -->
+    <el-card v-if="isMobile" class="summary-card-wrap" shadow="never">
+      <template #header>
+        <div class="card-header-simple">
+          <div class="panel-title">请求概览</div>
+          <el-button link type="primary" @click="summaryCollapsed = !summaryCollapsed">
+            {{ summaryCollapsed ? '展开' : '折叠' }}
+          </el-button>
+        </div>
+      </template>
+      <div v-show="!summaryCollapsed" class="summary-grid summary-grid--mobile">
+        <div v-for="item in summaryCards" :key="item.label" class="summary-card">
+          <span class="summary-card__label">{{ item.label }}</span>
+          <strong class="summary-card__value">{{ item.value }}</strong>
+        </div>
+      </div>
+    </el-card>
+
+    <div v-else class="summary-grid">
       <div v-for="item in summaryCards" :key="item.label" class="summary-card">
         <span class="summary-card__label">{{ item.label }}</span>
         <strong class="summary-card__value">{{ item.value }}</strong>
@@ -130,9 +172,18 @@
           <div>
             <div class="panel-title">用量趋势</div>
           </div>
+          <el-button v-if="isMobile" link type="primary" @click="chartCollapsed = !chartCollapsed">
+            {{ chartCollapsed ? '展开' : '折叠' }}
+          </el-button>
         </div>
       </template>
-      <v-chart :option="chartOption" class="chart-view" autoresize />
+      <v-chart
+        v-show="!isMobile || !chartCollapsed"
+        :option="chartOption"
+        class="chart-view"
+        :class="{ 'chart-view--mobile': isMobile }"
+        autoresize
+      />
     </el-card>
 
     <el-card class="logs-card" shadow="never">
@@ -144,13 +195,72 @@
           </div>
         </div>
       </template>
-      <el-table :data="logs" stripe border v-loading="loadingLogs" height="600" class="logs-table" size="small">
+      <!-- 窄屏：15 列表格改为卡片流，详细字段折叠在「详情」里 -->
+      <div v-if="isMobile" class="log-card-list" v-loading="loadingLogs">
+        <div v-if="!logs.length" class="log-card-empty">暂无数据</div>
+        <div v-for="row in logs" :key="row.id" class="log-card">
+          <div class="log-card__head">
+            <span class="log-card__model">{{ row.model || '-' }}</span>
+            <span class="log-card__time">{{ formatTableTime(row.request_time) }}</span>
+          </div>
+          <div class="log-card__meta">
+            <el-button v-if="showUserFilter" link type="primary" class="log-card__key" @click="openKeyDetail(row.api_key_id)">
+              {{ getLogKeyName(row) || `#${row.api_key_id}` }}
+            </el-button>
+            <span v-else class="log-card__key log-card__key--static">
+              {{ getLogKeyName(row) || `#${row.api_key_id}` }}
+            </span>
+            <el-tag :type="getStatusTagType(row.status)" size="small">{{ getStatusLabel(row.status) }}</el-tag>
+          </div>
+          <div class="log-card__foot">
+            <span class="log-card__latency">{{ formatCompactLatency(row.latency_ms) }}</span>
+            <span class="log-card__tokens">{{ formatCompactTokenValue(row.total_tokens) }} Tokens</span>
+            <button type="button" class="log-card__toggle" @click="toggleLogExpand(row.id)">
+              <span>{{ isLogExpanded(row.id) ? '收起' : '详情' }}</span>
+              <el-icon :class="{ 'is-open': isLogExpanded(row.id) }"><ArrowDown /></el-icon>
+            </button>
+          </div>
+          <div v-show="isLogExpanded(row.id)" class="log-card__rows">
+            <div class="log-card__row">
+              <span class="log-card__label">ID</span>
+              <span class="log-card__value">{{ row.id }}</span>
+            </div>
+            <div v-if="row.actual_model" class="log-card__row">
+              <span class="log-card__label">实际模型</span>
+              <span class="log-card__value">{{ row.actual_model }}</span>
+            </div>
+            <div class="log-card__row">
+              <span class="log-card__label">Token</span>
+              <span class="log-card__value">
+                入 {{ formatCompactTokenValue(row.prompt_tokens) }} /
+                实 {{ formatCompactTokenValue(getActualInputTokens(row)) }} /
+                出 {{ formatCompactTokenValue(row.completion_tokens) }}
+                <template v-if="row.cache_tokens"> / 缓存 {{ formatCompactTokenValue(row.cache_tokens) }}</template>
+              </span>
+            </div>
+            <div class="log-card__row">
+              <span class="log-card__label">耗时</span>
+              <span class="log-card__value">
+                上游 {{ formatCompactLatency(row.upstream_latency_ms) }} /
+                CPA {{ formatCompactLatency(row.cpa_overhead_ms) }}
+              </span>
+            </div>
+            <div v-if="row.error_message" class="log-card__row">
+              <span class="log-card__label">错误</span>
+              <span class="log-card__value log-card__value--error">{{ row.error_message }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <el-table v-else :data="logs" stripe border v-loading="loadingLogs" height="600" class="logs-table" size="small">
         <el-table-column prop="id" label="ID" width="64" />
         <el-table-column prop="api_key_id" label="Key ID" width="60">
           <template #default="{ row }">
-            <el-button link type="primary" class="key-id-link" @click="openKeyDetail(row.api_key_id)">
+            <el-button v-if="showUserFilter" link type="primary" class="key-id-link" @click="openKeyDetail(row.api_key_id)">
               {{ row.api_key_id }}
             </el-button>
+            <span v-else class="key-id-static">{{ row.api_key_id }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="api_key_name" label="Key 名称" width="90">
@@ -269,7 +379,9 @@
           v-model:page-size="pageSize"
           :page-sizes="pageSizeOptions"
           :total="totalLogs"
-          layout="total, sizes, prev, pager, next"
+          :small="isMobile"
+          :pager-count="isMobile ? 5 : 7"
+          :layout="isMobile ? 'prev, pager, next, sizes, total' : 'total, sizes, prev, pager, next'"
           @current-change="handlePageChange"
           @size-change="handlePageSizeChange"
         />
@@ -283,7 +395,7 @@
       @closed="handleKeyDetailDialogClosed"
     >
       <div v-loading="keyDetailLoading" class="key-detail-dialog">
-        <el-descriptions :column="2" border>
+        <el-descriptions :column="isMobile ? 1 : 2" border>
           <el-descriptions-item label="Key ID">{{ keyDetail.id || '-' }}</el-descriptions-item>
           <el-descriptions-item label="名称">
             <span>{{ keyDetail.name || '-' }}</span>
@@ -313,15 +425,20 @@
             </el-button>
           </el-descriptions-item>
           <el-descriptions-item label="权重">{{ keyDetail.weight ?? '-' }}</el-descriptions-item>
-          <el-descriptions-item label="总请求数">{{ Number(keyDetailSummary.total_requests || 0).toLocaleString('zh-CN') }}</el-descriptions-item>
-          <el-descriptions-item label="成功率">{{ getSuccessRate(keyDetailSummary) }}%</el-descriptions-item>
-          <el-descriptions-item label="总 Token">{{ formatTokenValue(keyDetailSummary.total_tokens) }}</el-descriptions-item>
-          <el-descriptions-item label="输入 Token">{{ formatTokenValue(keyDetailSummary.prompt_tokens) }}</el-descriptions-item>
-          <el-descriptions-item label="缓存 Token">{{ formatTokenValue(keyDetailSummary.cache_tokens) }}</el-descriptions-item>
-          <el-descriptions-item label="输出 Token">{{ formatTokenValue(keyDetailSummary.completion_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="区间请求数">{{ Number(keyDetailSummary.total_requests || 0).toLocaleString('zh-CN') }}</el-descriptions-item>
+          <el-descriptions-item label="区间成功率">{{ getSuccessRate(keyDetailSummary) }}%</el-descriptions-item>
+          <el-descriptions-item label="区间总 Token">{{ formatTokenValue(keyDetailSummary.total_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="区间输入 Token">{{ formatTokenValue(keyDetailSummary.prompt_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="区间缓存 Token">{{ formatTokenValue(keyDetailSummary.cache_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="区间输出 Token">{{ formatTokenValue(keyDetailSummary.completion_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="累计请求数">{{ Number(keyDetail.request_count || 0).toLocaleString('zh-CN') }}</el-descriptions-item>
+          <el-descriptions-item label="累计总 Token">{{ formatTokenValue(keyDetail.total_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="累计输入 Token">{{ formatTokenValue(keyDetail.prompt_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="累计缓存 Token">{{ formatTokenValue(keyDetail.cache_tokens) }}</el-descriptions-item>
+          <el-descriptions-item label="累计输出 Token">{{ formatTokenValue(keyDetail.completion_tokens) }}</el-descriptions-item>
           <el-descriptions-item label="平均上游耗时">{{ formatLatency(keyDetailSummary.avg_upstream_latency_ms) }}</el-descriptions-item>
           <el-descriptions-item label="CPA 额外耗时">{{ formatLatency(keyDetailSummary.avg_cpa_overhead_ms) }}</el-descriptions-item>
-          <el-descriptions-item label="账户余额" :span="2">
+          <el-descriptions-item label="账户余额" :span="isMobile ? 1 : 2">
             <span v-if="keyDetailBalanceLoading" style="color: #909399; font-size: 13px">查询中...</span>
             <span v-else-if="keyDetailBalance">
               <span style="color: #10b981; font-weight: 600">${{ keyDetailBalance.balance_usd.toFixed(4) }}</span>
@@ -428,7 +545,7 @@ import { LineChart, BarChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
 import { ElMessage } from 'element-plus'
-import { View } from '@element-plus/icons-vue'
+import { View, ArrowDown } from '@element-plus/icons-vue'
 import { statsApi, adminApi, authApi, copyText } from '../api'
 import { useDisplaySettings } from '../stores/displaySettings'
 
@@ -451,6 +568,30 @@ const restoreUsageStatsState = () => {
 
 const savedState = restoreUsageStatsState()
 const route = useRoute()
+
+// 手机竖屏改用卡片流与折叠面板，桌面端保持原表格与栅格
+const MOBILE_QUERY = '(max-width: 768px)'
+const isMobile = ref(false)
+let mobileMediaQuery = null
+const syncMobile = (event) => {
+  isMobile.value = event.matches
+}
+
+// 窄屏首屏空间紧张：筛选与概览默认折叠，趋势图和记录保持展开
+const filtersCollapsed = ref(true)
+const summaryCollapsed = ref(true)
+const chartCollapsed = ref(false)
+
+// 请求记录卡片的详细信息按需展开，避免每条都铺开十几个字段
+const expandedLogIds = ref(new Set())
+const isLogExpanded = (id) => expandedLogIds.value.has(Number(id))
+const toggleLogExpand = (id) => {
+  const next = new Set(expandedLogIds.value)
+  const key = Number(id)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedLogIds.value = next
+}
 
 const filterDays = ref([7, 14, 30, 90].includes(Number(savedState.filterDays)) ? Number(savedState.filterDays) : 7)
 const filterDateRange = ref([])
@@ -743,7 +884,7 @@ const summaryCards = computed(() => [
     hint: '命中错误状态的请求数量',
   },
   {
-    label: '进行中请求',
+    label: '进行请求',
     value: Number(summary.value.in_progress_requests || 0).toLocaleString('zh-CN'),
     hint: '仍在处理或尚未完成的请求',
   },
@@ -768,12 +909,12 @@ const summaryCards = computed(() => [
     hint: '命中缓存的输入 Token 数',
   },
   {
-    label: '平均上游耗时',
+    label: '上游耗时',
     value: formatLatencyValue(summary.value.avg_upstream_latency_ms),
     hint: '请求在上游处理的平均耗时',
   },
   {
-    label: 'CPA 额外耗时',
+    label: 'CPA 耗时',
     value: formatLatencyValue(summary.value.avg_cpa_overhead_ms),
     hint: '系统内部额外处理耗时',
   },
@@ -815,73 +956,106 @@ const formatTableTime = (time) => {
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
-const chartOption = computed(() => ({
-  color: ['#3b82f6', '#06b6d4'],
-  tooltip: {
-    trigger: 'axis',
-    backgroundColor: 'rgba(15, 23, 42, 0.84)',
-    borderWidth: 0,
-    textStyle: { color: '#f8fafc' },
-  },
-  legend: {
-    data: ['请求数', 'Token 数'],
-    top: 0,
-    textStyle: { color: '#59708f' },
-  },
-  grid: {
-    left: 10,
-    right: 10,
-    top: 56,
-    bottom: 8,
-    containLabel: true,
-  },
-  xAxis: {
-    type: 'category',
-    data: dailyUsage.value.map((d) => d.date),
-    axisLine: { lineStyle: { color: 'rgba(148, 163, 184, 0.22)' } },
-    axisLabel: { color: '#6b7f99' },
-  },
-  yAxis: [
-    {
-      type: 'value',
-      name: '请求数',
-      nameTextStyle: { color: '#6b7f99' },
-      axisLabel: { color: '#6b7f99' },
-      splitLine: { lineStyle: { color: 'rgba(148, 163, 184, 0.14)' } },
+// 窄屏图表可用宽度只有 300 出头：轴名挪到轴顶、数值改紧凑写法、日期只留月日，
+// 否则「请求数 / Token 数」和坐标标签会互相挤掉
+const formatAxisNumber = (value) => {
+  const num = Number(value) || 0
+  if (num >= 10000) return `${(num / 10000).toFixed(num >= 100000 ? 0 : 1)}万`
+  if (num >= 1000) return `${(num / 1000).toFixed(1)}k`
+  return String(num)
+}
+
+const chartOption = computed(() => {
+  const mobile = isMobile.value
+  const labelColor = '#6b7f99'
+  return {
+    color: ['#3b82f6', '#06b6d4'],
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: 'rgba(15, 23, 42, 0.84)',
+      borderWidth: 0,
+      textStyle: { color: '#f8fafc', fontSize: mobile ? 11 : 12 },
+      confine: mobile,
     },
-    {
-      type: 'value',
-      name: 'Token 数',
-      nameTextStyle: { color: '#6b7f99' },
-      axisLabel: { color: '#6b7f99' },
-      splitLine: { show: false },
+    legend: {
+      data: ['请求数', 'Token 数'],
+      top: 0,
+      itemWidth: mobile ? 12 : 25,
+      itemHeight: mobile ? 8 : 14,
+      itemGap: mobile ? 10 : 16,
+      textStyle: { color: '#59708f', fontSize: mobile ? 10 : 12 },
     },
-  ],
-  series: [
-    {
-      name: '请求数',
-      type: 'bar',
-      barMaxWidth: 28,
-      itemStyle: {
-        borderRadius: [10, 10, 0, 0],
+    grid: {
+      left: mobile ? 2 : 10,
+      right: mobile ? 2 : 10,
+      top: mobile ? 46 : 56,
+      bottom: mobile ? 2 : 8,
+      containLabel: true,
+    },
+    xAxis: {
+      type: 'category',
+      data: dailyUsage.value.map((d) => d.date),
+      axisLine: { lineStyle: { color: 'rgba(148, 163, 184, 0.22)' } },
+      axisLabel: {
+        color: labelColor,
+        fontSize: mobile ? 9 : 12,
+        // 日期只保留 MM-DD，并按可用宽度自动抽稀
+        formatter: mobile ? (value) => String(value).slice(5) : undefined,
+        hideOverlap: mobile,
       },
-      data: dailyUsage.value.map((d) => d.total_requests),
     },
-    {
-      name: 'Token 数',
-      type: 'line',
-      yAxisIndex: 1,
-      smooth: true,
-      symbol: 'circle',
-      symbolSize: 7,
-      lineStyle: { width: 3 },
-      areaStyle: {
-        color: 'rgba(6, 182, 212, 0.10)',
+    yAxis: [
+      {
+        type: 'value',
+        name: '请求数',
+        nameTextStyle: { color: labelColor, fontSize: mobile ? 9 : 12, align: 'left' },
+        nameGap: mobile ? 8 : 15,
+        axisLabel: {
+          color: labelColor,
+          fontSize: mobile ? 9 : 12,
+          formatter: mobile ? formatAxisNumber : undefined,
+        },
+        splitLine: { lineStyle: { color: 'rgba(148, 163, 184, 0.14)' } },
       },
-      data: dailyUsage.value.map((d) => d.total_tokens),
-    },
-  ],
-}))
+      {
+        type: 'value',
+        name: 'Token 数',
+        nameTextStyle: { color: labelColor, fontSize: mobile ? 9 : 12, align: 'right' },
+        nameGap: mobile ? 8 : 15,
+        axisLabel: {
+          color: labelColor,
+          fontSize: mobile ? 9 : 12,
+          formatter: mobile ? formatAxisNumber : undefined,
+        },
+        splitLine: { show: false },
+      },
+    ],
+    series: [
+      {
+        name: '请求数',
+        type: 'bar',
+        barMaxWidth: mobile ? 16 : 28,
+        itemStyle: {
+          borderRadius: [10, 10, 0, 0],
+        },
+        data: dailyUsage.value.map((d) => d.total_requests),
+      },
+      {
+        name: 'Token 数',
+        type: 'line',
+        yAxisIndex: 1,
+        smooth: true,
+        symbol: 'circle',
+        symbolSize: mobile ? 4 : 7,
+        lineStyle: { width: mobile ? 2 : 3 },
+        areaStyle: {
+          color: 'rgba(6, 182, 212, 0.10)',
+        },
+        data: dailyUsage.value.map((d) => d.total_tokens),
+      },
+    ],
+  }
+})
 
 const loadSummaryAndDaily = async () => {
   const params = buildStatsParams()
@@ -995,6 +1169,24 @@ const handleDateRangeChange = (value) => {
   loadData({ resetLogsPage: true })
 }
 
+// 窄屏把区间选择器拆成两个单值输入，这里桥接回同一个 filterDateRange
+const makeRangeEndpoint = (index) => computed({
+  get: () => filterDateRange.value?.[index] || '',
+  set: (value) => {
+    const next = [filterDateRange.value?.[0] || '', filterDateRange.value?.[1] || '']
+    next[index] = value || ''
+    // 半填状态先留住输入，等起止都齐了再触发查询；两端都清空则退回快捷天数
+    filterDateRange.value = next
+    if (next[0] && next[1]) {
+      handleDateRangeChange(next)
+    } else if (!next[0] && !next[1]) {
+      handleDateRangeChange([])
+    }
+  },
+})
+const customStartTime = makeRangeEndpoint(0)
+const customEndTime = makeRangeEndpoint(1)
+
 const handlePageChange = (page) => {
   currentPage.value = page
   loadLogs()
@@ -1064,7 +1256,12 @@ watch(
 )
 
 onMounted(async () => {
-  await Promise.all([loadKeyOptions(), loadProviderOptions(), loadModelOptions(), loadUserOptions()])
+  mobileMediaQuery = window.matchMedia(MOBILE_QUERY)
+  isMobile.value = mobileMediaQuery.matches
+  mobileMediaQuery.addEventListener('change', syncMobile)
+  if (showUserFilter.value) {
+    await Promise.all([loadKeyOptions(), loadProviderOptions(), loadModelOptions(), loadUserOptions()])
+  }
   loadData()
   document.addEventListener('visibilitychange', handleVisibilityChange)
   startAutoRefresh()
@@ -1072,6 +1269,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   stopAutoRefresh()
+  mobileMediaQuery?.removeEventListener('change', syncMobile)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 </script>
@@ -1205,9 +1403,229 @@ onBeforeUnmount(() => {
   background-color: #409eff;
 }
 
+/* ── 移动端：概览格子 / 趋势图 / 请求记录卡片 ── */
+.summary-grid--mobile {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.summary-grid--mobile .summary-card:nth-child(9),
+.summary-grid--mobile .summary-card:nth-child(10) {
+  grid-column: span 2;
+}
+
+.summary-grid--mobile .summary-card {
+  gap: 1px;
+  padding: 5px 2px;
+  border: 1px solid var(--cpa-border-soft, rgba(148, 163, 184, 0.24));
+  border-radius: 10px;
+  text-align: center;
+}
+
+.summary-grid--mobile .summary-card__label {
+  font-size: 9px;
+  line-height: 1.25;
+  font-weight: 600;
+}
+
+/* 前两行每行 4 格，最后两个耗时指标各占 2 格，兼顾信息密度和完整显示 */
+.summary-grid--mobile .summary-card__value {
+  font-size: clamp(10px, 2.9vw, 12px);
+  line-height: 1.2;
+  letter-spacing: -0.2px;
+  /* 超长数值收省略号，不撑破格子 */
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.chart-view--mobile {
+  height: 240px;
+}
+
+.log-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 120px;
+}
+
+.log-card-empty {
+  padding: 28px 0;
+  text-align: center;
+  font-size: 12px;
+  color: var(--cpa-text-tertiary, #8ba0ba);
+}
+
+.log-card {
+  padding: 10px;
+  border: 1px solid var(--cpa-border-soft, rgba(148, 163, 184, 0.24));
+  border-radius: 12px;
+  background: var(--cpa-surface, #fff);
+}
+
+.log-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.log-card__model {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--cpa-text-primary, #10233f);
+}
+
+.log-card__time {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--cpa-text-tertiary, #8ba0ba);
+}
+
+.log-card__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.log-card__key {
+  max-width: 60%;
+  padding: 0;
+  font-size: 11px;
+  overflow: hidden;
+}
+
+.log-card__foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--cpa-text-secondary, #6b7f99);
+}
+
+.log-card__tokens {
+  margin-right: auto;
+}
+
+.log-card__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  padding: 2px 4px;
+  border: none;
+  background: none;
+  font-size: 11px;
+  color: var(--cpa-text-tertiary, #8ba0ba);
+  cursor: pointer;
+}
+
+.log-card__toggle .el-icon {
+  transition: transform 0.2s;
+}
+
+.log-card__toggle .el-icon.is-open {
+  transform: rotate(180deg);
+}
+
+.log-card__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--cpa-border-soft, rgba(148, 163, 184, 0.24));
+}
+
+.log-card__row {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 6px;
+  font-size: 11px;
+}
+
+.log-card__label {
+  color: var(--cpa-text-tertiary, #8ba0ba);
+}
+
+.log-card__value {
+  color: var(--cpa-text-secondary, #6b7f99);
+  word-break: break-all;
+}
+
+.log-card__value--error {
+  color: var(--el-color-danger, #f56c6c);
+}
+
 @media (max-width: 768px) {
-  .summary-grid {
+  /* 桌面端一行一个的自适应格子在窄屏会拉成长条，这里交给上面的 5 列布局 */
+  .summary-grid:not(.summary-grid--mobile) {
     grid-template-columns: 1fr;
+  }
+
+  .page-title {
+    white-space: normal;
+  }
+
+  .panel-title {
+    font-size: 13px;
+  }
+
+  .panel-subtitle {
+    margin-top: 4px;
+    font-size: 11px;
+  }
+
+  .filter-card :deep(.el-card__header),
+  .summary-card-wrap :deep(.el-card__header),
+  .chart-card :deep(.el-card__header),
+  .logs-card :deep(.el-card__header) {
+    padding: 8px 12px;
+  }
+
+  .filter-card :deep(.el-card__body),
+  .summary-card-wrap :deep(.el-card__body),
+  .chart-card :deep(.el-card__body),
+  .logs-card :deep(.el-card__body) {
+    padding: 10px 12px;
+  }
+
+  /* 栅格在窄屏由 xs 跨度控制，这里补上纵向间距 */
+  .filter-card :deep(.el-col) {
+    margin-bottom: 8px;
+  }
+
+  .filter-card :deep(.el-input__inner),
+  .filter-card :deep(.el-select__placeholder) {
+    font-size: 12px;
+  }
+
+  /* 日期选择器默认最小宽度会超出半列，压到容器宽度 */
+  .filter-card :deep(.el-date-editor.el-input) {
+    width: 100%;
+  }
+
+  .filter-card :deep(.el-date-editor .el-input__wrapper) {
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+
+  .filter-card :deep(.el-date-editor .el-input__prefix) {
+    display: none;
+  }
+
+  .pagination {
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 10px;
   }
 }
 </style>

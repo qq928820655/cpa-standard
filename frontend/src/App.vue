@@ -1,7 +1,7 @@
 <template>
   <el-config-provider :locale="zhCn">
-    <el-container class="app-shell">
-      <el-aside width="220px" class="sidebar-shell">
+    <el-container class="app-shell" :class="{ 'is-mobile-shell': isMobile }">
+      <el-aside v-if="!isMobile" width="220px" class="sidebar-shell">
         <div class="sidebar-panel">
           <div class="logo-block">
             <div class="logo-mark" @click="toggleMenuMode">CPA</div>
@@ -29,11 +29,11 @@
                 <el-icon><Grid /></el-icon>
                 <span>模型广场</span>
               </el-menu-item>
-              <el-menu-item index="/provider-model-mappings">
+              <el-menu-item v-if="showSettings" index="/provider-model-mappings">
                 <el-icon><Connection /></el-icon>
                 <span>模型映射</span>
               </el-menu-item>
-              <el-menu-item index="/images">
+              <el-menu-item v-if="showImageSquare" index="/images">
                 <el-icon><Picture /></el-icon>
                 <span>光影世界</span>
               </el-menu-item>
@@ -45,6 +45,10 @@
                 <el-icon><Warning /></el-icon>
                 <span>安全事件</span>
               </el-menu-item>
+              <el-menu-item v-if="showRuntimeLogs" index="/runtime-logs">
+                <el-icon><Document /></el-icon>
+                <span>运行日志</span>
+              </el-menu-item>
               <el-menu-item v-if="showSettings" index="/settings">
                 <el-icon><Setting /></el-icon>
                 <span>系统设置</span>
@@ -54,6 +58,10 @@
               <el-menu-item v-if="showSettings" index="/openai-plus">
                 <el-icon><Link /></el-icon>
                 <span>OpenAI</span>
+              </el-menu-item>
+              <el-menu-item v-if="showSettings" index="/grok-pool">
+                <el-icon><Connection /></el-icon>
+                <span>Grok</span>
               </el-menu-item>
             </template>
           </el-menu>
@@ -83,27 +91,128 @@
       </el-aside>
 
       <el-main class="main-shell">
+        <div v-if="isMobile" class="mobile-topbar">
+          <div class="mobile-topbar__brand" @click="toggleMenuMode">CPA</div>
+          <div class="mobile-topbar__title">{{ currentNavLabel }}</div>
+          <div class="mobile-topbar__spacer"></div>
+          <button
+            type="button"
+            class="mobile-topbar__more"
+            aria-label="打开菜单"
+            @click="mobileDrawerVisible = true"
+          >
+            <el-icon><Operation /></el-icon>
+          </button>
+        </div>
+
         <div class="main-panel">
           <router-view v-slot="{ Component }">
             <keep-alive>
-              <component :is="Component" />
+              <component :is="Component" :key="`${route.fullPath}:${sessionVersion}`" />
             </keep-alive>
           </router-view>
         </div>
       </el-main>
+
+      <nav v-if="isMobile" class="mobile-tabbar" aria-label="主导航">
+        <button
+          v-for="item in mobileTabItems"
+          :key="item.path"
+          type="button"
+          class="mobile-tab"
+          :class="{ 'is-active': currentRoute === item.path }"
+          @click="goMobileRoute(item.path)"
+        >
+          <el-icon class="mobile-tab__icon"><component :is="item.icon" /></el-icon>
+          <span class="mobile-tab__label">{{ item.label }}</span>
+        </button>
+        <button
+          type="button"
+          class="mobile-tab"
+          :class="{ 'is-active': isDrawerRouteActive }"
+          @click="mobileDrawerVisible = true"
+        >
+          <el-icon class="mobile-tab__icon"><Operation /></el-icon>
+          <span class="mobile-tab__label">更多</span>
+        </button>
+      </nav>
+
+      <el-drawer
+        v-if="isMobile"
+        v-model="mobileDrawerVisible"
+        direction="rtl"
+        size="78%"
+        :with-header="false"
+        class="mobile-nav-drawer"
+      >
+        <div class="mobile-drawer-body">
+          <div class="mobile-drawer__head">
+            <div class="mobile-drawer__logo" @click="toggleMenuMode">CPA</div>
+            <div class="mobile-drawer__mode">{{ menuMode === 'main' ? '主菜单' : 'OpenAI 菜单' }}</div>
+          </div>
+
+          <div class="mobile-drawer__list">
+            <button
+              v-for="item in mobileDrawerItems"
+              :key="item.path"
+              type="button"
+              class="mobile-drawer__item"
+              :class="{ 'is-active': currentRoute === item.path }"
+              @click="goMobileRoute(item.path)"
+            >
+              <el-icon><component :is="item.icon" /></el-icon>
+              <span>{{ item.label }}</span>
+            </button>
+          </div>
+
+          <div class="mobile-drawer__footer">
+            <div class="theme-switcher">
+              <div class="theme-switcher__options">
+                <button
+                  v-for="theme in themeOptions"
+                  :key="theme.value"
+                  type="button"
+                  class="theme-option"
+                  :class="{ 'is-active': currentTheme === theme.value }"
+                  :aria-label="theme.label"
+                  :title="theme.label"
+                  @click="selectTheme(theme.value)"
+                >
+                  <span class="theme-option__swatch" :style="{ background: theme.preview }"></span>
+                </button>
+              </div>
+            </div>
+
+            <div v-if="loginEnabled && isLoggedIn" class="logout-row">
+              <span class="logout-user">{{ username }}</span>
+              <button type="button" class="logout-btn" @click="handleLogout">退出</button>
+            </div>
+          </div>
+        </div>
+      </el-drawer>
     </el-container>
   </el-config-provider>
 </template>
 
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import zhCn from 'element-plus/dist/locale/zh-cn.mjs'
-import { authApi } from './api'
-import { Connection, User, Warning, Link } from '@element-plus/icons-vue'
+import { adminApi, authApi } from './api'
+import { Connection, Document, User, Warning, Link, Operation } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
+
+// 手机竖屏改用底部标签栏 + 抽屉导航，桌面端继续走左侧栏
+const MOBILE_NAV_QUERY = '(max-width: 768px)'
+const isMobile = ref(false)
+const mobileDrawerVisible = ref(false)
+let navMediaQuery = null
+const syncMobileNav = (event) => {
+  isMobile.value = event.matches
+  if (!event.matches) mobileDrawerVisible.value = false
+}
 const sessionVersion = ref(0)
 const isLoggedIn = computed(() => {
   sessionVersion.value  // 触发响应式依赖
@@ -115,6 +224,7 @@ const username = computed(() => {
 })
 const loginEnabled = ref(false)
 const userRole = ref('')
+const showImageSquare = ref(false)
 const menuMode = ref('main')
 const lastMainRoute = ref('/dashboard')
 const lastOpenAIRoute = ref('/openai-plus')
@@ -140,13 +250,82 @@ const showKeyManage = computed(() => {
   return userRole.value === 'admin'
 })
 
-const showUserManage = computed(() => {
-  return loginEnabled.value && !!userRole.value
-})
+const showUserManage = computed(() => loginEnabled.value && isLoggedIn.value)
 
 const showSettings = computed(() => {
   if (!loginEnabled.value) return true
   return userRole.value === 'admin'
+})
+
+const runtimeLogEnabled = ref(false)
+const showRuntimeLogs = computed(() => showSettings.value && runtimeLogEnabled.value)
+
+const loadRuntimeLogConfig = async () => {
+  if (!showSettings.value) {
+    runtimeLogEnabled.value = false
+    return
+  }
+  try {
+    const data = await adminApi.getRuntimeLogConfig()
+    runtimeLogEnabled.value = !!data.enabled
+  } catch {
+    runtimeLogEnabled.value = false
+  }
+}
+
+const handleRuntimeLogConfigChanged = (event) => {
+  runtimeLogEnabled.value = !!event.detail?.enabled
+}
+
+const handleSessionChanged = () => {
+  sessionVersion.value++
+  checkLoginConfig()
+}
+
+// 主菜单项集中描述，供桌面侧栏之外的移动端底部栏与抽屉复用
+const mainNavItems = computed(() => [
+  { path: '/dashboard', label: '仪表盘', icon: 'DataAnalysis', visible: true },
+  { path: '/keys', label: 'Key 管理', icon: 'Key', visible: showKeyManage.value },
+  { path: '/usage', label: '用量统计', icon: 'TrendCharts', visible: true },
+  { path: '/images', label: '光影世界', icon: 'Picture', visible: showImageSquare.value },
+  { path: '/models', label: '模型广场', icon: 'Grid', visible: true },
+  { path: '/provider-model-mappings', label: '模型映射', icon: 'Connection', visible: showSettings.value },
+  { path: '/users', label: '用户管理', icon: 'User', visible: showUserManage.value },
+  { path: '/security-events', label: '安全事件', icon: 'Warning', visible: showSettings.value },
+  { path: '/runtime-logs', label: '运行日志', icon: 'Document', visible: showRuntimeLogs.value },
+  { path: '/settings', label: '系统设置', icon: 'Setting', visible: showSettings.value },
+].filter((item) => item.visible))
+
+// 底部标签栏只放高频入口，其余进抽屉，避免小屏图标挤在一起划不准
+const MOBILE_TAB_PATHS = ['/dashboard', '/keys', '/usage', '/images']
+
+const mobileTabItems = computed(() => {
+  const items = mainNavItems.value.filter((item) => MOBILE_TAB_PATHS.includes(item.path))
+  return items.sort((a, b) => MOBILE_TAB_PATHS.indexOf(a.path) - MOBILE_TAB_PATHS.indexOf(b.path))
+})
+
+const mobileDrawerItems = computed(() => {
+  if (menuMode.value === 'openai') return openaiNavItems.value
+  return mainNavItems.value.filter((item) => !MOBILE_TAB_PATHS.includes(item.path))
+})
+
+const openaiNavItems = computed(() => [
+  { path: '/openai-plus', label: 'OpenAI', icon: 'Link', visible: showSettings.value },
+  { path: '/grok-pool', label: 'Grok', icon: 'Connection', visible: showSettings.value },
+].filter((item) => item.visible))
+
+// 抽屉里已经展开了完整菜单，标签栏的“更多”只负责开合
+const isDrawerRouteActive = computed(() => mobileDrawerItems.value.some((item) => item.path === route.path))
+
+const goMobileRoute = (path) => {
+  mobileDrawerVisible.value = false
+  if (route.path !== path) router.push(path)
+}
+
+// 移动端顶栏显示当前页名称，替代被隐藏的侧栏标识
+const currentNavLabel = computed(() => {
+  const all = [...mainNavItems.value, ...openaiNavItems.value]
+  return all.find((item) => item.path === route.path)?.label || 'CPA'
 })
 
 // 检查登录是否启用
@@ -155,10 +334,16 @@ const checkLoginConfig = async () => {
     const res = await authApi.getConfig()
     loginEnabled.value = !!res.login_enabled
     userRole.value = loginEnabled.value ? authApi.getCurrentRole() : ''
+    showImageSquare.value = !loginEnabled.value || userRole.value === 'admin'
+    if (loginEnabled.value && authApi.isLoggedIn() && userRole.value !== 'admin') {
+      const user = await authApi.getMe()
+      showImageSquare.value = !!user.show_image_square
+    }
     sessionVersion.value++
   } catch {
     loginEnabled.value = false
     userRole.value = ''
+    showImageSquare.value = true
     sessionVersion.value++
   }
 }
@@ -206,7 +391,24 @@ const selectTheme = (theme) => {
 
 onMounted(() => {
   applyTheme(localStorage.getItem(THEME_STORAGE_KEY) || DEFAULT_THEME)
-  checkLoginConfig()
+  checkLoginConfig().then(loadRuntimeLogConfig)
+  window.addEventListener('runtime-log-config-changed', handleRuntimeLogConfigChanged)
+  window.addEventListener('session-changed', handleSessionChanged)
+  if (typeof window !== 'undefined' && window.matchMedia) {
+    navMediaQuery = window.matchMedia(MOBILE_NAV_QUERY)
+    isMobile.value = navMediaQuery.matches
+    if (navMediaQuery.addEventListener) navMediaQuery.addEventListener('change', syncMobileNav)
+    else navMediaQuery.addListener(syncMobileNav)
+  }
+})
+
+onUnmounted(() => {
+  window.removeEventListener('runtime-log-config-changed', handleRuntimeLogConfigChanged)
+  window.removeEventListener('session-changed', handleSessionChanged)
+  if (!navMediaQuery) return
+  if (navMediaQuery.removeEventListener) navMediaQuery.removeEventListener('change', syncMobileNav)
+  else navMediaQuery.removeListener(syncMobileNav)
+  navMediaQuery = null
 })
 
 watch(currentTheme, (value) => {
@@ -450,23 +652,352 @@ html, body, #app {
 
   .sidebar-shell {
     width: 100% !important;
-    padding: 20px 20px 0;
+    padding: 10px 12px 0;
     position: static;
+    height: auto;
   }
 
   .sidebar-panel {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
     height: auto;
+    padding: 8px 10px;
+    border-radius: 18px;
+    overflow: hidden;
+  }
+
+  .logo-block {
+    width: auto;
+    padding: 0;
+    flex-shrink: 0;
+  }
+
+  .logo-mark {
+    width: 46px;
+    height: 46px;
+    border-radius: 14px;
+    font-size: 20px;
+  }
+
+  /* 菜单改为横向可滚动的紧凑菜单条，避免竖排铺满整屏 */
+  .app-menu {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .app-menu::-webkit-scrollbar {
+    display: none;
+  }
+
+  .app-menu .el-menu-item {
+    flex: 0 0 auto;
+    height: 40px;
+    margin-bottom: 0;
+    padding: 0 12px;
+  }
+
+  /* 横向菜单条下隐藏文字，仅留图标，节省空间 */
+  .app-menu .el-menu-item span {
+    display: none;
+  }
+
+  .app-menu .el-menu-item .el-icon {
+    margin-right: 0;
+  }
+
+  .theme-switcher {
+    flex-shrink: 0;
+    margin: 0;
+    padding: 6px 8px;
+    border-radius: 14px;
+  }
+
+  .theme-switcher__options {
+    gap: 6px;
+  }
+
+  .theme-option {
+    padding: 5px 0;
+  }
+
+  .sidebar-logout-row {
+    flex-shrink: 0;
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
   }
 
   .main-shell {
     max-width: 100vw;
     margin-left: 0;
-    padding: 16px 20px 20px;
+    padding: 12px;
   }
 
   .main-panel {
     height: auto;
-    min-height: calc(100vh - 220px);
+    min-height: calc(100vh - 96px);
+    padding: 14px;
+    border-radius: 18px;
+  }
+}
+
+/* 手机竖屏：菜单条进一步压缩，主题切换器可换行到菜单下方 */
+@media (max-width: 640px) {
+  .sidebar-panel {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .app-menu {
+    order: 2;
+    width: 100%;
+    flex: 1 1 100%;
+  }
+
+  .logo-block {
+    order: 1;
+  }
+
+  .theme-switcher {
+    order: 1;
+    margin-left: auto;
+  }
+
+  .sidebar-logout-row {
+    order: 1;
+  }
+
+  .main-shell {
+    padding: 8px;
+  }
+
+  .main-panel {
+    padding: 12px;
+    border-radius: 16px;
+  }
+}
+
+/* 手机竖屏导航：顶部标题栏 + 底部标签栏 + 右侧抽屉，
+   整块只在 768px 以下渲染，桌面端不加载这些节点。 */
+.mobile-topbar,
+.mobile-tabbar {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .app-shell.is-mobile-shell {
+    flex-direction: column;
+    padding-bottom: calc(58px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .is-mobile-shell .main-shell {
+    max-width: 100vw;
+    margin-left: 0;
+    padding: 0 10px 10px;
+  }
+
+  .mobile-topbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    position: sticky;
+    top: 0;
+    z-index: 90;
+    margin: 0 -10px 8px;
+    padding: 8px 12px;
+    background: var(--cpa-sidebar-bg);
+    border-bottom: 1px solid var(--cpa-sidebar-border);
+    backdrop-filter: blur(16px);
+  }
+
+  .mobile-topbar__brand {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 34px;
+    border-radius: 11px;
+    background: var(--cpa-brand-gradient);
+    color: #fff;
+    font-size: 15px;
+    font-weight: 800;
+    flex-shrink: 0;
+    cursor: pointer;
+  }
+
+  .mobile-topbar__title {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--cpa-text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mobile-topbar__spacer {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .mobile-topbar__more {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 34px;
+    border: 1px solid var(--cpa-panel-border-soft);
+    border-radius: 11px;
+    background: var(--cpa-theme-option-bg);
+    color: var(--cpa-menu-text);
+    font-size: 17px;
+    flex-shrink: 0;
+    cursor: pointer;
+  }
+
+  .is-mobile-shell .main-panel {
+    min-height: calc(100vh - 130px);
+    padding: 12px;
+    border-radius: 16px;
+  }
+
+  .mobile-tabbar {
+    display: flex;
+    align-items: stretch;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 200;
+    padding: 4px 4px calc(4px + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid var(--cpa-sidebar-border);
+    background: var(--cpa-sidebar-bg);
+    backdrop-filter: blur(16px);
+  }
+
+  .mobile-tab {
+    display: flex;
+    flex: 1 1 0;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    min-width: 0;
+    padding: 6px 2px;
+    border: none;
+    border-radius: 12px;
+    background: none;
+    color: var(--cpa-text-secondary);
+    cursor: pointer;
+  }
+
+  .mobile-tab.is-active {
+    background: var(--cpa-menu-active-bg);
+    color: var(--cpa-menu-active-text);
+  }
+
+  .mobile-tab__icon {
+    font-size: 19px;
+  }
+
+  .mobile-tab__label {
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+  }
+
+  .mobile-nav-drawer .el-drawer__body {
+    padding: 0;
+  }
+
+  .mobile-drawer-body {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    padding: 14px 14px calc(14px + env(safe-area-inset-bottom, 0px));
+    background: var(--cpa-sidebar-bg);
+  }
+
+  .mobile-drawer__head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--cpa-panel-border-soft);
+  }
+
+  .mobile-drawer__logo {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 46px;
+    height: 40px;
+    border-radius: 13px;
+    background: var(--cpa-brand-gradient);
+    color: #fff;
+    font-size: 17px;
+    font-weight: 800;
+    flex-shrink: 0;
+    cursor: pointer;
+  }
+
+  .mobile-drawer__mode {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--cpa-text-secondary);
+  }
+
+  .mobile-drawer__list {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 12px;
+    overflow-y: auto;
+  }
+
+  .mobile-drawer__item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 12px 12px;
+    border: 1px solid transparent;
+    border-radius: 14px;
+    background: var(--cpa-theme-option-bg);
+    color: var(--cpa-menu-text);
+    font-size: 14px;
+    font-weight: 600;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .mobile-drawer__item .el-icon {
+    font-size: 18px;
+  }
+
+  .mobile-drawer__item.is-active {
+    border-color: var(--cpa-theme-option-active-border);
+    background: var(--cpa-menu-active-bg);
+    color: var(--cpa-menu-active-text);
+  }
+
+  .mobile-drawer__footer {
+    margin-top: 12px;
+  }
+
+  .mobile-drawer__footer .theme-switcher {
+    margin: 0;
   }
 }
 </style>

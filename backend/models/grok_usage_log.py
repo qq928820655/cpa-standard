@@ -1,5 +1,5 @@
 """
-OpenAI request usage log model
+Grok request usage log model
 """
 from datetime import datetime
 from sqlalchemy import Boolean, DateTime, Integer, String, Text
@@ -8,13 +8,14 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base
 
 
-class OpenAIPlusUsageLog(Base):
-    """OpenAI Plus request usage log"""
-    __tablename__ = "openai_plus_usage_logs"
+class GrokUsageLog(Base):
+    """Grok account pool request usage log"""
+    __tablename__ = "grok_usage_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_id: Mapped[int] = mapped_column(Integer, index=True, nullable=True)
     account_email: Mapped[str] = mapped_column(String(255), nullable=True)
+    account_type: Mapped[str] = mapped_column(String(30), nullable=True)
     model: Mapped[str] = mapped_column(String(100), nullable=True)
     endpoint: Mapped[str] = mapped_column(String(80), nullable=True)
     stream: Mapped[bool] = mapped_column(Boolean, default=False)

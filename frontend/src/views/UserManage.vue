@@ -10,9 +10,71 @@
       </div>
     </div>
 
-    <!-- 管理员视图：完整用户表格 -->
+    <!-- 管理员视图：移动端卡片与桌面表格共享同一数据和操作 -->
     <el-card v-if="isAdmin" shadow="never" class="table-card">
-      <el-table :data="users" stripe style="width: 100%" size="small">
+      <div v-if="isMobile" class="user-card-list">
+        <div v-for="row in users" :key="row.id" class="user-card">
+          <div class="user-card__head">
+            <span class="user-card__name">{{ row.username }}</span>
+            <button type="button" class="user-card__toggle" @click="toggleUserExpand(row.id)">
+              <span>{{ isUserExpanded(row.id) ? '收起' : '详情' }}</span>
+              <el-icon :class="{ 'is-open': isUserExpanded(row.id) }"><ArrowDown /></el-icon>
+            </button>
+            <el-tag :type="row.role === 'admin' ? 'danger' : 'info'" size="small">
+              {{ row.role === 'admin' ? '管理员' : '普通用户' }}
+            </el-tag>
+          </div>
+          <div class="user-card__meta">
+            <span>#{{ row.id }}</span>
+            <span>{{ row.supported_models?.length ? `${row.supported_models.length} 个模型` : '全部模型' }}</span>
+            <span>{{ row.created_at ? formatShortTime(row.created_at) : '-' }}</span>
+          </div>
+          <div class="user-card__usage">
+            <span>请求 {{ Number(row.lifetime_request_count || 0).toLocaleString('zh-CN') }}</span>
+            <span>Token {{ formatCompactToken(row.lifetime_total_tokens) }}</span>
+          </div>
+          <div v-if="isUserExpanded(row.id)" class="user-card__detail">
+            <div class="user-card__row">
+              <span>API Key</span>
+              <div v-if="row.api_key" class="api-key-cell">
+                <span class="api-key-text">{{ maskApiKey(row.api_key) }}</span>
+                <el-button link type="primary" size="small" @click="copyApiKey(row.api_key)">复制</el-button>
+              </div>
+              <span v-else class="text-muted">-</span>
+            </div>
+            <div class="user-card__row">
+              <span>可用模型</span>
+              <div v-if="row.supported_models?.length" class="model-tags">
+                <el-tag v-for="model in row.supported_models" :key="model" size="small" class="model-tag">{{ model }}</el-tag>
+              </div>
+              <span v-else class="text-muted">全部</span>
+            </div>
+            <div class="user-card__row">
+              <span>Token 限额</span>
+              <div v-if="row.daily_token_limit || row.weekly_token_limit || row.monthly_token_limit" class="user-card__quota">
+                <span v-if="row.daily_token_limit">日：{{ formatQuotaUsageM(quotaUsageMap[row.id]?.daily_used, row.daily_token_limit) }}</span>
+                <span v-if="row.weekly_token_limit">周：{{ formatQuotaUsageM(quotaUsageMap[row.id]?.weekly_used, row.weekly_token_limit) }}</span>
+                <span v-if="row.monthly_token_limit">月：{{ formatQuotaUsageM(quotaUsageMap[row.id]?.monthly_used, row.monthly_token_limit) }}</span>
+              </div>
+              <span v-else class="text-muted">不限制</span>
+            </div>
+          </div>
+          <div class="user-card__actions">
+            <el-button link type="primary" size="small" @click="showEditDialog(row)">编辑</el-button>
+            <el-button link type="primary" size="small" @click="handleRegenerateKey(row)">重置Key</el-button>
+            <el-button link type="primary" size="small" @click="showPasswordDialog(row)">改密码</el-button>
+            <el-button v-if="row.daily_token_limit || row.weekly_token_limit || row.monthly_token_limit" link type="warning" size="small" @click="handleResetQuota(row)">重置额度</el-button>
+            <el-popconfirm v-if="!row.role || row.role !== 'admin' || adminCount > 1" title="确定删除该用户？" @confirm="handleDeleteUser(row)">
+              <template #reference>
+                <el-button link type="danger" size="small">删除</el-button>
+              </template>
+            </el-popconfirm>
+          </div>
+        </div>
+        <el-empty v-if="!users.length" description="暂无用户" :image-size="80" />
+      </div>
+
+      <el-table v-else :data="users" stripe style="width: 100%" size="small">
         <el-table-column prop="id" label="ID" width="52" />
         <el-table-column prop="username" label="用户名" width="130" show-overflow-tooltip />
         <el-table-column label="角色" width="80">
@@ -61,6 +123,14 @@
               </div>
             </div>
             <span v-else style="color: #909399; font-size: 11px">不限制</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="累计用量" width="130" align="right">
+          <template #default="{ row }">
+            <div style="font-size: 11px; line-height: 1.7; color: #606266">
+              <div>请求: {{ Number(row.lifetime_request_count || 0).toLocaleString('zh-CN') }}</div>
+              <div>Token: {{ formatCompactToken(row.lifetime_total_tokens) }}</div>
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="创建时间" width="112">
@@ -139,7 +209,9 @@
     <el-dialog
       v-model="dialogVisible"
       :title="isEditing ? '编辑用户' : '新增用户'"
-      width="860px"
+      :width="isMobile ? '100%' : '860px'"
+      :fullscreen="isMobile"
+      :align-center="!isMobile"
       destroy-on-close
     >
       <el-form ref="userFormRef" :model="userForm" :rules="userFormRules" label-position="top">
@@ -169,6 +241,23 @@
               style="width: 100%"
             >
               <el-option v-for="m in availableModels" :key="m" :value="m" :label="m" />
+            </el-select>
+          </el-form-item>
+        </div>
+        <div class="form-grid-2">
+          <el-form-item label="显示光影世界">
+            <el-switch v-model="userForm.show_image_square" active-text="开启" inactive-text="关闭" />
+          </el-form-item>
+          <el-form-item label="可用生图模型">
+            <el-select
+              v-model="userForm.supported_image_models"
+              multiple
+              filterable
+              clearable
+              placeholder="留空表示可用全部生图模型"
+              style="width: 100%"
+            >
+              <el-option v-for="m in availableImageModels" :key="m" :value="m" :label="m" />
             </el-select>
           </el-form-item>
         </div>
@@ -277,8 +366,8 @@
     </el-dialog>
 
     <!-- 修改密码对话框 -->
-    <el-dialog v-model="passwordDialogVisible" title="修改密码" width="400px" destroy-on-close>
-      <el-form ref="passwordFormRef" :model="passwordForm" :rules="passwordFormRules" label-width="80px">
+    <el-dialog v-model="passwordDialogVisible" title="修改密码" :width="isMobile ? '100%' : '400px'" :fullscreen="isMobile" :align-center="!isMobile" destroy-on-close>
+      <el-form ref="passwordFormRef" :model="passwordForm" :rules="passwordFormRules" :label-width="isMobile ? 'auto' : '80px'" :label-position="isMobile ? 'top' : 'right'">
         <el-form-item label="新密码" prop="password">
           <el-input v-model="passwordForm.password" type="password" placeholder="请输入新密码" show-password />
         </el-form-item>
@@ -292,12 +381,30 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onActivated, onBeforeUnmount, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
+import { ArrowDown } from '@element-plus/icons-vue'
 import { authApi, adminApi, copyText } from '../api'
+
+const MOBILE_QUERY = '(max-width: 768px)'
+const isMobile = ref(false)
+let mobileMediaQuery = null
+const syncMobile = (event) => {
+  isMobile.value = event.matches
+}
+const expandedUserIds = ref(new Set())
+const isUserExpanded = (id) => expandedUserIds.value.has(Number(id))
+const toggleUserExpand = (id) => {
+  const next = new Set(expandedUserIds.value)
+  const key = Number(id)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedUserIds.value = next
+}
 
 const users = ref([])
 const availableModels = ref([])
+const availableImageModels = ref([])
 const dialogVisible = ref(false)
 const passwordDialogVisible = ref(false)
 const isEditing = ref(false)
@@ -305,7 +412,11 @@ const submitting = ref(false)
 const editingUserId = ref(null)
 const passwordUserId = ref(null)
 
-const isAdmin = computed(() => authApi.isAdmin())
+const sessionVersion = ref(0)
+const isAdmin = computed(() => {
+  sessionVersion.value
+  return authApi.isAdmin()
+})
 const myInfo = computed(() => (!isAdmin.value && users.value.length ? users.value[0] : null))
 
 const userFormRef = ref(null)
@@ -316,6 +427,8 @@ const userForm = reactive({
   password: '',
   role: 'user',
   supported_models: [],
+  show_image_square: false,
+  supported_image_models: [],
   daily_token_limit: null,
   weekly_token_limit: null,
   monthly_token_limit: null,
@@ -374,6 +487,13 @@ const formatShortTime = (t) => {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+const formatCompactToken = (value) => {
+  const tokens = Number(value || 0)
+  if (tokens >= 1000000) return `${(tokens / 1000000).toFixed(2)}M`
+  if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k`
+  return tokens.toLocaleString('zh-CN')
+}
+
 const copyApiKey = async (key) => {
   try {
     await copyText(key)
@@ -393,6 +513,13 @@ const loadUsers = async () => {
   } catch (err) {
     ElMessage.error(err.message || '加载用户列表失败')
   }
+}
+
+const refreshSessionUserView = async () => {
+  sessionVersion.value++
+  dialogVisible.value = false
+  passwordDialogVisible.value = false
+  await loadUsers()
 }
 
 const loadQuotaUsages = async () => {
@@ -435,9 +562,13 @@ const handleResetQuota = async (row) => {
 
 const loadModels = async () => {
   try {
-    const res = await adminApi.listModels(null, { limit: 500 })
-    const items = Array.isArray(res) ? res : (res?.items || [])
+    const [modelRes, imageModelRes] = await Promise.all([
+      adminApi.listModels(null, { limit: 500 }),
+      adminApi.getImageModels(),
+    ])
+    const items = Array.isArray(modelRes) ? modelRes : (modelRes?.items || [])
     availableModels.value = items.map((m) => m.model_id || m.name).filter(Boolean)
+    availableImageModels.value = (imageModelRes?.items || []).map((m) => m.model).filter(Boolean)
   } catch {
     // 模型列表加载失败不影响用户管理
   }
@@ -450,6 +581,8 @@ const showAddDialog = () => {
   userForm.password = ''
   userForm.role = 'user'
   userForm.supported_models = []
+  userForm.show_image_square = false
+  userForm.supported_image_models = []
   userForm.daily_token_limit = null
   userForm.weekly_token_limit = null
   userForm.monthly_token_limit = null
@@ -470,6 +603,8 @@ const showEditDialog = (row) => {
   userForm.password = ''
   userForm.role = row.role || 'user'
   userForm.supported_models = [...(row.supported_models || [])]
+  userForm.show_image_square = !!row.show_image_square
+  userForm.supported_image_models = [...(row.supported_image_models || [])]
   userForm.daily_token_limit = row.daily_token_limit ?? null
   userForm.weekly_token_limit = row.weekly_token_limit ?? null
   userForm.monthly_token_limit = row.monthly_token_limit ?? null
@@ -568,6 +703,8 @@ const handleUserSubmit = async () => {
         username: userForm.username,
         role: userForm.role,
         supported_models: userForm.supported_models.length ? userForm.supported_models : null,
+        show_image_square: userForm.show_image_square,
+        supported_image_models: userForm.supported_image_models.length ? userForm.supported_image_models : null,
         daily_token_limit: mToTokens(userForm.daily_token_limit_m),
         weekly_token_limit: mToTokens(userForm.weekly_token_limit_m),
         monthly_token_limit: mToTokens(userForm.monthly_token_limit_m),
@@ -585,6 +722,8 @@ const handleUserSubmit = async () => {
         username: userForm.username,
         password: userForm.password,
         supported_models: userForm.supported_models.length ? userForm.supported_models : null,
+        show_image_square: userForm.show_image_square,
+        supported_image_models: userForm.supported_image_models.length ? userForm.supported_image_models : null,
         daily_token_limit: mToTokens(userForm.daily_token_limit_m),
         weekly_token_limit: mToTokens(userForm.weekly_token_limit_m),
         monthly_token_limit: mToTokens(userForm.monthly_token_limit_m),
@@ -666,8 +805,21 @@ const showMyPasswordDialog = () => {
 }
 
 onMounted(() => {
+  mobileMediaQuery = window.matchMedia(MOBILE_QUERY)
+  isMobile.value = mobileMediaQuery.matches
+  mobileMediaQuery.addEventListener('change', syncMobile)
+  window.addEventListener('session-changed', refreshSessionUserView)
   loadUsers()
   loadModels()
+})
+
+onActivated(() => {
+  refreshSessionUserView()
+})
+
+onBeforeUnmount(() => {
+  mobileMediaQuery?.removeEventListener('change', syncMobile)
+  window.removeEventListener('session-changed', refreshSessionUserView)
 })
 </script>
 
@@ -801,5 +953,145 @@ onMounted(() => {
   margin-top: 20px;
   padding-top: 16px;
   border-top: 1px solid var(--cpa-border);
+}
+
+.user-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.user-card {
+  padding: 9px 10px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  background: var(--el-bg-color);
+}
+
+.user-card__head,
+.user-card__meta,
+.user-card__usage,
+.user-card__actions {
+  display: flex;
+  align-items: center;
+}
+
+.user-card__head {
+  gap: 7px;
+}
+
+.user-card__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.user-card__toggle {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+}
+
+.user-card__toggle .el-icon {
+  transition: transform 0.2s;
+}
+
+.user-card__toggle .el-icon.is-open {
+  transform: rotate(180deg);
+}
+
+.user-card__meta,
+.user-card__usage {
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.user-card__usage {
+  color: var(--el-text-color-regular);
+}
+
+.user-card__detail {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--el-border-color-lighter);
+}
+
+.user-card__row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.user-card__row > span:first-child {
+  flex: 0 0 66px;
+  color: var(--el-text-color-secondary);
+}
+
+.user-card__row > :last-child {
+  min-width: 0;
+}
+
+.user-card__quota {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.user-card__actions {
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
+.user-card__actions :deep(.el-button) {
+  margin-left: 0;
+  padding: 0;
+}
+
+@media (max-width: 768px) {
+  .user-manage {
+    max-width: none;
+  }
+
+  .form-grid-3,
+  .form-grid-2 {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  .model-mapping-item > div:first-child {
+    flex-wrap: wrap;
+  }
+
+  .profile-row {
+    align-items: flex-start;
+    padding: 10px 0;
+  }
+
+  .profile-label {
+    width: 78px;
+  }
+
+  .profile-actions {
+    flex-direction: column;
+  }
 }
 </style>

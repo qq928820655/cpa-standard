@@ -60,6 +60,84 @@
               <div class="panel-title">API Key 状态</div>
             </div>
             <div class="dashboard-filters">
+              <template v-if="isNarrowScreen">
+                <div class="dashboard-filter-row dashboard-filter-row--primary">
+                  <el-tooltip content="刷新" placement="top" :show-after="300">
+                    <el-button
+                      :icon="Refresh"
+                      circle
+                      size="small"
+                      :loading="keyStatsRefreshing"
+                      class="dashboard-refresh-btn"
+                      @click="handleKeyStatsRefresh"
+                    />
+                  </el-tooltip>
+                  <el-select
+                    v-model="keyStatsDays"
+                    class="dashboard-filter dashboard-filter--quick-range"
+                    placeholder="时间范围"
+                    @change="handleKeyStatsQuickRangeChange"
+                  >
+                    <el-option :value="7" label="最近 7 天" />
+                    <el-option :value="14" label="最近 14 天" />
+                    <el-option :value="30" label="最近 30 天" />
+                    <el-option :value="90" label="最近 90 天" />
+                  </el-select>
+                  <el-select
+                    v-model="providerFilters"
+                    class="dashboard-filter dashboard-filter--provider"
+                    multiple
+                    filterable
+                    allow-create
+                    collapse-tags
+                    clearable
+                    placeholder="筛选提供商"
+                    @change="handleFilterChange"
+                  >
+                    <el-option v-for="item in providerOptions" :key="item" :label="item" :value="item" />
+                  </el-select>
+                  <el-select
+                    v-model="modelFilters"
+                    class="dashboard-filter dashboard-filter--model"
+                    multiple
+                    filterable
+                    allow-create
+                    collapse-tags
+                    clearable
+                    placeholder="筛选模型"
+                    @visible-change="handleModelFilterVisibleChange"
+                    @change="handleFilterChange"
+                  >
+                    <el-option
+                      v-for="item in modelOptions"
+                      :key="item.model_id"
+                      :label="`${item.display_name || item.model_id} (${item.model_id})`"
+                      :value="item.model_id"
+                    />
+                  </el-select>
+                </div>
+                <div class="dashboard-filter-row dashboard-filter-row--dates">
+                  <el-date-picker
+                    v-model="mobileKeyStatsStartTime"
+                    type="datetime"
+                    format="MM-DD HH:mm"
+                    value-format="YYYY-MM-DDTHH:mm:ss"
+                    placeholder="开始时间"
+                    clearable
+                    @change="handleMobileKeyStatsDateChange"
+                  />
+                  <el-date-picker
+                    v-model="mobileKeyStatsEndTime"
+                    type="datetime"
+                    format="MM-DD HH:mm"
+                    value-format="YYYY-MM-DDTHH:mm:ss"
+                    placeholder="结束时间"
+                    clearable
+                    @change="handleMobileKeyStatsDateChange"
+                  />
+                </div>
+              </template>
+              <template v-else>
               <el-tooltip content="刷新" placement="top" :show-after="300">
                 <el-button
                   :icon="Refresh"
@@ -149,12 +227,76 @@
                   :value="item.id"
                 />
               </el-select>
+              </template>
+            </div>
+            <div class="key-status-sort-actions" aria-label="Key 排序">
+              <button
+                type="button"
+                class="key-status-sort-button"
+                :class="{ 'is-active': keyTimeSortOrder }"
+                :title="keyTimeSortOrder ? `按最后操作时间${keyTimeSortOrder === 'descending' ? '从新到旧' : '从旧到新'}` : '按最后操作时间排序'"
+                @click="toggleKeyStatusSort('time')"
+              >
+                <el-icon class="key-status-sort-type"><Timer /></el-icon>
+                <el-icon><component :is="keyTimeSortOrder === 'ascending' ? SortUp : SortDown" /></el-icon>
+              </button>
+              <button
+                type="button"
+                class="key-status-sort-button"
+                :class="{ 'is-active': keyUsageSortOrder }"
+                :title="keyUsageSortOrder ? `按用量${keyUsageSortOrder === 'descending' ? '从高到低' : '从低到高'}` : '按用量排序'"
+                @click="toggleKeyStatusSort('usage')"
+              >
+                <el-icon class="key-status-sort-type"><Coin /></el-icon>
+                <el-icon><component :is="keyUsageSortOrder === 'ascending' ? SortUp : SortDown" /></el-icon>
+              </button>
             </div>
           </div>
         </div>
       </template>
 
-      <div class="dashboard-key-table-wrap">
+      <!-- 窄屏：6 列排行榜改卡片流，次要指标折叠在「详情」里 -->
+      <div v-if="isNarrowScreen" class="key-rank-list">
+        <div v-if="!sortedKeyUsage.length" class="key-rank-empty">暂无数据</div>
+
+        <div v-for="row in sortedKeyUsage" :key="row.api_key_id" class="key-rank-card">
+          <div class="key-rank-card__head">
+            <button v-if="showUserFilter" type="button" class="key-rank-card__name" @click="openKeyDetail(row.api_key_id)">
+              {{ row.api_key_name }}
+            </button>
+            <span v-else class="key-rank-card__name key-rank-card__name--static">
+              {{ row.api_key_name }}
+            </span>
+            <button type="button" class="key-rank-card__toggle" @click="toggleKeyRowExpand(row.api_key_id)">
+              <span>{{ isKeyRowExpanded(row.api_key_id) ? '收起' : '详情' }}</span>
+              <el-icon :class="{ 'is-open': isKeyRowExpanded(row.api_key_id) }"><ArrowDown /></el-icon>
+            </button>
+          </div>
+
+          <div class="key-rank-card__tags">
+            <el-tag :type="row.provider === 'claude' ? 'warning' : 'primary'" size="small">
+              {{ row.provider }}
+            </el-tag>
+            <el-tag size="small" type="info">{{ Number(row.total_requests || 0).toLocaleString('zh-CN') }} 次</el-tag>
+            <el-tag size="small" type="info">历史 {{ formatNumber(row.lifetime_total_tokens) }} token</el-tag>
+          </div>
+
+          <div v-show="isKeyRowExpanded(row.api_key_id)" class="key-rank-card__rows">
+            <div class="key-rank-card__row">
+              <span class="key-rank-card__label">成功率</span>
+              <span class="key-rank-card__value">
+                <el-progress :percentage="getSuccessRate(row)" :stroke-width="10" />
+              </span>
+            </div>
+            <div class="key-rank-card__row">
+              <span class="key-rank-card__label">平均延迟</span>
+              <span class="key-rank-card__value">{{ formatLatency(row.avg_latency_ms) }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div v-else class="dashboard-key-table-wrap">
         <el-table
           :data="sortedKeyUsage"
           stripe
@@ -165,9 +307,10 @@
         >
           <el-table-column prop="api_key_name" label="名称" min-width="160" sortable="custom">
             <template #default="{ row }">
-              <el-button link type="primary" class="key-name-link" @click="openKeyDetail(row.api_key_id)">
+              <el-button v-if="showUserFilter" link type="primary" class="key-name-link" @click="openKeyDetail(row.api_key_id)">
                 {{ row.api_key_name }}
               </el-button>
+              <span v-else class="key-name-static">{{ row.api_key_name }}</span>
             </template>
           </el-table-column>
           <el-table-column prop="provider" label="提供商" width="120" sortable="custom">
@@ -182,9 +325,9 @@
               {{ Number(row.total_requests || 0).toLocaleString('zh-CN') }}
             </template>
           </el-table-column>
-          <el-table-column prop="total_tokens" label="Token 数" min-width="140" sortable="custom">
+          <el-table-column prop="lifetime_total_tokens" label="历史 Token" min-width="140" sortable="custom">
             <template #default="{ row }">
-              {{ formatNumber(row.total_tokens) }}
+              {{ formatNumber(row.lifetime_total_tokens) }}
             </template>
           </el-table-column>
           <el-table-column prop="success_rate" label="成功率" min-width="180" sortable="custom">
@@ -208,7 +351,7 @@
       @closed="handleKeyDetailDialogClosed"
     >
       <div v-loading="keyDetailLoading" class="key-detail-dialog">
-        <el-descriptions :column="2" border>
+        <el-descriptions :column="isNarrowScreen ? 1 : 2" border>
           <el-descriptions-item label="Key ID">{{ keyDetail.id || '-' }}</el-descriptions-item>
           <el-descriptions-item label="名称">
             <span>{{ keyDetail.name || '-' }}</span>
@@ -238,15 +381,15 @@
             </el-button>
           </el-descriptions-item>
           <el-descriptions-item label="权重">{{ keyDetail.weight ?? '-' }}</el-descriptions-item>
-          <el-descriptions-item label="总请求数">{{ Number(keyDetailSummary.total_requests || 0).toLocaleString('zh-CN') }}</el-descriptions-item>
-          <el-descriptions-item label="成功率">{{ getSuccessRate(keyDetailSummary) }}%</el-descriptions-item>
-          <el-descriptions-item label="总 Token">{{ formatNumber(keyDetailSummary.total_tokens || 0) }}</el-descriptions-item>
-          <el-descriptions-item label="输入 Token">{{ formatNumber(keyDetailSummary.prompt_tokens || 0) }}</el-descriptions-item>
-          <el-descriptions-item label="缓存 Token">{{ formatNumber(keyDetailSummary.cache_tokens || 0) }}</el-descriptions-item>
-          <el-descriptions-item label="输出 Token">{{ formatNumber(keyDetailSummary.completion_tokens || 0) }}</el-descriptions-item>
+          <el-descriptions-item label="历史总请求数">{{ Number(keyDetail.request_count || 0).toLocaleString('zh-CN') }}</el-descriptions-item>
+          <el-descriptions-item label="历史成功率">{{ getSuccessRate({ total_requests: keyDetail.request_count, success_requests: keyDetail.success_count }) }}%</el-descriptions-item>
+          <el-descriptions-item label="历史总 Token">{{ formatNumber(keyDetail.total_tokens || 0) }}</el-descriptions-item>
+          <el-descriptions-item label="历史输入 Token">{{ formatNumber(keyDetail.prompt_tokens || 0) }}</el-descriptions-item>
+          <el-descriptions-item label="历史缓存 Token">{{ formatNumber(keyDetail.cache_tokens || 0) }}</el-descriptions-item>
+          <el-descriptions-item label="历史输出 Token">{{ formatNumber(keyDetail.completion_tokens || 0) }}</el-descriptions-item>
           <el-descriptions-item label="平均上游耗时">{{ formatLatency(keyDetailSummary.avg_upstream_latency_ms) }}</el-descriptions-item>
           <el-descriptions-item label="CPA 额外耗时">{{ formatLatency(keyDetailSummary.avg_cpa_overhead_ms) }}</el-descriptions-item>
-          <el-descriptions-item label="账户余额" :span="2">
+          <el-descriptions-item label="账户余额" :span="isNarrowScreen ? 1 : 2">
             <span v-if="keyDetailBalanceLoading" style="color: #909399; font-size: 13px">查询中...</span>
             <span v-else-if="keyDetailBalance">
               <span style="color: #10b981; font-weight: 600">${{ keyDetailBalance.balance_usd.toFixed(4) }}</span>
@@ -336,7 +479,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -344,7 +487,8 @@ import { LineChart, PieChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
 import { ElMessage } from 'element-plus'
-import { Refresh, View } from '@element-plus/icons-vue'
+import { Coin, SortDown, SortUp, Timer } from '@element-plus/icons-vue'
+import { ArrowDown, Refresh, View } from '@element-plus/icons-vue'
 import { adminApi, statsApi, authApi, copyText } from '../api'
 import { useDisplaySettings } from '../stores/displaySettings'
 
@@ -369,6 +513,25 @@ const restoreDashboardState = () => {
 const savedState = restoreDashboardState()
 const route = useRoute()
 
+// 窄屏下饼图图例条目过多会压住图形，改为滚动型图例
+const MOBILE_CHART_QUERY = '(max-width: 768px)'
+const isNarrowScreen = ref(false)
+let chartMediaQuery = null
+const syncNarrowScreen = (event) => {
+  isNarrowScreen.value = event.matches
+}
+
+// 窄屏 Key 排行榜改卡片流，次要字段折叠在「详情」里
+const expandedKeyIds = ref(new Set())
+const isKeyRowExpanded = (id) => expandedKeyIds.value.has(Number(id))
+const toggleKeyRowExpand = (id) => {
+  const next = new Set(expandedKeyIds.value)
+  const key = Number(id)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedKeyIds.value = next
+}
+
 const days = ref([7, 14, 30].includes(Number(savedState.days)) ? Number(savedState.days) : 7)
 const keyStatsDays = ref([7, 14, 30, 90].includes(Number(savedState.keyStatsDays)) ? Number(savedState.keyStatsDays) : 7)
 const keyStatsDateRange = ref(
@@ -376,6 +539,8 @@ const keyStatsDateRange = ref(
     ? savedState.keyStatsDateRange
     : []
 )
+const mobileKeyStatsStartTime = ref(keyStatsDateRange.value[0] || '')
+const mobileKeyStatsEndTime = ref(keyStatsDateRange.value[1] || '')
 const providerFilters = ref(Array.isArray(savedState.providerFilters) ? savedState.providerFilters.filter(Boolean) : [])
 const modelFilters = ref(Array.isArray(savedState.modelFilters) ? savedState.modelFilters.filter(Boolean) : [])
 const providerOptions = ref([])
@@ -407,11 +572,26 @@ const summary = ref({
 const dailyUsage = ref([])
 const keyUsage = ref([])
 const keyUsageSort = ref({
-  prop: typeof savedState.keyUsageSort?.prop === 'string' ? savedState.keyUsageSort.prop : '',
-  order: ['ascending', 'descending', null].includes(savedState.keyUsageSort?.order) ? savedState.keyUsageSort.order : null,
+  timeOrder: ['ascending', 'descending'].includes(savedState.keyUsageSort?.timeOrder) ? savedState.keyUsageSort.timeOrder : null,
+  usageOrder: ['ascending', 'descending'].includes(savedState.keyUsageSort?.usageOrder) ? savedState.keyUsageSort.usageOrder : null,
 })
 
-const keyStatsRefreshing = ref(false)
+const keyTimeSortOrder = computed(() => keyUsageSort.value.timeOrder)
+const keyUsageSortOrder = computed(() => keyUsageSort.value.usageOrder)
+
+const toggleKeyStatusSort = (type) => {
+  const key = type === 'time' ? 'timeOrder' : 'usageOrder'
+  const currentOrder = keyUsageSort.value[key]
+  const nextOrder = currentOrder === null
+    ? 'descending'
+    : currentOrder === 'descending'
+      ? 'ascending'
+      : null
+  keyUsageSort.value = {
+    ...keyUsageSort.value,
+    [key]: nextOrder,
+  }
+}
 
 const normalizeText = (value) => String(value || '').trim().toLowerCase()
 
@@ -476,18 +656,42 @@ const compareKeyUsageValues = (left, right, prop) => {
 
 const sortedKeyUsage = computed(() => {
   const items = [...filteredKeyUsage.value]
-  const { prop, order } = keyUsageSort.value
-  if (!prop || !order) return items
+  const { timeOrder, usageOrder } = keyUsageSort.value
 
-  items.sort((left, right) => {
+  const compareByOrder = (left, right, prop, order) => {
+    if (prop === 'last_request_time') {
+      const leftTime = left?.last_request_time ? new Date(left.last_request_time).getTime() : null
+      const rightTime = right?.last_request_time ? new Date(right.last_request_time).getTime() : null
+      if (leftTime === null && rightTime === null) return 0
+      if (leftTime === null) return 1
+      if (rightTime === null) return -1
+      const result = leftTime - rightTime
+      return order === 'ascending' ? result : -result
+    }
     const result = compareKeyUsageValues(left, right, prop)
     return order === 'ascending' ? result : -result
+  }
+
+  items.sort((left, right) => {
+    if (timeOrder) {
+      const timeResult = compareByOrder(left, right, 'last_request_time', timeOrder)
+      if (timeResult) return timeResult
+    }
+    if (usageOrder) {
+      const usageResult = compareByOrder(left, right, 'lifetime_total_tokens', usageOrder)
+      if (usageResult) return usageResult
+    }
+    return compareByOrder(left, right, 'lifetime_total_tokens', 'descending')
   })
   return items
 })
 
 const handleKeyUsageSortChange = ({ prop, order }) => {
-  keyUsageSort.value = { prop, order }
+  if (prop === 'last_request_time') {
+    keyUsageSort.value = { ...keyUsageSort.value, timeOrder: order || null }
+  } else if (prop === 'total_tokens') {
+    keyUsageSort.value = { ...keyUsageSort.value, usageOrder: order || null }
+  }
 }
 
 const handleFilterChange = () => {
@@ -530,6 +734,8 @@ const buildKeyStatsTimeParams = () => {
 
 const handleKeyStatsQuickRangeChange = () => {
   keyStatsDateRange.value = []
+  mobileKeyStatsStartTime.value = ''
+  mobileKeyStatsEndTime.value = ''
   loadData()
 }
 
@@ -537,7 +743,21 @@ const handleKeyStatsDateRangeChange = (value) => {
   if (!Array.isArray(value) || value.length !== 2) {
     keyStatsDateRange.value = []
   }
+  mobileKeyStatsStartTime.value = keyStatsDateRange.value[0] || ''
+  mobileKeyStatsEndTime.value = keyStatsDateRange.value[1] || ''
   loadData()
+}
+
+const handleMobileKeyStatsDateChange = () => {
+  if (mobileKeyStatsStartTime.value && mobileKeyStatsEndTime.value) {
+    keyStatsDateRange.value = [mobileKeyStatsStartTime.value, mobileKeyStatsEndTime.value]
+    loadData()
+    return
+  }
+  if (!mobileKeyStatsStartTime.value && !mobileKeyStatsEndTime.value) {
+    keyStatsDateRange.value = []
+    loadData()
+  }
 }
 
 const formatLatency = (value) => {
@@ -614,12 +834,9 @@ const openKeyDetail = async (apiKeyId) => {
   keyDetailLoading.value = true
   keyDetailBalance.value = null
   try {
-    const [keyData, summaryData] = await Promise.all([
-      adminApi.getKey(apiKeyId),
-      statsApi.getSummary({ api_key_id: apiKeyId, ...buildKeyStatsTimeParams() }),
-    ])
+    const keyData = await adminApi.getKey(apiKeyId)
     keyDetail.value = keyData || {}
-    keyDetailSummary.value = summaryData || {}
+    keyDetailSummary.value = {}
     keyDetailLogsPage.value = 1
     await loadKeyDetailLogs(apiKeyId)
     // 异步加载余额（不阻塞弹窗打开）
@@ -781,21 +998,36 @@ const pieOption = computed(() => ({
     borderWidth: 0,
     textStyle: { color: '#f8fafc' },
   },
-  legend: {
-    bottom: 0,
-    textStyle: { color: '#59708f' },
-  },
+  legend: isNarrowScreen.value
+    ? {
+        type: 'scroll',
+        orient: 'horizontal',
+        bottom: 0,
+        left: 'center',
+        width: '92%',
+        itemGap: 10,
+        itemWidth: 12,
+        itemHeight: 8,
+        pageIconSize: 10,
+        textStyle: { color: '#59708f', fontSize: 11 },
+      }
+    : {
+        bottom: 0,
+        textStyle: { color: '#59708f' },
+      },
   series: [
     {
       type: 'pie',
-      radius: ['48%', '74%'],
+      center: isNarrowScreen.value ? ['50%', '42%'] : ['50%', '50%'],
+      radius: isNarrowScreen.value ? ['42%', '62%'] : ['48%', '74%'],
       padAngle: 2,
       itemStyle: {
         borderRadius: 10,
         borderColor: 'rgba(255,255,255,0.9)',
         borderWidth: 3,
       },
-      label: { color: '#35506f' },
+      label: isNarrowScreen.value ? { show: false } : { color: '#35506f' },
+      labelLine: isNarrowScreen.value ? { show: false } : undefined,
       data: filteredKeyUsage.value.map((item) => ({
         name: item.api_key_name,
         value: item.total_tokens,
@@ -888,7 +1120,22 @@ watch(
 )
 
 onMounted(async () => {
-  await Promise.all([loadProviderOptions(), loadModelOptions(), loadUserOptions(), loadData()])
+  if (typeof window !== 'undefined' && window.matchMedia) {
+    chartMediaQuery = window.matchMedia(MOBILE_CHART_QUERY)
+    isNarrowScreen.value = chartMediaQuery.matches
+    chartMediaQuery.addEventListener('change', syncNarrowScreen)
+  }
+  const adminLoads = showUserFilter.value
+    ? [loadProviderOptions(), loadModelOptions(), loadUserOptions()]
+    : []
+  await Promise.all([...adminLoads, loadData()])
+})
+
+onUnmounted(() => {
+  if (chartMediaQuery) {
+    chartMediaQuery.removeEventListener('change', syncNarrowScreen)
+    chartMediaQuery = null
+  }
 })
 </script>
 
@@ -996,14 +1243,56 @@ onMounted(async () => {
 }
 
 .card-header--inline {
+  position: relative;
   align-items: center;
   flex-wrap: nowrap;
 }
 
 .dashboard-key-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   flex: 0 0 auto;
   min-width: 0;
   white-space: nowrap;
+}
+
+.key-status-sort-actions {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  transform: translateY(-50%);
+}
+
+.key-status-sort-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #a8b5c6;
+  cursor: pointer;
+}
+
+.key-status-sort-button:hover,
+.key-status-sort-button.is-active {
+  color: var(--cpa-primary);
+}
+
+.key-status-sort-button .el-icon {
+  font-size: 14px;
+}
+
+.key-status-sort-button .key-status-sort-type {
+  margin-right: -3px;
+  font-size: 13px;
 }
 
 .dashboard-filters {
@@ -1115,7 +1404,29 @@ onMounted(async () => {
   }
 
   .metric-card__inner {
-    align-items: flex-start;
+    align-items: center;
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .metric-card__icon {
+    flex: 0 0 40px;
+    width: 40px;
+    height: 40px;
+    border-radius: 13px;
+  }
+
+  .metric-card__icon :deep(.el-icon) {
+    font-size: 18px !important;
+  }
+
+  .metric-card__content {
+    gap: 3px;
+  }
+
+  .metric-card__label {
+    font-size: 11px;
+    white-space: nowrap;
   }
 
   .card-header {
@@ -1123,9 +1434,67 @@ onMounted(async () => {
     align-items: flex-start;
   }
 
+  .card-header--inline {
+    display: block;
+  }
+
+  .dashboard-key-title {
+    min-height: 32px;
+    padding-right: 58px;
+  }
+
+  .key-status-sort-actions {
+    top: 4px;
+    right: 0;
+    transform: none;
+  }
+
   .dashboard-filters {
-    flex-wrap: wrap;
+    display: flex;
+    flex-direction: column;
+    flex-wrap: nowrap;
     width: 100%;
+    gap: 8px;
+  }
+
+  .dashboard-filter-row {
+    display: grid;
+    width: 100%;
+    gap: 6px;
+  }
+
+  .dashboard-filter-row--primary {
+    grid-template-columns: 32px minmax(0, 0.9fr) minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .dashboard-filter-row--dates {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dashboard-filter-row .dashboard-filter,
+  .dashboard-filter-row :deep(.el-date-editor) {
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+  }
+
+  .dashboard-filter-row--primary .dashboard-refresh-btn {
+    width: 32px;
+    height: 32px;
+    margin: 0;
+  }
+
+  .dashboard-filter-row--primary :deep(.el-select__wrapper),
+  .dashboard-filter-row--dates :deep(.el-input__wrapper) {
+    min-height: 32px;
+    padding-left: 7px;
+    padding-right: 7px;
+  }
+
+  .dashboard-filter-row--primary :deep(.el-select__placeholder),
+  .dashboard-filter-row--primary :deep(.el-select__selected-item),
+  .dashboard-filter-row--dates :deep(.el-input__inner) {
+    font-size: 11px;
   }
 
   .dashboard-filter,
@@ -1137,5 +1506,121 @@ onMounted(async () => {
     width: 100%;
     min-width: 0;
   }
+
+  /* 指标卡一行两个，避免竖排把首屏顶掉 */
+  .dashboard-metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .metric-card :deep(.el-card__body) {
+    padding: 10px;
+  }
+
+  .metric-card__value {
+    font-size: 15px;
+  }
+
+  .metric-card__hint {
+    display: none;
+  }
+}
+
+/* ── 移动端：API Key 状态卡片流 ── */
+.key-rank-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.key-rank-empty {
+  padding: 20px 0;
+  text-align: center;
+  color: var(--cpa-text-tertiary, #8ba0ba);
+  font-size: 12px;
+}
+
+.key-rank-card {
+  padding: 10px;
+  border: 1px solid var(--cpa-border-soft, rgba(148, 163, 184, 0.24));
+  border-radius: 12px;
+  background: var(--cpa-surface, #fff);
+}
+
+.key-rank-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.key-rank-card__name {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--cpa-primary, #3b82f6);
+  cursor: pointer;
+}
+
+.key-rank-card__toggle {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 2px;
+  padding: 2px 0;
+  border: none;
+  background: none;
+  font-size: 11px;
+  color: var(--cpa-text-tertiary, #7f93ad);
+  cursor: pointer;
+}
+
+.key-rank-card__toggle .el-icon {
+  transition: transform 0.2s;
+}
+
+.key-rank-card__toggle .el-icon.is-open {
+  transform: rotate(180deg);
+}
+
+.key-rank-card__tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.key-rank-card__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--cpa-border-soft, rgba(148, 163, 184, 0.24));
+}
+
+.key-rank-card__row {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.key-rank-card__label {
+  color: var(--cpa-text-tertiary, #8ba0ba);
+}
+
+.key-rank-card__value {
+  min-width: 0;
+  color: var(--cpa-text-secondary, #40566f);
+  word-break: break-word;
 }
 </style>

@@ -7,6 +7,7 @@ const SESSION_ROLE_KEY = 'sessionRole'
 const SESSION_API_KEY_KEY = 'sessionApiKey'
 const CHECK_REQUEST_TIMEOUT = 65000
 const IMAGE_REQUEST_TIMEOUT = 360000
+const IMPORT_REQUEST_TIMEOUT = 300000
 
 const getMasterKey = () => localStorage.getItem(MASTER_KEY_STORAGE_KEY) || ''
 const setMasterKey = (value) => localStorage.setItem(MASTER_KEY_STORAGE_KEY, value)
@@ -32,6 +33,8 @@ const rawApi = axios.create({
 })
 
 let masterKeyRequest = null
+let sessionLogoutInProgress = false
+let sessionRequestVersion = 0
 
 const ensureMasterKey = async (forceRefresh = false) => {
   const cachedMasterKey = getMasterKey()
@@ -81,6 +84,11 @@ const serializeParams = (params = {}) => {
 
 api.interceptors.request.use(
   async (config) => {
+    config._sessionRequestVersion = sessionRequestVersion
+    if (sessionLogoutInProgress && window.location.pathname === '/login') {
+      return new Promise(() => {})
+    }
+
     // 优先使用 session token（登录凭证）
     const sessionToken = getSessionToken()
     if (sessionToken) {
@@ -107,6 +115,9 @@ api.interceptors.request.use(
 
 api.interceptors.response.use(
   (response) => {
+    if (response.config?._sessionRequestVersion !== sessionRequestVersion) {
+      return new Promise(() => {})
+    }
     if (response.config?.responseType === 'blob') {
       return response.data
     }
@@ -114,11 +125,21 @@ api.interceptors.response.use(
   },
   async (error) => {
     const originalRequest = error.config || {}
+    if (originalRequest._sessionRequestVersion !== undefined && originalRequest._sessionRequestVersion !== sessionRequestVersion) {
+      return new Promise(() => {})
+    }
     const status = error.response?.status
     const requestUrl = originalRequest.url || ''
 
-    // 如果是 session token 认证失败（403 也视为凭证无效）
-    if ((status === 401 || status === 403) && getSessionToken() && !originalRequest._retriedWithFreshSession) {
+    // 退出后缓存页面可能仍有尚未结束的请求；静默标记，避免登录页继续弹认证错误。
+    if (status === 401 && !getSessionToken() && window.location.pathname === '/login') {
+      const silentError = new Error('__session_logged_out__')
+      silentError.silent = true
+      return Promise.reject(silentError)
+    }
+
+    // 仅 401 代表 session token 已失效；403 表示当前登录用户没有该接口权限，不能登出。
+    if (status === 401 && getSessionToken() && !originalRequest._retriedWithFreshSession) {
       // session token 无效，清除并跳转登录
       clearSessionToken()
       if (window.location.pathname !== '/login') {
@@ -167,8 +188,9 @@ export const adminApi = {
   listKeys: (params) => api.get('/admin/keys', { params, paramsSerializer: { serialize: serializeParams } }),
   exportKeys: () => api.get('/admin/keys/export'),
   createKey: (data) => api.post('/admin/keys', data),
-  importKeys: (items) => api.post('/admin/keys/import', { items }),
+  importKeys: (items) => api.post('/admin/keys/import', { items }, { timeout: IMPORT_REQUEST_TIMEOUT }),
   batchUpdateKeyModels: (data) => api.post('/admin/keys/batch/models', data),
+  batchSetKeysProxy: (data) => api.post('/admin/keys/batch/models', data),
   batchSetKeysFakeIp: (data) => api.post('/admin/keys/batch/fake-ip', data),
   batchCheckKeyEndpoints: (data) => api.post('/admin/keys/batch/check', data),
   checkKey: (id, data) => api.post(`/admin/keys/${id}/check`, data, { timeout: CHECK_REQUEST_TIMEOUT }),
@@ -214,6 +236,9 @@ export const adminApi = {
   deleteProviderModelMapping: (id) => api.delete(`/admin/provider-model-mappings/${id}`),
 
   listModels: (provider, params) => api.get('/admin/models', { params: { provider, ...(params || {}) } }),
+  getModelPricingConfig: () => api.get('/admin/models/pricing-config'),
+  updateModelPricingConfig: (data) => api.put('/admin/models/pricing-config', data),
+  syncModelsDevPricing: () => api.post('/admin/models/pricing/models-dev/sync'),
   exportModels: () => api.get('/admin/models/export'),
   createModel: (data) => api.post('/admin/models', data),
   importModels: (items) => api.post('/admin/models/import', { items }),
@@ -222,6 +247,7 @@ export const adminApi = {
   deleteModel: (id) => api.delete(`/admin/models/${id}`),
 
   getImageModels: () => api.get('/admin/image/models'),
+  createImageModel: (data) => api.post('/admin/image/models', data),
   getImageCapabilities: () => api.get('/admin/image/capabilities'),
   generateImage: (data) => api.post('/admin/image/generations', data, { timeout: IMAGE_REQUEST_TIMEOUT }),
   validateImageGeneration: (data) => api.post('/admin/image/validate', data, { timeout: data?.probe_only === false ? IMAGE_REQUEST_TIMEOUT : 130000 }),
@@ -273,7 +299,20 @@ export const adminApi = {
   getOpenAIPlusQuota: (id) => api.get(`/admin/openai-plus/accounts/${id}/quota`, { timeout: 120000 }),
   getOpenAIPlusQuotaRefreshConfig: () => api.get('/admin/openai-plus/quota-refresh-config'),
   updateOpenAIPlusQuotaRefreshConfig: (data) => api.put('/admin/openai-plus/quota-refresh-config', data),
+  getOpenAIPlusProxyConfig: () => api.get('/admin/openai-plus/proxy-config'),
+  updateOpenAIPlusProxyConfig: (data) => api.put('/admin/openai-plus/proxy-config', data),
+  createGrokOAuthAuthUrl: (data) => api.post('/admin/grok/oauth/auth-url', data || {}),
+  exchangeGrokOAuthCode: (data) => api.post('/admin/grok/oauth/exchange-code', data),
+  listGrokUsageLogs: (params) => api.get('/admin/grok/usage-logs', { params }),
+  listGrokAccounts: () => api.get('/admin/grok/accounts'),
+  createGrokAccount: (data) => api.post('/admin/grok/accounts', data),
+  updateGrokAccountStatus: (id, data) => api.put(`/admin/grok/accounts/${id}/status`, data),
+  checkGrokAccount: (id, data) => api.post(`/admin/grok/accounts/${id}/check`, data, { timeout: CHECK_REQUEST_TIMEOUT }),
+  refreshGrokAccount: (id) => api.post(`/admin/grok/accounts/${id}/refresh`, null, { timeout: CHECK_REQUEST_TIMEOUT }),
+  batchDeleteGrokAccounts: (accountIds) => api.delete('/admin/grok/accounts/batch', { data: { account_ids: accountIds } }),
+  deleteGrokAccount: (id) => api.delete(`/admin/grok/accounts/${id}`),
   importOpenAIPlusAccounts: (content) => api.post('/admin/openai-plus/accounts/import', { content }, { timeout: 600000 }),
+  exportOpenAIPlusAccounts: (data) => api.post('/admin/openai-plus/accounts/export', data, data?.mode === 'separate' ? { responseType: 'blob' } : undefined),
   updateOpenAIPlusAccount: (id, data) => api.put(`/admin/openai-plus/accounts/${id}`, data),
   batchUpdateOpenAIPlusAccounts: (data) => api.put('/admin/openai-plus/accounts/batch', data),
   batchDeleteOpenAIPlusAccounts: (data) => api.delete('/admin/openai-plus/accounts/batch', { data }),
@@ -288,11 +327,25 @@ export const adminApi = {
   getModelSeedConfig: () => api.get('/admin/model-seed-config'),
   updateModelSeedConfig: (data) => api.put('/admin/model-seed-config', data),
 
+  getRuntimeLogConfig: () => api.get('/admin/runtime-log-config'),
+  updateRuntimeLogConfig: (data) => api.put('/admin/runtime-log-config', data),
+  listRuntimeLogs: (params) => api.get('/admin/runtime-logs', { params }),
+  clearRuntimeLogs: () => api.delete('/admin/runtime-logs'),
+
   getProxyTraceConfig: () => api.get('/admin/proxy-trace-config'),
   updateProxyTraceConfig: (data) => api.put('/admin/proxy-trace-config', data),
   listProxyTraces: (params) => api.get('/admin/proxy-traces', { params }),
   getProxyTrace: (traceId) => api.get(`/admin/proxy-traces/${traceId}`),
   cleanupProxyTraces: () => api.delete('/admin/proxy-traces/cleanup'),
+
+  getThinkingModeConfig: () => api.get('/admin/thinking-mode-config'),
+  updateThinkingModeConfig: (data) => api.put('/admin/thinking-mode-config', data),
+
+  getUsageRetentionConfig: () => api.get('/admin/usage-retention-config'),
+  updateUsageRetentionConfig: (data) => api.put('/admin/usage-retention-config', data),
+
+  getRetrySameKeyConfig: () => api.get('/admin/retry-same-key-config'),
+  updateRetrySameKeyConfig: (data) => api.put('/admin/retry-same-key-config', data),
 
   factoryReset: (data) => api.post('/admin/factory-reset', data),
 }
@@ -305,11 +358,16 @@ export const authApi = {
   changePassword: (oldPassword, newPassword) =>
     api.post('/auth/change-password', { old_password: oldPassword, new_password: newPassword }),
   logout: () => {
+    sessionLogoutInProgress = true
+    sessionRequestVersion++
     const token = getSessionToken()
     if (token) {
       rawApi.post('/auth/logout', null, { headers: { Authorization: `Bearer ${token}` } }).catch(() => {})
     }
     clearSessionToken()
+    // 清除缓存的 master key，避免登出/切换用户后残留管理员凭证
+    clearMasterKey()
+    window.dispatchEvent(new Event('session-changed'))
   },
   isLoggedIn: () => !!getSessionToken(),
   getCurrentUsername: () => localStorage.getItem(SESSION_USERNAME_KEY) || '',
@@ -331,10 +389,13 @@ export const authApi = {
  * 存储登录/注册后的用户信息到 localStorage
  */
 export function saveSessionUser(data) {
+  sessionLogoutInProgress = false
+  sessionRequestVersion++
   if (data?.token) localStorage.setItem(SESSION_TOKEN_KEY, data.token)
   if (data?.username) localStorage.setItem(SESSION_USERNAME_KEY, data.username)
   if (data?.role) localStorage.setItem(SESSION_ROLE_KEY, data.role)
   if (data?.api_key) localStorage.setItem(SESSION_API_KEY_KEY, data.api_key)
+  window.dispatchEvent(new Event('session-changed'))
 }
 
 /**

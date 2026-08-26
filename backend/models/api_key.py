@@ -74,6 +74,15 @@ class ApiKey(Base):
     # 最近一次内容安全违规原因
     last_security_violation: Mapped[str] = mapped_column(Text, nullable=True)
 
+    # 生命周期累计用量，不随明细日志清理回退
+    request_count: Mapped[int] = mapped_column(Integer, default=0)
+    success_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_count: Mapped[int] = mapped_column(Integer, default=0)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_tokens: Mapped[int] = mapped_column(Integer, default=0)
+
     # 创建时间
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow
