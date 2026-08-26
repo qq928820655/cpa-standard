@@ -81,6 +81,15 @@ DEFAULT_EXPORT_CONFIG = {
     "runtime_log_enabled": False,
     # 运行日志滚动信息：默认关闭，开启后按页面宽度自动换行显示
     "runtime_log_wrap": False,
+    # 未显式协议请求的客户端智能协议路由，关闭时保持原有协议处理逻辑。
+    "intelligent_protocol_routing": {
+        "enabled": False,
+        "models_dev_enabled": True,
+        "models_dev_refresh_hours": 24,
+        "capability_ttl_hours": 240,
+        "client_rules": [],
+        "provider_model_overrides": [],
+    },
     # 上游内容安全防护：默认关闭，开启后扫描广告与危险代码片段
     "content_guard": {
         "enabled": False,

@@ -70,6 +70,7 @@ async def init_db():
         ModelCatalog,
         ProviderModelPriority,
         ProviderModelMapping,
+        ProviderModelProtocolCapability,
         UsageDailySummary,
         UsageLog,
         AdminUser,
@@ -150,6 +151,10 @@ async def init_db():
         def has_openai_plus_account_cache_tokens(sync_conn):
             columns = inspect(sync_conn).get_columns("openai_plus_accounts")
             return any(column["name"] == "cache_tokens" for column in columns)
+
+        def has_protocol_capability_request_profile(sync_conn):
+            columns = inspect(sync_conn).get_columns("provider_model_protocol_capabilities")
+            return any(column["name"] == "request_profile" for column in columns)
 
         def has_image_generation_task_is_deleted(sync_conn):
             columns = inspect(sync_conn).get_columns("image_generation_tasks")
@@ -417,6 +422,48 @@ async def init_db():
                     AND COALESCE(total_tokens, 0) = 0
                     AND COALESCE(cache_tokens, 0) = 0
                 """
+            )
+
+        if not await conn.run_sync(has_protocol_capability_request_profile):
+            await conn.exec_driver_sql(
+                """
+                CREATE TABLE provider_model_protocol_capabilities_migrated (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider VARCHAR(100) NOT NULL DEFAULT '',
+                    base_url VARCHAR(500) NOT NULL DEFAULT '',
+                    model_id VARCHAR(200) NOT NULL,
+                    protocol VARCHAR(50) NOT NULL,
+                    request_profile VARCHAR(30) NOT NULL DEFAULT 'default',
+                    supported BOOLEAN NOT NULL DEFAULT 0,
+                    source VARCHAR(30) NOT NULL DEFAULT 'probe',
+                    status_code INTEGER,
+                    detail TEXT,
+                    checked_at DATETIME,
+                    expires_at DATETIME,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    UNIQUE(provider, base_url, model_id, protocol, request_profile)
+                )
+                """
+            )
+            await conn.exec_driver_sql(
+                """
+                INSERT INTO provider_model_protocol_capabilities_migrated (
+                    id, provider, base_url, model_id, protocol, request_profile, supported,
+                    source, status_code, detail, checked_at, expires_at, created_at, updated_at
+                )
+                SELECT id, provider, base_url, model_id, protocol, 'default', supported,
+                       source, status_code, detail, checked_at, expires_at, created_at, updated_at
+                FROM provider_model_protocol_capabilities
+                """
+            )
+            await conn.exec_driver_sql("DROP TABLE provider_model_protocol_capabilities")
+            await conn.exec_driver_sql(
+                "ALTER TABLE provider_model_protocol_capabilities_migrated RENAME TO provider_model_protocol_capabilities"
+            )
+            await conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_provider_model_protocol_capability_lookup "
+                "ON provider_model_protocol_capabilities(provider, model_id)"
             )
 
         if not await conn.run_sync(has_image_generation_task_is_deleted):

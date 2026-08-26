@@ -337,6 +337,10 @@ export const adminApi = {
   listProxyTraces: (params) => api.get('/admin/proxy-traces', { params }),
   getProxyTrace: (traceId) => api.get(`/admin/proxy-traces/${traceId}`),
   cleanupProxyTraces: () => api.delete('/admin/proxy-traces/cleanup'),
+  getIntelligentProtocolRoutingConfig: () => api.get('/admin/intelligent-protocol-routing-config'),
+  updateIntelligentProtocolRoutingConfig: (data) => api.put('/admin/intelligent-protocol-routing-config', data),
+  listProtocolCapabilities: (params) => api.get('/admin/protocol-capabilities', { params }),
+  clearProtocolCapabilities: (data) => api.delete('/admin/protocol-capabilities', { data }),
 
   getThinkingModeConfig: () => api.get('/admin/thinking-mode-config'),
   updateThinkingModeConfig: (data) => api.put('/admin/thinking-mode-config', data),

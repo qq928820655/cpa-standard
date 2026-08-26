@@ -8,6 +8,7 @@ from .image_generation_task import ImageGenerationTask, ImageGenerationTaskResul
 from .model_catalog import ModelCatalog
 from .provider_model_priority import ProviderModelPriority
 from .provider_model_mapping import ProviderModelMapping
+from .provider_model_protocol_capability import ProviderModelProtocolCapability
 from .content_guard_event import ContentGuardEvent
 from .openai_plus_account import OpenAIPlusAccount
 from .openai_plus_usage_log import OpenAIPlusUsageLog
@@ -29,6 +30,7 @@ __all__ = [
     "ModelCatalog",
     "ProviderModelPriority",
     "ProviderModelMapping",
+    "ProviderModelProtocolCapability",
     "ContentGuardEvent",
     "OpenAIPlusAccount",
     "OpenAIPlusUsageLog",

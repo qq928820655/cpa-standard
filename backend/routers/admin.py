@@ -34,6 +34,7 @@ from services.proxy_service import proxy_service
 from services.key_check_task_service import key_check_task_service
 from services.proxy_trace_service import proxy_trace_service, normalize_trace_config
 from services.runtime_log_service import DEFAULT_LINE_LIMIT, runtime_log_buffer
+from services.protocol_routing_service import protocol_routing_service
 
 
 router = APIRouter()
@@ -7408,9 +7409,12 @@ async def get_provider_balance(
 
             user_data = login_data.get("data") or {}
             user_id = user_data.get("id")
+            access_token = parse_sub2api_token(login_data)
 
             # 查询用户信息
             self_headers = proxy_service._build_magic666_headers(user_id=user_id, api_key=key)
+            if access_token:
+                self_headers["authorization"] = f"Bearer {access_token}"
             self_resp = await client.get(self_url, headers=self_headers)
             if self_resp.status_code >= 400:
                 raise HTTPException(status_code=502, detail=f"查询余额失败: HTTP {self_resp.status_code}")
@@ -8013,6 +8017,44 @@ class ProxyTraceCleanupResponse(BaseModel):
     deleted_count: int
 
 
+class IntelligentProtocolRoutingConfigResponse(BaseModel):
+    enabled: bool = False
+    models_dev_enabled: bool = True
+    models_dev_refresh_hours: int = Field(24, ge=1, le=720)
+    capability_ttl_hours: int = Field(240, ge=1, le=8760)
+    client_rules: List[dict] = Field(default_factory=list)
+    provider_model_overrides: List[dict] = Field(default_factory=list)
+
+
+class IntelligentProtocolRoutingConfigUpdate(IntelligentProtocolRoutingConfigResponse):
+    pass
+
+
+class ProtocolCapabilityItem(BaseModel):
+    id: int
+    provider: str
+    base_url: str
+    model_id: str
+    protocol: str
+    request_profile: str = "default"
+    supported: bool
+    source: str
+    status_code: Optional[int] = None
+    detail: Optional[str] = None
+    checked_at: datetime
+    expires_at: Optional[datetime] = None
+    updated_at: datetime
+
+
+class ProtocolCapabilityListResponse(BaseModel):
+    items: List[ProtocolCapabilityItem]
+    total: int
+
+
+class ProtocolCapabilityClearRequest(BaseModel):
+    ids: List[int] = Field(default_factory=list)
+
+
 def _parse_trace_json(value: Optional[str]) -> Any:
     if not value:
         return None
@@ -8038,6 +8080,61 @@ def _to_trace_summary(item) -> ProxyTraceSummaryResponse:
         upstream_latency_ms=item.upstream_latency_ms,
         error_summary=item.error_summary,
     )
+
+
+@router.get("/intelligent-protocol-routing-config", response_model=IntelligentProtocolRoutingConfigResponse)
+async def get_intelligent_protocol_routing_config(
+    _: dict = Depends(require_admin_access),
+):
+    raw = export_config.get("intelligent_protocol_routing") or {}
+    return IntelligentProtocolRoutingConfigResponse(
+        enabled=bool(raw.get("enabled", False)),
+        models_dev_enabled=bool(raw.get("models_dev_enabled", True)),
+        models_dev_refresh_hours=int(raw.get("models_dev_refresh_hours", 24) or 24),
+        capability_ttl_hours=int(raw.get("capability_ttl_hours", 240) or 240),
+        client_rules=raw.get("client_rules") or [],
+        provider_model_overrides=raw.get("provider_model_overrides") or [],
+    )
+
+
+@router.put("/intelligent-protocol-routing-config", response_model=IntelligentProtocolRoutingConfigResponse)
+async def update_intelligent_protocol_routing_config(
+    data: IntelligentProtocolRoutingConfigUpdate,
+    _: dict = Depends(require_admin_access),
+):
+    payload = data.model_dump()
+    export_config["intelligent_protocol_routing"] = payload
+    persist_export_config()
+    return IntelligentProtocolRoutingConfigResponse(**payload)
+
+
+@router.get("/protocol-capabilities", response_model=ProtocolCapabilityListResponse)
+async def list_protocol_capabilities(
+    provider: str = Query(""),
+    model: str = Query(""),
+    protocol: str = Query(""),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin_access),
+):
+    rows, total = await protocol_routing_service.list_capabilities(
+        db, provider=provider, model=model, protocol=protocol, limit=limit, offset=offset
+    )
+    return ProtocolCapabilityListResponse(
+        items=[ProtocolCapabilityItem.model_validate(row, from_attributes=True) for row in rows],
+        total=total,
+    )
+
+
+@router.delete("/protocol-capabilities", response_model=ProxyTraceCleanupResponse)
+async def clear_protocol_capabilities(
+    data: ProtocolCapabilityClearRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin_access),
+):
+    deleted_count = await protocol_routing_service.clear_capabilities(db, ids=(data.ids if data else None))
+    return ProxyTraceCleanupResponse(deleted_count=deleted_count)
 
 
 @router.get("/proxy-trace-config", response_model=ProxyTraceConfigResponse)

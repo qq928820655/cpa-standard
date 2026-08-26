@@ -241,6 +241,7 @@ class ProxyService:
             or input_details.get("cached_tokens")
             or usage.get("cache_read_input_tokens")
             or usage.get("cached_tokens")
+            or usage.get("cached_prompt_tokens")
             or usage.get("cache_tokens")
             or 0
         )
@@ -2760,7 +2761,7 @@ class ProxyService:
         cache_read_tokens = int(usage.get("cache_read_input_tokens") or 0)
         cache_creation_tokens = int(usage.get("cache_creation_input_tokens") or 0)
         cache_tokens = openai_cached_tokens or cache_read_tokens or cache_creation_tokens or int(
-            usage.get("cached_tokens") or usage.get("cache_tokens") or 0
+            usage.get("cached_tokens") or usage.get("cached_prompt_tokens") or usage.get("cache_tokens") or 0
         )
 
         if not explicit_prompt_tokens and (cache_read_tokens or cache_creation_tokens):
@@ -3050,7 +3051,31 @@ class ProxyService:
 
         return None
 
+    def _validate_responses_request_for_chat(self, body: dict) -> None:
+        """确认 Responses 请求可无损降级为 Chat Completions。"""
+        stateful_fields = ("previous_response_id", "conversation", "background")
+        if any(body.get(field) is not None for field in stateful_fields):
+            raise ValueError("stateful responses request cannot be converted to chat completions")
+
+        unsupported_tools = []
+        for tool in body.get("tools") or []:
+            if not isinstance(tool, dict):
+                unsupported_tools.append("invalid")
+                continue
+            if tool.get("type") not in {None, "function"}:
+                unsupported_tools.append(str(tool.get("type") or "unknown"))
+        if unsupported_tools:
+            raise ValueError(f"responses tools cannot be converted to chat completions: {', '.join(unsupported_tools)}")
+
+        for item in body.get("input") if isinstance(body.get("input"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type and item_type not in {"message", "function_call", "function_call_output"}:
+                raise ValueError(f"responses input item cannot be converted to chat completions: {item_type}")
+
     def adapt_responses_request_to_chat(self, body: dict) -> dict:
+        self._validate_responses_request_for_chat(body)
         chat_body = {}
 
         for source_key, target_key in [
@@ -3068,6 +3093,8 @@ class ProxyService:
                 chat_body[target_key] = body[source_key]
 
         adapted_tools = self._adapt_responses_tools_for_chat(body.get("tools"))
+        if body.get("tools") and len(adapted_tools) != len(body.get("tools") or []):
+            raise ValueError("responses tools cannot be converted to chat completions")
         if adapted_tools:
             chat_body["tools"] = adapted_tools
 
@@ -3159,6 +3186,16 @@ class ProxyService:
                 output_items.append(function_call_item)
         return output_items
 
+    def adapt_responses_request_to_claude_messages(self, body: dict) -> dict:
+        """将可安全转换的 Responses 图片请求转为 Anthropic Messages。"""
+        chat_body = self.adapt_responses_request_to_chat(body)
+        return self._adapt_chat_body_to_claude_messages_body(chat_body)
+
+    def adapt_claude_messages_response_to_responses(self, response_data: Any) -> Any:
+        """将 Anthropic Messages 非流式响应转为 OpenAI Responses。"""
+        chat_response = self._adapt_claude_messages_response_to_chat_response(response_data)
+        return self.adapt_chat_response_to_responses(chat_response)
+
     def adapt_chat_response_to_responses(self, response_data: Any) -> Any:
         if not isinstance(response_data, dict) or response_data.get("object") != "chat.completion":
             return response_data
@@ -3179,6 +3216,23 @@ class ProxyService:
             "output_text": output_text,
             "usage": responses_usage,
         }
+
+    def normalize_responses_output_text(self, response_data: Any) -> Any:
+        """补齐上游遗漏的 Responses 顶层 output_text，不改动原始 output 项。"""
+        if not isinstance(response_data, dict) or response_data.get("output_text"):
+            return response_data
+        output_text_parts: list[str] = []
+        for item in response_data.get("output") or []:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for block in item.get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "output_text" and block.get("text") is not None:
+                    output_text_parts.append(str(block.get("text")))
+        if not output_text_parts:
+            return response_data
+        normalized = dict(response_data)
+        normalized["output_text"] = "".join(output_text_parts)
+        return normalized
 
     def _build_sse_event(self, event_name: str, data: dict) -> bytes:
         payload = json.dumps(data, ensure_ascii=False)

@@ -18,6 +18,7 @@ from services.proxy_service import proxy_service
 from services.proxy_trace_service import proxy_trace_service
 
 from services.responses_capability_service import responses_capability_service
+from services.protocol_routing_service import protocol_routing_service
 
 
 router = APIRouter()
@@ -48,7 +49,7 @@ def is_responses_capability_candidate(model: Optional[str]) -> bool:
     return any(normalized.startswith(prefix) for prefix in RESPONSES_CAPABILITY_MODEL_PREFIXES)
 
 
-def log_proxy_hit(path: str, body: dict, protocol: Optional[str] = None):
+def log_proxy_hit(path: str, body: dict, protocol: Optional[str] = None, request: Optional[Request] = None):
     model = body.get("model") if isinstance(body, dict) else None
     stream = body.get("stream") if isinstance(body, dict) else None
     protocol_name = protocol or {
@@ -56,7 +57,32 @@ def log_proxy_hit(path: str, body: dict, protocol: Optional[str] = None):
         "/v1/responses": "openai_responses",
         "/v1/messages": "claude_messages",
     }.get(path, "unknown")
-    logger.info("[CPA HIT] protocol=%s path=%s model=%s stream=%s", protocol_name, path, model, stream)
+    if request is None:
+        logger.info("[CPA HIT] protocol=%s path=%s model=%s stream=%s", protocol_name, path, model, stream)
+        return
+
+    from services.protocol_routing_service import protocol_routing_service
+
+    headers = dict(request.headers)
+    client_type = protocol_routing_service.identify_client(headers)
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = headers.get("user-agent", "")[:200]
+    session_id = next(
+        (headers.get(name) for name in STICKY_SESSION_HEADERS if headers.get(name)),
+        "",
+    )
+    session_hint = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12] if session_id else ""
+    logger.info(
+        "[CPA HIT] protocol=%s path=%s model=%s stream=%s client=%s client_ip=%s user_agent=%s session=%s",
+        protocol_name,
+        path,
+        model,
+        stream,
+        client_type,
+        client_ip,
+        user_agent,
+        session_hint,
+    )
 
 
 def should_pass_through_error(status_code: int) -> bool:
@@ -450,16 +476,32 @@ def is_balance_insufficient_failure(response_data: Any) -> bool:
 
 
 def is_service_unavailable_error(response_data: Any) -> bool:
-    """判断是否为服务暂不可用错误（应切换到其他提供商的 Key 重试）"""
+    """判断上游是否明确表示当前服务或账号暂不可用。"""
     if not isinstance(response_data, dict):
         return False
     error = response_data.get("error")
-    if isinstance(error, dict):
-        msg = str(error.get("message") or "").lower()
-        err_type = str(error.get("type") or "").lower()
-        if "temporarily unavailable" in msg and err_type == "api_error":
-            return True
+    if not isinstance(error, dict):
+        return False
+    msg = str(error.get("message") or "").lower()
+    err_type = str(error.get("type") or "").lower()
+    if err_type in {"api_error", "server_error", "rate_limit_error"} and any(marker in msg for marker in (
+        "temporarily unavailable",
+        "暂时没有可用账号",
+        "暂时无可用账号",
+        "no available account",
+        "no available channel",
+        "upstream unavailable",
+        "service unavailable",
+    )):
+        return True
     return False
+
+
+def normalize_retryable_upstream_status(status_code: int, response_data: Any) -> int:
+    """将被上游包装成 2xx 的 HTML 或明确不可用错误归一为 502。"""
+    if status_code < 400 and (is_nginx_error_response(response_data) or is_service_unavailable_error(response_data)):
+        return 502
+    return status_code
 
 
 async def disable_failed_api_key(db: AsyncSession, api_key: Any, reason: str):
@@ -668,6 +710,66 @@ def _trace_attempt(
     )
 
 
+async def _record_protocol_capability(
+    db: AsyncSession,
+    api_key: Any,
+    model: Optional[str],
+    path: str,
+    status_code: Optional[int],
+    response_data: Any = None,
+    request_profile: str = "default",
+) -> None:
+    if not protocol_routing_service.enabled() or not api_key or not model:
+        return
+    normalized_path = (path or "").lstrip("/")
+    protocol = {
+        "v1/chat/completions": "openai_chat",
+        "v1/responses": "openai_responses",
+        "v1/messages": "anthropic_messages",
+    }.get(normalized_path)
+    if not protocol:
+        return
+    supported = status_code is not None and status_code < 400
+    if not supported:
+        explicit_unsupported_statuses = {404, 405, 415, 501}
+        error_text = "\n".join(collect_upstream_error_texts(response_data)).lower()
+        protocol_unsupported_markers = (
+            "unknown endpoint",
+            "invalid path",
+            "no route",
+            "method not allowed",
+            "not implemented",
+            "unsupported endpoint",
+            "unsupported api",
+            "unsupported protocol",
+            "unsupported method",
+        )
+        is_explicit_protocol_error = status_code in explicit_unsupported_statuses or (
+            status_code in {400, 422} and any(marker in error_text for marker in protocol_unsupported_markers)
+        )
+        if not is_explicit_protocol_error:
+            return
+    detail = str(response_data)[:2000] if not supported and response_data is not None else None
+    try:
+        await protocol_routing_service.record_capability(
+            db,
+            provider=getattr(api_key, "provider", ""),
+            base_url=getattr(api_key, "base_url", ""),
+            model=model,
+            protocol=protocol,
+            request_profile=request_profile,
+            supported=supported,
+            status_code=status_code,
+            detail=detail,
+        )
+    except Exception:
+        logger.exception("[CPA PROTOCOL CAPABILITY] failed to persist capability result")
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("[CPA PROTOCOL CAPABILITY] failed to rollback capability write")
+
+
 async def _save_trace(
     db: AsyncSession,
     trace_ctx,
@@ -820,7 +922,12 @@ async def forward_stream_with_retry(
         attempt_ms = int((time.perf_counter() - attempt_started_at) * 1000)
         trace_upstream_ms += attempt_ms
         trace_selected_api_key = api_key
+        normalized_status_code = normalize_retryable_upstream_status(status_code, stream_response)
+        if normalized_status_code != status_code:
+            logger.warning("[CPA UPSTREAM RETRYABLE ERROR] normalizing stream status to %s api_key_id=%s path=%s", normalized_status_code, api_key.id, path)
+            status_code = normalized_status_code
         if status_code < 400:
+            await _record_protocol_capability(db, api_key, upstream_model, path, status_code, stream_response)
             _trace_attempt(
                 trace_ctx,
                 api_key=api_key,
@@ -853,6 +960,7 @@ async def forward_stream_with_retry(
         last_status_code = status_code
         last_response_headers = response_headers
         last_response_body = stream_response
+        await _record_protocol_capability(db, api_key, upstream_model, path, status_code, stream_response)
 
         # 服务暂不可用：切换到其他提供商的 Key，不计入重试次数，对客户端透明
         if is_service_unavailable_error(stream_response):
@@ -1144,7 +1252,12 @@ async def forward_request_with_retry(
         attempt_ms = int((time.perf_counter() - attempt_started_at) * 1000)
         trace_upstream_ms += attempt_ms
         trace_selected_api_key = api_key
+        normalized_status_code = normalize_retryable_upstream_status(status_code, response_data)
+        if normalized_status_code != status_code:
+            logger.warning("[CPA UPSTREAM RETRYABLE ERROR] normalizing status to %s api_key_id=%s path=%s", normalized_status_code, api_key.id, path)
+            status_code = normalized_status_code
         if status_code < 400:
+            await _record_protocol_capability(db, api_key, upstream_model, path, status_code, response_data)
             _trace_attempt(
                 trace_ctx,
                 api_key=api_key,
@@ -1177,6 +1290,7 @@ async def forward_request_with_retry(
         last_status_code = status_code
         last_response_headers = response_headers
         last_response_body = response_data
+        await _record_protocol_capability(db, api_key, upstream_model, path, status_code, response_data)
 
         # 服务暂不可用：切换到其他提供商的 Key，不计入重试次数，对客户端透明
         if is_service_unavailable_error(response_data):
@@ -1952,6 +2066,33 @@ async def resolve_claude_messages_native_providers(
         seen.add(value)
         providers.append(value)
 
+    if protocol_routing_service.enabled():
+        from models import ApiKey, ProviderModelProtocolCapability
+
+        capability_query = select(ProviderModelProtocolCapability).where(
+            ProviderModelProtocolCapability.model_id.in_([item.lower() for item in candidates]),
+            ProviderModelProtocolCapability.protocol == CLAUDE_MESSAGES_NATIVE_PROTOCOL,
+            ProviderModelProtocolCapability.supported == True,
+            ProviderModelProtocolCapability.expires_at > datetime.utcnow(),
+        )
+        if force_providers:
+            capability_query = capability_query.where(ProviderModelProtocolCapability.provider.in_(force_providers))
+        capability_rows = (await db.execute(capability_query)).scalars().all()
+        active_key_query = select(ApiKey.provider, ApiKey.base_url).where(ApiKey.is_active == True)
+        if force_providers:
+            active_key_query = active_key_query.where(ApiKey.provider.in_(force_providers))
+        active_keys = (await db.execute(active_key_query)).all()
+        active_origins = {
+            ((provider or "").strip().lower(), protocol_routing_service.normalize_base_url(base_url))
+            for provider, base_url in active_keys
+        }
+        for row in capability_rows:
+            origin = ((row.provider or "").strip().lower(), protocol_routing_service.normalize_base_url(row.base_url))
+            if origin in active_origins:
+                add_provider(row.provider)
+        if providers:
+            return providers
+
     catalog_query = select(ModelCatalog).where(
         ModelCatalog.is_active == True,
         ModelCatalog.protocol == CLAUDE_MESSAGES_NATIVE_PROTOCOL,
@@ -2088,7 +2229,7 @@ async def openai_chat_completions(
     POST /v1/chat/completions
     """
     body = await request.json()
-    log_proxy_hit("/v1/chat/completions", body)
+    log_proxy_hit("/v1/chat/completions", body, request=request)
     headers = dict(request.headers)
 
     model = body.get("model")
@@ -2403,7 +2544,7 @@ async def openai_responses(
     POST /v1/responses
     """
     body = await request.json()
-    log_proxy_hit("/v1/responses", body)
+    log_proxy_hit("/v1/responses", body, request=request)
     headers = dict(request.headers)
 
     model = body.get("model")
@@ -2430,6 +2571,31 @@ async def openai_responses(
 
     is_stream = body.get("stream", False)
     user_id = auth_info.get("user_id")
+    vision_request = protocol_routing_service.enabled() and _is_safe_responses_vision_request(body)
+    vision_messages_key_name = None
+    if vision_request:
+        sticky_session_key = get_sticky_session_key(headers, body.get("model"))
+        vision_candidate_key = await select_api_key(
+            db,
+            model=body.get("model"),
+            sticky_session_key=sticky_session_key,
+            tried_key_ids=[],
+            filter_providers=_dir_providers if _dir_providers else None,
+            filter_key_name=_dir_key,
+        )
+        if vision_candidate_key:
+            _, vision_candidate_model = await build_upstream_body_for_key(
+                db, vision_candidate_key, body, body.get("model"), _dir_providers if _dir_providers else None
+            )
+            vision_protocols, _ = await protocol_routing_service.supported_protocols(
+                db,
+                provider=getattr(vision_candidate_key, "provider", ""),
+                base_url=getattr(vision_candidate_key, "base_url", ""),
+                model=vision_candidate_model or body.get("model"),
+                request_profile="vision",
+            )
+            if "anthropic_messages" in vision_protocols:
+                vision_messages_key_name = getattr(vision_candidate_key, "name", None)
 
     # 支持原生 Responses 的模型按上游 base_url 探测能力；结果 10 天内复用
     use_native_responses = False
@@ -2460,6 +2626,31 @@ async def openai_responses(
             if capability is True:
                 use_native_responses = True
                 native_key_name = getattr(candidate_key, "name", None)
+
+    if vision_messages_key_name:
+        try:
+            messages_body = proxy_service.adapt_responses_request_to_claude_messages(body)
+        except ValueError:
+            messages_body = None
+        if messages_body is not None:
+            status_code, _, response_data, selected_api_key = await forward_request_with_retry(
+                db=db,
+                method="POST",
+                path="/v1/messages",
+                headers=headers,
+                body=messages_body,
+                user_id=user_id,
+                original_model=original_model,
+                force_providers=_dir_providers if _dir_providers else None,
+                force_key_name=vision_messages_key_name,
+            )
+            if status_code < 400:
+                await _record_protocol_capability(
+                    db, selected_api_key, messages_body.get("model"), "/v1/messages", status_code,
+                    response_data, request_profile="vision"
+                )
+                adapted = proxy_service.adapt_claude_messages_response_to_responses(response_data)
+                return JSONResponse(content=_restore_model_in_response(adapted, original_model), status_code=status_code)
 
     logger.info(
         "[CPA RESPONSES ROUTE] model=%s native=%s upstream_key=%s",
@@ -2501,6 +2692,40 @@ async def openai_responses(
             force_providers=_dir_providers if _dir_providers else None,
             force_key_name=native_key_name,
         )
+        response_data = proxy_service.normalize_responses_output_text(response_data)
+        if status_code < 400 and vision_request and not _responses_vision_was_rejected(response_data):
+            await _record_protocol_capability(
+                db, _selected_api_key, body.get("model"), "/v1/responses", status_code,
+                response_data, request_profile="vision"
+            )
+        if status_code < 400 and vision_request and _responses_vision_was_rejected(response_data):
+            try:
+                messages_body = proxy_service.adapt_responses_request_to_claude_messages(body)
+            except ValueError:
+                messages_body = None
+            if messages_body is not None:
+                fallback_status, fallback_headers, messages_response, fallback_key = await forward_request_with_retry(
+                    db=db,
+                    method="POST",
+                    path="/v1/messages",
+                    headers=headers,
+                    body=messages_body,
+                    user_id=user_id,
+                    original_model=original_model,
+                    force_providers=_dir_providers if _dir_providers else None,
+                    force_key_name=_dir_key,
+                )
+                if fallback_status < 400:
+                    await _record_protocol_capability(
+                        db, fallback_key, messages_body.get("model"), "/v1/messages", fallback_status,
+                        messages_response, request_profile="vision"
+                    )
+                    response_data = proxy_service.adapt_claude_messages_response_to_responses(messages_response)
+                    return JSONResponse(
+                        content=_restore_model_in_response(response_data, original_model),
+                        status_code=fallback_status,
+                        headers=fallback_headers,
+                    )
         return JSONResponse(
             content=_restore_model_in_response(response_data, original_model),
             status_code=status_code,
@@ -2549,6 +2774,34 @@ async def openai_responses(
         if status_code >= 400:
             return JSONResponse(content=response_data, status_code=status_code)
         adapted = proxy_service.adapt_chat_response_to_responses(response_data)
+        if vision_request and not _responses_vision_was_rejected(adapted):
+            await _record_protocol_capability(
+                db, _selected_api_key, chat_body.get("model"), "/v1/chat/completions", status_code,
+                response_data, request_profile="vision"
+            )
+        if vision_request and _responses_vision_was_rejected(adapted):
+            try:
+                messages_body = proxy_service.adapt_responses_request_to_claude_messages(body)
+            except ValueError:
+                messages_body = None
+            if messages_body is not None:
+                status_code, _, messages_response, selected_api_key = await forward_request_with_retry(
+                    db=db,
+                    method="POST",
+                    path="/v1/messages",
+                    headers=headers,
+                    body=messages_body,
+                    user_id=user_id,
+                    original_model=original_model,
+                    force_providers=_dir_providers if _dir_providers else None,
+                    force_key_name=_dir_key,
+                )
+                if status_code < 400:
+                    await _record_protocol_capability(
+                        db, vision_candidate_key or selected_api_key, messages_body.get("model"), "/v1/messages", status_code,
+                        messages_response, request_profile="vision"
+                    )
+                    adapted = proxy_service.adapt_claude_messages_response_to_responses(messages_response)
         return JSONResponse(content=_restore_model_in_response(adapted, original_model), status_code=status_code)
 
 
@@ -2565,6 +2818,48 @@ def _is_claude_messages_request(request: Request, body: dict) -> bool:
 def _is_openai_responses_request(body: dict) -> bool:
     """依据 OpenAI Responses 专属字段识别根路径协议。"""
     return any(field in body for field in ("input", "instructions", "previous_response_id", "conversation", "background"))
+
+
+def _is_safe_responses_vision_request(body: dict) -> bool:
+    """仅允许无状态、非流式、无工具的图片请求参与协议自动回退。"""
+    if body.get("stream") or body.get("tools"):
+        return False
+    if any(body.get(field) is not None for field in ("previous_response_id", "conversation", "background")):
+        return False
+    input_data = body.get("input")
+    if not isinstance(input_data, list):
+        return False
+    for item in input_data:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for block in item.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "input_image":
+                return True
+    return False
+
+
+def _responses_vision_was_rejected(response_data: Any) -> bool:
+    """判断成功响应是否表明模型没有接收到图片。"""
+    if not isinstance(response_data, dict):
+        return False
+    text_parts = []
+    for item in response_data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for block in item.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "output_text":
+                text_parts.append(str(block.get("text") or ""))
+    text = "\n".join(text_parts).lower()
+    markers = (
+        "cannot view", "can't view", "unable to view", "cannot see the image",
+        "无法查看图片", "无法看到图片", "看不到图片", "没有看到图片", "没有看到任何图片",
+        "无法识别图片", "请重新上传",
+    )
+    if any(marker in text for marker in markers):
+        return True
+    image_terms = ("图片", "图像", "image")
+    missing_terms = ("没有看到", "无法看到", "看不到", "cannot see", "unable to see")
+    return any(term in text for term in image_terms) and any(term in text for term in missing_terms)
 
 
 @router.post("/")
@@ -2596,7 +2891,7 @@ async def claude_messages(
     POST /v1/messages
     """
     body = await request.json()
-    log_proxy_hit("/v1/messages", body)
+    log_proxy_hit("/v1/messages", body, request=request)
     headers = dict(request.headers)
 
     model = body.get("model")

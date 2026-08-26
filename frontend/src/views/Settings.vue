@@ -743,6 +743,58 @@
       </div>
     </el-card>
 
+    <!-- 智能协议路由配置 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('intelligentProtocolRouting')">
+          <div class="setting-card-header-text">
+            <div class="panel-title">智能协议路由</div>
+            <div class="panel-subtitle">按客户端偏好和真实上游能力选择 Responses、Chat 或 Messages；关闭时保持现有路由</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.intelligentProtocolRouting }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.intelligentProtocolRouting" class="setting-card-body">
+        <el-form label-width="170px" v-loading="intelligentProtocolRoutingLoading">
+          <el-form-item label="智能路由开关">
+            <el-switch v-model="intelligentProtocolRoutingForm.enabled" active-text="开启" inactive-text="关闭" />
+            <div class="form-tip">仅影响未显式指定协议的请求，以及既有协议失败后的兼容降级；能力结果只来自真实请求。</div>
+          </el-form-item>
+          <el-form-item label="能力缓存时间（小时）">
+            <el-input-number v-model="intelligentProtocolRoutingForm.capability_ttl_hours" :min="1" :max="8760" controls-position="right" />
+          </el-form-item>
+          <el-form-item label="客户端规则">
+            <el-input v-model="intelligentProtocolRoutingForm.clientRulesText" type="textarea" :rows="3" placeholder="每行：客户端标识|User-Agent 包含文本，例如 deepseek_harness|deepseek-harness" style="max-width: 620px" />
+          </el-form-item>
+          <el-form-item label="提供商模型覆盖">
+            <el-input v-model="intelligentProtocolRoutingForm.overridesText" type="textarea" :rows="3" placeholder="每行：provider|model|protocol1,protocol2" style="max-width: 620px" />
+            <div class="form-tip">仅用于异常上游的人工覆盖；协议可填 openai_responses、openai_chat、anthropic_messages。</div>
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" :loading="intelligentProtocolRoutingSaving" @click="saveIntelligentProtocolRoutingConfig">保存配置</el-button>
+            <el-button :loading="protocolCapabilitiesLoading" @click="loadProtocolCapabilities">刷新能力记录</el-button>
+            <el-button type="danger" plain :loading="protocolCapabilitiesClearing" @click="clearProtocolCapabilities">清空能力记录</el-button>
+          </el-form-item>
+        </el-form>
+        <el-form inline class="capability-filter-form">
+          <el-form-item label="Provider"><el-input v-model="protocolCapabilityFilters.provider" clearable /></el-form-item>
+          <el-form-item label="Model"><el-input v-model="protocolCapabilityFilters.model" clearable /></el-form-item>
+          <el-form-item label="Protocol"><el-input v-model="protocolCapabilityFilters.protocol" clearable /></el-form-item>
+          <el-button @click="loadProtocolCapabilities">查询</el-button>
+        </el-form>
+        <el-table :data="protocolCapabilities" size="small" border>
+          <el-table-column prop="provider" label="Provider" width="130" />
+          <el-table-column prop="model_id" label="Model" min-width="180" />
+          <el-table-column prop="protocol" label="Protocol" width="160" />
+          <el-table-column label="结果" width="80"><template #default="scope"><el-tag :type="scope.row.supported ? 'success' : 'danger'">{{ scope.row.supported ? '支持' : '不支持' }}</el-tag></template></el-table-column>
+          <el-table-column prop="source" label="来源" width="90" />
+          <el-table-column prop="status_code" label="状态码" width="80" />
+          <el-table-column prop="updated_at" label="更新时间" min-width="170" />
+        </el-table>
+        <div class="form-tip" style="margin-top: 8px">当前记录共 {{ protocolCapabilitiesTotal }} 条。认证、限流、超时和 5xx 等异常不会被误记为协议不支持。</div>
+      </div>
+    </el-card>
+
     <!-- 用量保留期配置 -->
     <el-card class="setting-card" shadow="never">
       <template #header>
@@ -1025,6 +1077,7 @@ const expandedCards = reactive({
   thinkingMode: savedCardState.thinkingMode ?? false,
   usageRetention: savedCardState.usageRetention ?? false,
   retrySameKey: savedCardState.retrySameKey ?? false,
+  intelligentProtocolRouting: savedCardState.intelligentProtocolRouting ?? false,
   factoryReset: savedCardState.factoryReset ?? false,
 })
 
@@ -1184,6 +1237,88 @@ const saveUsageRetentionConfig = async () => {
 // 同 Key 重试配置
 const retrySameKeyProvidersText = ref('')
 const retrySameKeySaving = ref(false)
+
+const intelligentProtocolRoutingLoading = ref(false)
+const intelligentProtocolRoutingSaving = ref(false)
+const protocolCapabilitiesLoading = ref(false)
+const protocolCapabilitiesClearing = ref(false)
+const protocolCapabilities = ref([])
+const protocolCapabilitiesTotal = ref(0)
+const protocolCapabilityFilters = reactive({ provider: '', model: '', protocol: '' })
+const intelligentProtocolRoutingForm = reactive({
+  enabled: false,
+  models_dev_enabled: true,
+  models_dev_refresh_hours: 24,
+  capability_ttl_hours: 240,
+  clientRulesText: '',
+  overridesText: '',
+})
+
+const loadIntelligentProtocolRoutingConfig = async () => {
+  intelligentProtocolRoutingLoading.value = true
+  try {
+    const data = await adminApi.getIntelligentProtocolRoutingConfig()
+    intelligentProtocolRoutingForm.enabled = data?.enabled === true
+    intelligentProtocolRoutingForm.models_dev_enabled = data?.models_dev_enabled !== false
+    intelligentProtocolRoutingForm.models_dev_refresh_hours = Number(data?.models_dev_refresh_hours || 24)
+    intelligentProtocolRoutingForm.capability_ttl_hours = Number(data?.capability_ttl_hours || 240)
+    intelligentProtocolRoutingForm.clientRulesText = (data?.client_rules || []).map((r) => `${r.client || ''}|${r.user_agent_contains || ''}`).join('\\n')
+    intelligentProtocolRoutingForm.overridesText = (data?.provider_model_overrides || []).map((r) => `${r.provider || ''}|${r.model || r.model_id || ''}|${(r.protocols || r.protocol || []).join(',')}`).join('\\n')
+  } catch (e) { ElMessage.error(e.message || '加载智能协议路由配置失败') }
+  finally { intelligentProtocolRoutingLoading.value = false }
+}
+
+const saveIntelligentProtocolRoutingConfig = async () => {
+  intelligentProtocolRoutingSaving.value = true
+  try {
+    const client_rules = intelligentProtocolRoutingForm.clientRulesText.split(/\\r?\\n/).map((line) => {
+      const [client, user_agent_contains] = line.split('|').map((s) => s.trim())
+      return client && user_agent_contains ? { client, user_agent_contains } : null
+    }).filter(Boolean)
+    const provider_model_overrides = intelligentProtocolRoutingForm.overridesText.split(/\\r?\\n/).map((line) => {
+      const [provider, model, protocols] = line.split('|').map((s) => s.trim())
+      return provider && model && protocols ? { provider, model, protocols: protocols.split(/[,，]/).map((s) => s.trim()).filter(Boolean) } : null
+    }).filter(Boolean)
+    const data = await adminApi.updateIntelligentProtocolRoutingConfig({
+      enabled: !!intelligentProtocolRoutingForm.enabled,
+      models_dev_enabled: !!intelligentProtocolRoutingForm.models_dev_enabled,
+      models_dev_refresh_hours: intelligentProtocolRoutingForm.models_dev_refresh_hours,
+      capability_ttl_hours: intelligentProtocolRoutingForm.capability_ttl_hours,
+      client_rules,
+      provider_model_overrides,
+    })
+    intelligentProtocolRoutingForm.enabled = data?.enabled === true
+    intelligentProtocolRoutingForm.models_dev_enabled = data?.models_dev_enabled !== false
+    intelligentProtocolRoutingForm.models_dev_refresh_hours = Number(data?.models_dev_refresh_hours || 24)
+    intelligentProtocolRoutingForm.capability_ttl_hours = Number(data?.capability_ttl_hours || 240)
+    intelligentProtocolRoutingForm.clientRulesText = (data?.client_rules || []).map((r) => `${r.client || ''}|${r.user_agent_contains || ''}`).join('\n')
+    intelligentProtocolRoutingForm.overridesText = (data?.provider_model_overrides || []).map((r) => `${r.provider || ''}|${r.model || r.model_id || ''}|${(r.protocols || r.protocol || []).join(',')}`).join('\n')
+    ElMessage.success('智能协议路由配置已保存')
+  } catch (e) { ElMessage.error(e.message || '保存智能协议路由配置失败') }
+  finally { intelligentProtocolRoutingSaving.value = false }
+}
+
+const loadProtocolCapabilities = async () => {
+  protocolCapabilitiesLoading.value = true
+  try {
+    const data = await adminApi.listProtocolCapabilities(protocolCapabilityFilters)
+    protocolCapabilities.value = data?.items || []
+    protocolCapabilitiesTotal.value = Number(data?.total || 0)
+  } catch (e) { ElMessage.error(e.message || '加载协议能力记录失败') }
+  finally { protocolCapabilitiesLoading.value = false }
+}
+
+const clearProtocolCapabilities = async () => {
+  try {
+    await ElMessageBox.confirm('确定清空所有协议能力记录吗？后续请求会重新学习。', '确认清空', { type: 'warning' })
+    protocolCapabilitiesClearing.value = true
+    await adminApi.clearProtocolCapabilities({ ids: [] })
+    await loadProtocolCapabilities()
+    ElMessage.success('协议能力记录已清空')
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || '清空协议能力记录失败')
+  } finally { protocolCapabilitiesClearing.value = false }
+}
 
 const loadRetrySameKeyConfig = async () => {
   try {
@@ -1890,6 +2025,8 @@ onMounted(async () => {
     loadThinkingModeConfig(),
     loadUsageRetentionConfig(),
     loadRetrySameKeyConfig(),
+    loadIntelligentProtocolRoutingConfig(),
+    loadProtocolCapabilities(),
   ])
 })
 </script>
