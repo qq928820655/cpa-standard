@@ -6,12 +6,14 @@ import base64
 import binascii
 import hashlib
 import hmac
+import httpx
 import importlib.util
 import ipaddress
 import json
 import logging
 import os
 import random
+import re
 import struct
 import subprocess
 import urllib.error
@@ -155,11 +157,11 @@ class ApiKeyBatchImportItem(BaseModel):
     base_url: str
     is_active: bool = True
     weight: Optional[int] = Field(default=None, ge=0)
-    enable_proxy: bool = False
+    enable_proxy: Optional[bool] = None
     proxy_url: Optional[str] = None
     proxy_username: Optional[str] = None
     proxy_password: Optional[str] = None
-    enable_fake_ip: bool = False
+    enable_fake_ip: Optional[bool] = None
     fake_ip: Optional[str] = None
     supported_models: Optional[List[str]] = None
     remark: Optional[str] = None
@@ -381,6 +383,13 @@ class ImageModelCreateRequest(BaseModel):
     provider: str = Field(default="openai", min_length=1, max_length=80)
     request_formats: List[str] = Field(default_factory=lambda: ["images"])
     max_count: int = Field(default=1, ge=1, le=4)
+
+
+class ImageModelUpdateRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=120)
+    provider: str = Field(min_length=1, max_length=80)
+    request_formats: List[str]
+    max_count: int = Field(ge=1, le=4)
 
 
 IMAGE_INPUT_ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "image/webp"}
@@ -752,6 +761,22 @@ class ProxyTimeoutConfigUpdate(BaseModel):
     proxy_stream_read_timeout_seconds: int = Field(ge=1)
 
 
+class ProxyRetryConfigResponse(BaseModel):
+    proxy_retry_same_key_enabled: bool
+    proxy_retry_same_key_limit: int
+    proxy_retry_same_key_delay_ms: int
+    proxy_retry_same_key_timeout_seconds: int
+    proxy_retry_total_budget_seconds: int
+
+
+class ProxyRetryConfigUpdate(BaseModel):
+    proxy_retry_same_key_enabled: bool = True
+    proxy_retry_same_key_limit: int = Field(1, ge=0, le=3)
+    proxy_retry_same_key_delay_ms: int = Field(100, ge=0, le=5000)
+    proxy_retry_same_key_timeout_seconds: int = Field(20, ge=1, le=180)
+    proxy_retry_total_budget_seconds: int = Field(60, ge=1, le=600)
+
+
 class ContentGuardConfigResponse(BaseModel):
     enabled: bool = False
     check_ads: bool = True
@@ -817,12 +842,18 @@ class KeyCheckShortcutModelsUpdate(BaseModel):
 class ProxySessionConfigResponse(BaseModel):
     enabled: bool
     ttl_seconds: int
+    fallback_enabled: bool
+    protocol_aware: bool
+    profile_aware: bool
     binding_count: int
 
 
 class ProxySessionConfigUpdate(BaseModel):
     enabled: bool
     ttl_seconds: int = Field(ge=1)
+    fallback_enabled: bool = False
+    protocol_aware: bool = True
+    profile_aware: bool = True
 
 
 class ProviderListResponse(BaseModel):
@@ -3344,7 +3375,17 @@ def get_custom_image_model_options() -> list[dict]:
 
 
 def get_all_image_model_options() -> list[dict]:
-    return [*IMAGE_MODEL_OPTIONS, *get_custom_image_model_options()]
+    overrides = export_config.get("image_model_overrides") or {}
+    items = []
+    for item in IMAGE_MODEL_OPTIONS:
+        override = overrides.get(item["model"]) if isinstance(overrides, dict) else None
+        if isinstance(override, dict):
+            formats = [value for value in override.get("request_formats") or [] if value in {"images", "chat", "responses"}]
+            if formats:
+                items.append({**item, **override, "model": item["model"], "request_formats": formats, "candidate_request_formats": formats})
+                continue
+        items.append(item)
+    return [*items, *get_custom_image_model_options()]
 
 
 def get_image_model_config(model: str) -> dict:
@@ -4119,6 +4160,56 @@ async def create_image_model(
         max_count=data.max_count,
         available_key_count=len(available_keys),
         total_remaining_image_count=await calculate_total_remaining_image_count(db, available_keys, model),
+    )
+
+
+@router.put("/image/models/{model}", response_model=ImageModelOption)
+async def update_image_model(
+    model: str,
+    data: ImageModelUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin_access),
+):
+    """修改图片广场模型配置。"""
+    model_name = normalize_model_name(model)
+    if not any(item["model"] == model_name for item in get_all_image_model_options()):
+        raise HTTPException(status_code=404, detail="图片模型不存在")
+    display_name = data.display_name.strip()
+    provider = data.provider.strip()
+    formats = []
+    for item in data.request_formats:
+        value = str(item).strip().lower()
+        if value in {"images", "chat", "responses"} and value not in formats:
+            formats.append(value)
+    if not display_name or not provider or not formats:
+        raise HTTPException(status_code=400, detail="显示名称、提供商和请求格式不能为空")
+
+    updated = {
+        "display_name": display_name,
+        "provider": provider,
+        "request_formats": formats,
+        "max_count": data.max_count,
+    }
+    if any(item["model"] == model_name for item in IMAGE_MODEL_OPTIONS):
+        overrides = dict(export_config.get("image_model_overrides") or {})
+        overrides[model_name] = updated
+        export_config["image_model_overrides"] = overrides
+    else:
+        custom_models = list(export_config.get("custom_image_models") or [])
+        for index, item in enumerate(custom_models):
+            if isinstance(item, dict) and normalize_model_name(str(item.get("model") or "")) == model_name:
+                custom_models[index] = {**item, **updated}
+                break
+        export_config["custom_image_models"] = custom_models
+    persist_export_config()
+
+    config = get_image_model_config(model_name)
+    keys = await pool_manager.get_all_keys(db, active_only=True)
+    available_keys = [key for key in keys if key_supports_image_model(key, model_name)]
+    return ImageModelOption(
+        **config,
+        available_key_count=len(available_keys),
+        total_remaining_image_count=await calculate_total_remaining_image_count(db, available_keys, model_name),
     )
 
 
@@ -5450,6 +5541,33 @@ async def get_image_key_stats(
     return ImageKeyStatsResponse(items=items)
 
 
+@router.get("/proxy-session-config", response_model=ProxySessionConfigResponse)
+async def get_proxy_session_config(
+    _: dict = Depends(require_admin_access),
+):
+    return ProxySessionConfigResponse(
+        enabled=settings.proxy_session_sticky_enabled,
+        ttl_seconds=settings.proxy_session_sticky_ttl_seconds,
+        fallback_enabled=settings.proxy_session_sticky_fallback_enabled,
+        protocol_aware=settings.proxy_session_protocol_aware,
+        profile_aware=settings.proxy_session_profile_aware,
+        binding_count=pool_manager.get_session_binding_count(),
+    )
+
+
+@router.put("/proxy-session-config", response_model=ProxySessionConfigResponse)
+async def update_proxy_session_config(
+    data: ProxySessionConfigUpdate,
+    _: dict = Depends(require_admin_access),
+):
+    settings.proxy_session_sticky_enabled = data.enabled
+    settings.proxy_session_sticky_ttl_seconds = data.ttl_seconds
+    settings.proxy_session_sticky_fallback_enabled = data.fallback_enabled
+    settings.proxy_session_protocol_aware = data.protocol_aware
+    settings.proxy_session_profile_aware = data.profile_aware
+    return await get_proxy_session_config(_)
+
+
 @router.get("/key-cooldown-config", response_model=KeyCooldownConfigResponse)
 async def get_key_cooldown_config(
     _: dict = Depends(require_admin_access),
@@ -5493,6 +5611,30 @@ async def update_proxy_timeout_config(
     settings.proxy_stream_first_byte_timeout_seconds = payload["proxy_stream_first_byte_timeout_seconds"]
     settings.proxy_stream_read_timeout_seconds = payload["proxy_stream_read_timeout_seconds"]
     return ProxyTimeoutConfigResponse(**payload)
+
+
+@router.get("/proxy-retry-config", response_model=ProxyRetryConfigResponse)
+async def get_proxy_retry_config(
+    _: dict = Depends(require_admin_access),
+):
+    return ProxyRetryConfigResponse(
+        proxy_retry_same_key_enabled=settings.proxy_retry_same_key_enabled,
+        proxy_retry_same_key_limit=settings.proxy_retry_same_key_limit,
+        proxy_retry_same_key_delay_ms=settings.proxy_retry_same_key_delay_ms,
+        proxy_retry_same_key_timeout_seconds=settings.proxy_retry_same_key_timeout_seconds,
+        proxy_retry_total_budget_seconds=settings.proxy_retry_total_budget_seconds,
+    )
+
+
+@router.put("/proxy-retry-config", response_model=ProxyRetryConfigResponse)
+async def update_proxy_retry_config(
+    data: ProxyRetryConfigUpdate,
+    _: dict = Depends(require_admin_access),
+):
+    payload = data.model_dump()
+    for key, value in payload.items():
+        setattr(settings, key, value)
+    return ProxyRetryConfigResponse(**payload)
 
 
 @router.get("/content-guard-config", response_model=ContentGuardConfigResponse)
@@ -5883,20 +6025,25 @@ async def import_keys(
         serialized_models = dumps_json_list(supported_models)
         should_update_weight = "weight" in item.model_fields_set
         generated_fake_ip = next(auto_fake_ip_values) if import_item_needs_auto_fake_ip(item) else None
-        proxy_fields = build_proxy_fields(item)
-        fake_ip_fields = build_import_fake_ip_fields(item, generated_fake_ip)
+        import_fields = item.model_fields_set
+        should_update_proxy = bool(import_fields & {"enable_proxy", "proxy_url", "proxy_username", "proxy_password"})
+        should_update_fake_ip = bool(import_fields & {"enable_fake_ip", "fake_ip"}) or generated_fake_ip is not None
+        proxy_fields = build_proxy_fields(item) if should_update_proxy else None
+        fake_ip_fields = build_import_fake_ip_fields(item, generated_fake_ip) if should_update_fake_ip else None
 
         if matched_key:
             matched_key.api_key = normalized_api_key
             matched_key.api_type = normalize_api_type(item.api_type)
             matched_key.base_url = normalized_base_url
             matched_key.supported_models = serialized_models
-            matched_key.enable_proxy = proxy_fields["enable_proxy"]
-            matched_key.proxy_url = proxy_fields["proxy_url"]
-            matched_key.proxy_username = proxy_fields["proxy_username"]
-            matched_key.proxy_password = proxy_fields["proxy_password"]
-            matched_key.enable_fake_ip = fake_ip_fields["enable_fake_ip"]
-            matched_key.fake_ip = fake_ip_fields["fake_ip"]
+            if proxy_fields is not None:
+                matched_key.enable_proxy = proxy_fields["enable_proxy"]
+                matched_key.proxy_url = proxy_fields["proxy_url"]
+                matched_key.proxy_username = proxy_fields["proxy_username"]
+                matched_key.proxy_password = proxy_fields["proxy_password"]
+            if fake_ip_fields is not None:
+                matched_key.enable_fake_ip = fake_ip_fields["enable_fake_ip"]
+                matched_key.fake_ip = fake_ip_fields["fake_ip"]
             if should_update_weight:
                 matched_key.weight = item.weight
             if item.password is not None:
@@ -5921,8 +6068,8 @@ async def import_keys(
             remark=item.remark,
             password=item.password,
             wz_url=item.wz_url,
-            **proxy_fields,
-            **fake_ip_fields,
+            **(proxy_fields or build_proxy_fields(item)),
+            **(fake_ip_fields or build_import_fake_ip_fields(item, generated_fake_ip)),
         )
         db.add(key)
         processed_items.append(key)
@@ -6952,9 +7099,55 @@ class ModelsDevPricingSyncResponse(BaseModel):
 
 
 def normalize_model_id_for_pricing(model_id: str) -> str:
-    """将模型名称转换为 models.dev 价格匹配键。"""
-    value = str(model_id or "").rsplit("/", 1)[-1].split(":", 1)[0].replace("@", "-").strip().lower()
-    return value.removesuffix("[1m]").strip()
+    """去除路由标签后生成 models.dev 价格匹配键。"""
+    value = str(model_id or "").strip()
+    while value:
+        match = re.match(r"^(?:\{[^{}]*\}|\[[^\[\]]*\])", value)
+        if not match:
+            break
+        value = value[match.end():].strip()
+    value = value.rsplit("/", 1)[-1].split(":", 1)[0].replace("@", "-").strip().lower()
+    while re.search(r"\[[^\[\]]*\]$", value):
+        value = re.sub(r"\[[^\[\]]*\]$", "", value).strip()
+    return value
+
+
+OFFICIAL_PRICING_PROVIDERS = {
+    "claude": ("anthropic",),
+    "gpt": ("openai",),
+    "deepseek": ("deepseek",),
+    "glm": ("zai",),
+    "kimi": ("moonshotai", "moonshot-ai", "kimi-for-coding"),
+    "qwen": ("alibaba", "alibaba-cn"),
+}
+
+
+def get_official_pricing_provider(model_id: str) -> tuple[str, ...]:
+    """按模型系列返回官方定价来源优先级。"""
+    normalized = normalize_model_id_for_pricing(model_id)
+    for prefix, providers in OFFICIAL_PRICING_PROVIDERS.items():
+        if normalized.startswith(prefix):
+            return providers
+    return ()
+
+
+def select_models_dev_cost(model_id: str, candidates: list[tuple[str, dict]]) -> Optional[dict]:
+    """从同名模型的多个 models.dev 来源中选择官方非 plan 价格。"""
+    official_providers = get_official_pricing_provider(model_id)
+    if official_providers:
+        for official_provider in official_providers:
+            for provider_id, cost in candidates:
+                normalized_provider = str(provider_id or "").strip().lower()
+                if normalized_provider != official_provider:
+                    continue
+                if "plan" not in normalized_provider and "plan" not in str(cost.get("name") or "").lower():
+                    return cost
+
+    non_plan = [
+        cost for provider_id, cost in candidates
+        if "plan" not in str(provider_id or "").strip().lower()
+    ]
+    return non_plan[0] if non_plan else (candidates[0][1] if candidates else None)
 
 
 @router.get("/models/pricing-config", response_model=ModelPriceDisplayConfig)
@@ -6989,16 +7182,20 @@ async def sync_models_dev_pricing(
     from models import ModelCatalog
 
     source_url = "https://models.dev/api.json"
-    request = urllib.request.Request(source_url, headers={"Accept": "application/json", "User-Agent": "CPA"})
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            source_data = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+        timeout = httpx.Timeout(connect=5, read=15, write=15, pool=5)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(source_url, headers={"Accept": "application/json", "User-Agent": "CPA"})
+            response.raise_for_status()
+            if len(response.content) > 20 * 1024 * 1024:
+                raise ValueError("models.dev 响应超过 20MB 限制")
+            source_data = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=f"cpa_获取 models.dev 定价失败: {exc}") from exc
 
-    pricing_by_model: dict[str, dict] = {}
+    pricing_candidates_by_model: dict[str, list[tuple[str, dict]]] = {}
     if isinstance(source_data, dict):
-        for provider in source_data.values():
+        for provider_id, provider in source_data.items():
             if not isinstance(provider, dict):
                 continue
             for model_id, item in (provider.get("models") or {}).items():
@@ -7007,7 +7204,13 @@ async def sync_models_dev_pricing(
                 cost = item["cost"]
                 if not isinstance(cost.get("input"), (int, float)) and not isinstance(cost.get("output"), (int, float)):
                     continue
-                pricing_by_model.setdefault(normalize_model_id_for_pricing(model_id), cost)
+                normalized_model = normalize_model_id_for_pricing(model_id)
+                pricing_candidates_by_model.setdefault(normalized_model, []).append((str(provider_id), cost))
+
+    pricing_by_model = {
+        model_id: select_models_dev_cost(model_id, candidates)
+        for model_id, candidates in pricing_candidates_by_model.items()
+    }
 
     models = (await db.execute(select(ModelCatalog))).scalars().all()
     updated_count = 0
@@ -8055,6 +8258,15 @@ class ProtocolCapabilityClearRequest(BaseModel):
     ids: List[int] = Field(default_factory=list)
 
 
+class ProtocolCapabilityUpdate(BaseModel):
+    supported: bool
+    request_profile: str = Field(default="default", min_length=1, max_length=30)
+    source: str = Field(default="manual", min_length=1, max_length=30)
+    status_code: Optional[int] = Field(default=None, ge=100, le=599)
+    detail: Optional[str] = Field(default=None, max_length=10000)
+    expires_at: Optional[datetime] = None
+
+
 def _parse_trace_json(value: Optional[str]) -> Any:
     if not value:
         return None
@@ -8125,6 +8337,23 @@ async def list_protocol_capabilities(
         items=[ProtocolCapabilityItem.model_validate(row, from_attributes=True) for row in rows],
         total=total,
     )
+
+
+@router.put("/protocol-capabilities/{capability_id}", response_model=ProtocolCapabilityItem)
+async def update_protocol_capability(
+    capability_id: int,
+    data: ProtocolCapabilityUpdate,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_admin_access),
+):
+    row = await protocol_routing_service.update_capability(
+        db,
+        capability_id,
+        **data.model_dump(),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="协议能力记录不存在")
+    return ProtocolCapabilityItem.model_validate(row, from_attributes=True)
 
 
 @router.delete("/protocol-capabilities", response_model=ProxyTraceCleanupResponse)
@@ -8468,6 +8697,56 @@ async def update_usage_retention_config(
         usage_log_retention_days=export_config["usage_log_retention_days"],
         usage_summary_retention_days=export_config["usage_summary_retention_days"],
     )
+
+
+# ============ Claude 上下文管理兼容配置 ============
+
+class ContextManagementCompatRule(BaseModel):
+    enabled: bool = False
+    providers: List[str] = Field(default_factory=list)
+    models: List[str] = Field(default_factory=lambda: ["sonnet-4.6*", "sonnet-5*"])
+
+
+class ContextManagementCompatConfigResponse(BaseModel):
+    rules: List[ContextManagementCompatRule]
+
+
+class ContextManagementCompatConfigUpdate(BaseModel):
+    rules: List[ContextManagementCompatRule]
+
+
+@router.get("/context-management-compat-config", response_model=ContextManagementCompatConfigResponse)
+async def get_context_management_compat_config(
+    _: dict = Depends(require_admin_access),
+):
+    """获取旧 Claude 上游的 context_management 兼容规则。"""
+    raw_rules = export_config.get("context_management_compat_rules") or []
+    rules = []
+    for item in raw_rules:
+        if not isinstance(item, dict):
+            continue
+        rules.append(ContextManagementCompatRule(
+            enabled=bool(item.get("enabled", False)),
+            providers=[str(value).strip().lower() for value in item.get("providers") or [] if str(value).strip()],
+            models=[str(value).strip() for value in item.get("models") or [] if str(value).strip()] or ["sonnet-4.6*", "sonnet-5*"],
+        ))
+    return ContextManagementCompatConfigResponse(rules=rules)
+
+
+@router.put("/context-management-compat-config", response_model=ContextManagementCompatConfigResponse)
+async def update_context_management_compat_config(
+    data: ContextManagementCompatConfigUpdate,
+    _: dict = Depends(require_admin_access),
+):
+    """更新旧 Claude 上游的 context_management 兼容规则。"""
+    rules = [{
+        "enabled": rule.enabled,
+        "providers": [value.strip().lower() for value in rule.providers if value.strip()],
+        "models": [value.strip() for value in rule.models if value.strip()] or ["sonnet-4.6*", "sonnet-5*"],
+    } for rule in data.rules]
+    export_config["context_management_compat_rules"] = rules
+    persist_export_config()
+    return ContextManagementCompatConfigResponse(rules=[ContextManagementCompatRule(**rule) for rule in rules])
 
 
 # ============ 同 Key 重试配置 ============

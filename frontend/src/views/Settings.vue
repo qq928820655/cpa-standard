@@ -586,6 +586,30 @@
       </div>
     </el-card>
 
+    <!-- 会话粘滞配置 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('proxySession')">
+          <div class="setting-card-header-text">
+            <div class="panel-title">会话粘滞配置</div>
+            <div class="panel-subtitle">让同一客户端会话尽量复用同一个 Key，并区分协议和图片请求，提升长前缀缓存命中率</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.proxySession }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.proxySession" class="setting-card-body">
+        <el-form label-width="170px" v-loading="proxySessionLoading">
+          <el-form-item label="会话粘滞开关"><el-switch v-model="proxySessionForm.enabled" active-text="开启" inactive-text="关闭" /></el-form-item>
+          <el-form-item label="协议感知"><el-switch v-model="proxySessionForm.protocol_aware" active-text="开启" inactive-text="关闭" /><div class="form-tip">Chat、Responses、Messages 使用不同绑定，避免协议变化破坏缓存前缀。</div></el-form-item>
+          <el-form-item label="请求特征感知"><el-switch v-model="proxySessionForm.profile_aware" active-text="开启" inactive-text="关闭" /><div class="form-tip">普通文本和图片请求使用不同绑定。</div></el-form-item>
+          <el-form-item label="无会话标识时 fallback"><el-switch v-model="proxySessionForm.fallback_enabled" active-text="开启" inactive-text="关闭" /><div class="form-tip">默认关闭。开启后会基于客户端、认证用户和模型生成备用绑定键。</div></el-form-item>
+          <el-form-item label="绑定有效期（秒）"><el-input-number v-model="proxySessionForm.ttl_seconds" :min="1" :max="604800" controls-position="right" /></el-form-item>
+          <el-form-item label="当前绑定数"><span>{{ proxySessionForm.binding_count }}</span><el-button link type="primary" @click="loadProxySessionConfig">刷新</el-button></el-form-item>
+          <el-form-item><el-button type="primary" :loading="proxySessionSaving" @click="saveProxySessionConfig">保存会话粘滞配置</el-button></el-form-item>
+        </el-form>
+      </div>
+    </el-card>
+
     <!-- 代理调试追踪 -->
     <el-card class="setting-card" shadow="never">
       <template #header>
@@ -743,6 +767,34 @@
       </div>
     </el-card>
 
+    <!-- Claude context_management 兼容配置 -->
+    <el-card class="setting-card" shadow="never">
+      <template #header>
+        <div class="setting-card-header" @click="toggleCard('contextManagementCompat')">
+          <div class="setting-card-header-text">
+            <div class="panel-title">Claude context_management 兼容</div>
+            <div class="panel-subtitle">仅对指定 Provider 的旧 Sonnet 模型移除不支持的 context_management 字段</div>
+          </div>
+          <el-icon class="setting-card-arrow" :class="{ 'is-expanded': expandedCards.contextManagementCompat }"><ArrowDown /></el-icon>
+        </div>
+      </template>
+      <div v-show="expandedCards.contextManagementCompat" class="setting-card-body">
+        <div v-for="(rule, idx) in contextManagementCompatRules" :key="idx" style="margin-bottom: 16px; padding: 12px; border: 1px solid #e4e7ed; border-radius: 6px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+            <span style="font-weight: 600; color: #303133;">规则 #{{ idx + 1 }}</span>
+            <el-button type="danger" text size="small" @click="removeContextManagementCompatRule(idx)">删除</el-button>
+          </div>
+          <el-form label-width="120px" size="small">
+            <el-form-item label="启用"><el-switch v-model="rule.enabled" active-text="是" inactive-text="否" /></el-form-item>
+            <el-form-item label="Provider"><el-input v-model="rule.providersText" placeholder="必填，逗号分隔（如 by_cla,bb）" style="max-width: 420px" /><div class="form-tip">只匹配 Key 管理中相同的 Provider 名称；留空时该规则不会生效。</div></el-form-item>
+            <el-form-item label="模型通配符"><el-input v-model="rule.modelsText" placeholder="sonnet-4.6*,sonnet-5*" style="max-width: 420px" /><div class="form-tip">仅命中这些模型才删除 context_management；支持 * 通配符，不影响其他 Claude 模型。</div></el-form-item>
+          </el-form>
+        </div>
+        <el-button type="primary" text @click="addContextManagementCompatRule">+ 添加规则</el-button>
+        <div style="margin-top: 12px;"><el-button type="primary" :loading="contextManagementCompatSaving" @click="saveContextManagementCompatConfig">保存兼容配置</el-button></div>
+      </div>
+    </el-card>
+
     <!-- 智能协议路由配置 -->
     <el-card class="setting-card" shadow="never">
       <template #header>
@@ -772,26 +824,9 @@
           </el-form-item>
           <el-form-item>
             <el-button type="primary" :loading="intelligentProtocolRoutingSaving" @click="saveIntelligentProtocolRoutingConfig">保存配置</el-button>
-            <el-button :loading="protocolCapabilitiesLoading" @click="loadProtocolCapabilities">刷新能力记录</el-button>
-            <el-button type="danger" plain :loading="protocolCapabilitiesClearing" @click="clearProtocolCapabilities">清空能力记录</el-button>
+            <div class="form-tip">协议能力记录请在“模型广场”的“协议能力”中查看和编辑。</div>
           </el-form-item>
         </el-form>
-        <el-form inline class="capability-filter-form">
-          <el-form-item label="Provider"><el-input v-model="protocolCapabilityFilters.provider" clearable /></el-form-item>
-          <el-form-item label="Model"><el-input v-model="protocolCapabilityFilters.model" clearable /></el-form-item>
-          <el-form-item label="Protocol"><el-input v-model="protocolCapabilityFilters.protocol" clearable /></el-form-item>
-          <el-button @click="loadProtocolCapabilities">查询</el-button>
-        </el-form>
-        <el-table :data="protocolCapabilities" size="small" border>
-          <el-table-column prop="provider" label="Provider" width="130" />
-          <el-table-column prop="model_id" label="Model" min-width="180" />
-          <el-table-column prop="protocol" label="Protocol" width="160" />
-          <el-table-column label="结果" width="80"><template #default="scope"><el-tag :type="scope.row.supported ? 'success' : 'danger'">{{ scope.row.supported ? '支持' : '不支持' }}</el-tag></template></el-table-column>
-          <el-table-column prop="source" label="来源" width="90" />
-          <el-table-column prop="status_code" label="状态码" width="80" />
-          <el-table-column prop="updated_at" label="更新时间" min-width="170" />
-        </el-table>
-        <div class="form-tip" style="margin-top: 8px">当前记录共 {{ protocolCapabilitiesTotal }} 条。认证、限流、超时和 5xx 等异常不会被误记为协议不支持。</div>
       </div>
     </el-card>
 
@@ -1075,8 +1110,10 @@ const expandedCards = reactive({
   proxyTrace: savedCardState.proxyTrace ?? false,
   modelSeed: savedCardState.modelSeed ?? false,
   thinkingMode: savedCardState.thinkingMode ?? false,
+  contextManagementCompat: savedCardState.contextManagementCompat ?? false,
   usageRetention: savedCardState.usageRetention ?? false,
   retrySameKey: savedCardState.retrySameKey ?? false,
+  proxySession: savedCardState.proxySession ?? false,
   intelligentProtocolRouting: savedCardState.intelligentProtocolRouting ?? false,
   factoryReset: savedCardState.factoryReset ?? false,
 })
@@ -1121,6 +1158,48 @@ const runtimeLogLoading = ref(false)
 const runtimeLogSaving = ref(false)
 const runtimeLogEnabled = ref(false)
 const runtimeLogWrap = ref(false)
+
+// 代理调试追踪
+const proxySessionLoading = ref(false)
+const proxySessionSaving = ref(false)
+const proxySessionForm = reactive({
+  enabled: true,
+  ttl_seconds: 3600,
+  fallback_enabled: false,
+  protocol_aware: true,
+  profile_aware: true,
+  binding_count: 0,
+})
+
+const loadProxySessionConfig = async () => {
+  proxySessionLoading.value = true
+  try {
+    const data = await adminApi.getProxySessionConfig()
+    proxySessionForm.enabled = data?.enabled !== false
+    proxySessionForm.ttl_seconds = Number(data?.ttl_seconds || 3600)
+    proxySessionForm.fallback_enabled = data?.fallback_enabled === true
+    proxySessionForm.protocol_aware = data?.protocol_aware !== false
+    proxySessionForm.profile_aware = data?.profile_aware !== false
+    proxySessionForm.binding_count = Number(data?.binding_count || 0)
+  } catch (e) { ElMessage.error(e.message || '加载会话粘滞配置失败') }
+  finally { proxySessionLoading.value = false }
+}
+
+const saveProxySessionConfig = async () => {
+  proxySessionSaving.value = true
+  try {
+    const data = await adminApi.updateProxySessionConfig({
+      enabled: !!proxySessionForm.enabled,
+      ttl_seconds: proxySessionForm.ttl_seconds,
+      fallback_enabled: !!proxySessionForm.fallback_enabled,
+      protocol_aware: !!proxySessionForm.protocol_aware,
+      profile_aware: !!proxySessionForm.profile_aware,
+    })
+    proxySessionForm.binding_count = Number(data?.binding_count || 0)
+    ElMessage.success('会话粘滞配置已保存')
+  } catch (e) { ElMessage.error(e.message || '保存会话粘滞配置失败') }
+  finally { proxySessionSaving.value = false }
+}
 
 // 代理调试追踪
 const proxyTraceLoading = ref(false)
@@ -1199,6 +1278,45 @@ const saveThinkingModeConfig = async () => {
   finally { thinkingModeSaving.value = false }
 }
 
+// Claude context_management 兼容规则
+const contextManagementCompatRules = ref([])
+const contextManagementCompatSaving = ref(false)
+const defaultContextManagementCompatRule = () => ({ enabled: false, providersText: '', modelsText: 'sonnet-4.6*,sonnet-5*' })
+const addContextManagementCompatRule = () => contextManagementCompatRules.value.push(defaultContextManagementCompatRule())
+const removeContextManagementCompatRule = (index) => contextManagementCompatRules.value.splice(index, 1)
+const loadContextManagementCompatConfig = async () => {
+  try {
+    const data = await adminApi.getContextManagementCompatConfig()
+    const rules = data?.rules || []
+    contextManagementCompatRules.value = rules.length ? rules.map((rule) => ({
+      enabled: rule.enabled === true,
+      providersText: (rule.providers || []).join(','),
+      modelsText: (rule.models || []).join(','),
+    })) : [defaultContextManagementCompatRule()]
+  } catch {
+    contextManagementCompatRules.value = [defaultContextManagementCompatRule()]
+  }
+}
+const saveContextManagementCompatConfig = async () => {
+  contextManagementCompatSaving.value = true
+  try {
+    const rules = contextManagementCompatRules.value.map((rule) => ({
+      enabled: !!rule.enabled,
+      providers: rule.providersText.split(/[,，]/).map((value) => value.trim()).filter(Boolean),
+      models: rule.modelsText.split(/[,，]/).map((value) => value.trim()).filter(Boolean),
+    }))
+    const data = await adminApi.updateContextManagementCompatConfig({ rules })
+    contextManagementCompatRules.value = (data?.rules || []).map((rule) => ({
+      enabled: rule.enabled === true,
+      providersText: (rule.providers || []).join(','),
+      modelsText: (rule.models || []).join(','),
+    }))
+    if (!contextManagementCompatRules.value.length) contextManagementCompatRules.value = [defaultContextManagementCompatRule()]
+    ElMessage.success('context_management 兼容配置已保存')
+  } catch (error) { ElMessage.error(error.message || '保存 context_management 兼容配置失败') }
+  finally { contextManagementCompatSaving.value = false }
+}
+
 // 用量保留期配置
 const usageRetentionLoading = ref(false)
 const usageRetentionSaving = ref(false)
@@ -1240,11 +1358,6 @@ const retrySameKeySaving = ref(false)
 
 const intelligentProtocolRoutingLoading = ref(false)
 const intelligentProtocolRoutingSaving = ref(false)
-const protocolCapabilitiesLoading = ref(false)
-const protocolCapabilitiesClearing = ref(false)
-const protocolCapabilities = ref([])
-const protocolCapabilitiesTotal = ref(0)
-const protocolCapabilityFilters = reactive({ provider: '', model: '', protocol: '' })
 const intelligentProtocolRoutingForm = reactive({
   enabled: false,
   models_dev_enabled: true,
@@ -1296,28 +1409,6 @@ const saveIntelligentProtocolRoutingConfig = async () => {
     ElMessage.success('智能协议路由配置已保存')
   } catch (e) { ElMessage.error(e.message || '保存智能协议路由配置失败') }
   finally { intelligentProtocolRoutingSaving.value = false }
-}
-
-const loadProtocolCapabilities = async () => {
-  protocolCapabilitiesLoading.value = true
-  try {
-    const data = await adminApi.listProtocolCapabilities(protocolCapabilityFilters)
-    protocolCapabilities.value = data?.items || []
-    protocolCapabilitiesTotal.value = Number(data?.total || 0)
-  } catch (e) { ElMessage.error(e.message || '加载协议能力记录失败') }
-  finally { protocolCapabilitiesLoading.value = false }
-}
-
-const clearProtocolCapabilities = async () => {
-  try {
-    await ElMessageBox.confirm('确定清空所有协议能力记录吗？后续请求会重新学习。', '确认清空', { type: 'warning' })
-    protocolCapabilitiesClearing.value = true
-    await adminApi.clearProtocolCapabilities({ ids: [] })
-    await loadProtocolCapabilities()
-    ElMessage.success('协议能力记录已清空')
-  } catch (e) {
-    if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || '清空协议能力记录失败')
-  } finally { protocolCapabilitiesClearing.value = false }
 }
 
 const loadRetrySameKeyConfig = async () => {
@@ -2021,12 +2112,13 @@ onMounted(async () => {
     loadProviderContinueErrorRules(),
     loadRuntimeLogConfig(),
     loadProxyTraceConfig(),
+    loadProxySessionConfig(),
     loadModelSeedConfig(),
     loadThinkingModeConfig(),
+    loadContextManagementCompatConfig(),
     loadUsageRetentionConfig(),
     loadRetrySameKeyConfig(),
     loadIntelligentProtocolRoutingConfig(),
-    loadProtocolCapabilities(),
   ])
 })
 </script>

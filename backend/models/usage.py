@@ -54,7 +54,7 @@ class UsageDailySummary(Base):
     """按天按 Key 的用量汇总模型"""
     __tablename__ = "usage_daily_summaries"
     __table_args__ = (
-        UniqueConstraint("summary_date", "api_key_id", name="uq_usage_daily_summaries_date_key"),
+        UniqueConstraint("summary_date", "api_key_id", "user_id", name="uq_usage_daily_summaries_date_key_user"),
         Index("ix_usage_daily_summaries_summary_date", "summary_date"),
         Index("ix_usage_daily_summaries_api_key_id", "api_key_id"),
         Index("ix_usage_daily_summaries_user_id", "user_id"),

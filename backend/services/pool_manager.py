@@ -20,6 +20,8 @@ class PoolManager:
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300
     DEFAULT_AUTH_FAILURE_COOLDOWN_SECONDS = 600
     DEFAULT_UPSTREAM_ERROR_COOLDOWN_SECONDS = 120
+    PROVIDER_FAILURE_THRESHOLD = 3
+    PROVIDER_FAILURE_COOLDOWN_SECONDS = 120
 
     def __new__(cls):
         if cls._instance is None:
@@ -35,6 +37,8 @@ class PoolManager:
         # 每个 provider 维护独立的轮询索引
         self._indexes: dict[str, int] = {}
         self._cooldowns: dict[int, datetime] = {}
+        self._provider_failures: dict[str, int] = {}
+        self._provider_cooldowns: dict[str, datetime] = {}
         self._session_bindings: dict[str, dict[str, Any]] = {}
         self._cooldown_config = {
             "rate_limit_cooldown_seconds": self.DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
@@ -44,6 +48,34 @@ class PoolManager:
         }
         self._initialized = True
 
+    def record_provider_failure(self, provider: Optional[str]) -> bool:
+        """记录短暂渠道失败；仅影响后续替代选择，不修改会话绑定。"""
+        provider_key = str(provider or "").strip().lower()
+        if not provider_key:
+            return False
+        failures = self._provider_failures.get(provider_key, 0) + 1
+        self._provider_failures[provider_key] = failures
+        if failures < self.PROVIDER_FAILURE_THRESHOLD:
+            return False
+        self._provider_cooldowns[provider_key] = datetime.utcnow() + timedelta(
+            seconds=self.PROVIDER_FAILURE_COOLDOWN_SECONDS
+        )
+        return True
+
+    def record_provider_success(self, provider: Optional[str]) -> None:
+        provider_key = str(provider or "").strip().lower()
+        if not provider_key:
+            return
+        self._provider_failures.pop(provider_key, None)
+        self._provider_cooldowns.pop(provider_key, None)
+
+    def unhealthy_providers(self) -> list[str]:
+        now = datetime.utcnow()
+        expired = [provider for provider, until in self._provider_cooldowns.items() if until <= now]
+        for provider in expired:
+            self._provider_cooldowns.pop(provider, None)
+            self._provider_failures.pop(provider, None)
+        return list(self._provider_cooldowns)
     def _get_index(self, provider: str) -> int:
         """获取指定 provider 的当前索引"""
         return self._indexes.get(provider, 0)
@@ -511,6 +543,7 @@ class PoolManager:
         providers: Optional[List[str]] = None,
         key_name: Optional[str] = None,
         exclude_providers: Optional[List[str]] = None,
+        exclude_key_names: Optional[List[str]] = None,
         trace_context: Optional[Any] = None,
     ) -> Optional[Any]:
         """
@@ -534,6 +567,7 @@ class PoolManager:
         excluded_ids = set(exclude_key_ids or [])
         provider_values = self._normalize_model_names(providers)
         excluded_provider_values = set(self._normalize_model_names(exclude_providers))
+        excluded_key_name_values = {str(name).strip().lower() for name in (exclude_key_names or []) if str(name).strip()}
         single_filter_provider = provider or (provider_values[0] if provider_values and len(provider_values) == 1 else None)
         self._prune_expired_cooldowns()
         self._prune_expired_session_bindings()
@@ -546,6 +580,7 @@ class PoolManager:
                 "model": model,
                 "exclude_key_ids": sorted(excluded_ids),
                 "exclude_providers": sorted(excluded_provider_values),
+                "exclude_key_names": sorted(excluded_key_name_values),
                 "candidate_count": 0,
                 "eligible_count": 0,
                 "skipped": [],
@@ -562,7 +597,11 @@ class PoolManager:
                 exclude_key_ids=list(excluded_ids),
                 providers=providers,
             )
-            if bound_key:
+            if (
+                bound_key
+                and str(getattr(bound_key, "name", "") or "").strip().lower() not in excluded_key_name_values
+                and str(getattr(bound_key, "provider", "") or "").strip().lower() not in excluded_provider_values
+            ):
                 if trace_context:
                     trace_context.route_summary.setdefault("key_selection", {})["selected"] = {
                         "api_key_id": getattr(bound_key, "id", None),
@@ -581,6 +620,8 @@ class PoolManager:
             query = query.where(ApiKey.provider.notin_(exclude_providers))
         if key_name:
             query = query.where(ApiKey.name == key_name)
+        if excluded_key_name_values:
+            query = query.where(func.lower(ApiKey.name).notin_(excluded_key_name_values))
         query = query.order_by(ApiKey.id)
 
         plan = await self.build_model_match_plan(db, model, providers=provider_values or ([provider] if provider else None))
@@ -602,6 +643,8 @@ class PoolManager:
                     reason = "excluded_provider"
                 elif key_name and getattr(key, "name", None) != key_name:
                     reason = "key_name_mismatch"
+                elif str(getattr(key, "name", "") or "").strip().lower() in excluded_key_name_values:
+                    reason = "excluded_key_name"
                 elif key.id in excluded_ids:
                     reason = "excluded_key"
                 elif self.is_key_cooled_down(key.id):

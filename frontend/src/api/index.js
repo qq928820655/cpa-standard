@@ -7,6 +7,7 @@ const SESSION_ROLE_KEY = 'sessionRole'
 const SESSION_API_KEY_KEY = 'sessionApiKey'
 const CHECK_REQUEST_TIMEOUT = 65000
 const IMAGE_REQUEST_TIMEOUT = 360000
+const STATS_REQUEST_TIMEOUT = 60000
 const IMPORT_REQUEST_TIMEOUT = 300000
 
 const getMasterKey = () => localStorage.getItem(MASTER_KEY_STORAGE_KEY) || ''
@@ -248,6 +249,7 @@ export const adminApi = {
 
   getImageModels: () => api.get('/admin/image/models'),
   createImageModel: (data) => api.post('/admin/image/models', data),
+  updateImageModel: (model, data) => api.put(`/admin/image/models/${encodeURIComponent(model)}`, data),
   getImageCapabilities: () => api.get('/admin/image/capabilities'),
   generateImage: (data) => api.post('/admin/image/generations', data, { timeout: IMAGE_REQUEST_TIMEOUT }),
   validateImageGeneration: (data) => api.post('/admin/image/validate', data, { timeout: data?.probe_only === false ? IMAGE_REQUEST_TIMEOUT : 130000 }),
@@ -270,6 +272,73 @@ export const adminApi = {
   saveImageResultLocal: (id) => api.post(`/admin/image/results/${id}/save-local`, null, { timeout: 180000 }),
   openImageResultFolder: (id) => api.post(`/admin/image/results/${id}/open-folder`),
   revealImageResultFile: (id) => api.post(`/admin/image/results/${id}/reveal-file`),
+
+  listPlugins: () => api.get('/admin/plugins'),
+  listPluginReleases: () => api.get('/admin/plugins/releases'),
+  updatePluginSource: (data) => api.put('/admin/plugins/source', data),
+  installPlugin: (data) => api.post('/admin/plugins/install', data, { timeout: 180000 }),
+  importPlugin: (file) => { const formData = new FormData(); formData.append('file', file); return api.post('/admin/plugins/import', formData, { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 180000 }) },
+  setPluginEnabled: (id, enabled) => api.put(`/admin/plugins/${id}/enabled`, { enabled }),
+  uninstallPlugin: (id) => api.delete(`/admin/plugins/${id}`),
+
+  listVideoStylePresets: () => api.get('/admin/video/style-presets'),
+  getVideoEndpointTemplates: () => api.get('/admin/video/endpoint-templates'),
+  createVideoModel: (data) => api.post('/admin/video/models', data),
+  updateVideoModel: (id, data) => api.put(`/admin/video/models/${id}`, data),
+  deleteVideoModel: (id) => api.delete(`/admin/video/models/${id}`),
+  generateVideo: (data) => api.post('/admin/video/generations', data, { timeout: 150000 }),
+  generateStoryboardVideos: (id, data) => api.post(`/admin/video/creative-projects/${id}/storyboard/generate`, data, { timeout: 600000 }),
+  selectStoryboardVideoCandidate: (projectId, shotIndex, taskId) => api.post(`/admin/video/creative-projects/${projectId}/storyboard/${shotIndex}/select/${taskId}`),
+  listProjectVideoTasks: (id) => api.get(`/admin/video/creative-projects/${id}/tasks`),
+  listVideoTasks: (params) => api.get('/admin/video/tasks', { params }),
+  refreshVideoTask: (id) => api.post(`/admin/video/tasks/${id}/refresh`, null, { timeout: 120000 }),
+  deleteVideoTask: (id) => api.delete(`/admin/video/tasks/${id}`),
+  uploadVideoAsset: (file) => { const formData = new FormData(); formData.append('file', file); return api.post('/admin/video/assets', formData, { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 180000 }) },
+  listCreativeProjects: () => api.get('/admin/video/creative-projects'),
+  getCreativeAgentSources: (model) => api.get('/admin/video/agent-sources', { params: { model } }),
+  createCreativeProject: (data) => api.post('/admin/video/creative-projects', data),
+  updateCreativeProject: (id, data) => api.put(`/admin/video/creative-projects/${id}`, data),
+  runCreativeAgent: (id, data) => api.post(`/admin/video/creative-projects/${id}/agent`, data, { timeout: 300000 }),
+  updateDirectorShot: (id, shotIndex, data) => api.put(`/admin/video/creative-projects/${id}/director/shots/${shotIndex}`, data),
+  createDirectorStoryboard: (id, data) => api.post(`/admin/video/creative-projects/${id}/director/storyboard`, data, { timeout: 300000 }),
+  getDirectorStatus: (id) => api.get(`/admin/video/creative-projects/${id}/director/status`),
+  produceDirectorShots: (id, data) => api.post(`/admin/video/creative-projects/${id}/director/produce`, data, { timeout: 600000 }),
+  autoScheduleDirectorProject: (id, data) => api.post(`/admin/video/creative-projects/${id}/director/auto-schedule`, data, { timeout: 300000 }),
+  deleteCreativeProject: (id) => api.delete(`/admin/video/creative-projects/${id}`),
+  getProjectWorkflow: (id) => api.get(`/admin/video/creative-projects/${id}/workflow`),
+  createProjectWorkflowPlan: (id, data) => api.post(`/admin/video/creative-projects/${id}/workflow/plan`, data, { timeout: 300000 }),
+  reviewProjectWorkflow: (id, data) => api.post(`/admin/video/creative-projects/${id}/workflow/review`, data),
+  listProjectAttachments: (id) => api.get(`/admin/video/creative-projects/${id}/attachments`),
+  uploadProjectAttachment: (id, file) => { const formData = new FormData(); formData.append('file', file); return api.post(`/admin/video/creative-projects/${id}/attachments`, formData, { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 120000 }) },
+  deleteProjectAttachment: (projectId, attachmentId) => api.delete(`/admin/video/creative-projects/${projectId}/attachments/${attachmentId}`),
+  listCreativeProjectRoles: (id) => api.get(`/admin/video/creative-projects/${id}/roles`),
+  saveCreativeProjectRole: (id, role, data) => api.put(`/admin/video/creative-projects/${id}/roles/${role}`, data),
+  listProjectImages: (id) => api.get(`/admin/video/creative-projects/${id}/images`),
+  createProjectImage: (id, data) => api.post(`/admin/video/creative-projects/${id}/images`, data, { timeout: 120000 }),
+  listProjectVoiceProfiles: (id) => api.get(`/admin/video/creative-projects/${id}/voice-profiles`),
+  createProjectVoiceProfile: (id, data) => api.post(`/admin/video/creative-projects/${id}/voice-profiles`, data),
+  updateProjectVoiceProfile: (projectId, profileId, data) => api.put(`/admin/video/creative-projects/${projectId}/voice-profiles/${profileId}`, data),
+  deleteProjectVoiceProfile: (projectId, profileId) => api.delete(`/admin/video/creative-projects/${projectId}/voice-profiles/${profileId}`),
+  listProjectAudio: (id) => api.get(`/admin/video/creative-projects/${id}/audio`),
+  createProjectAudio: (id, data) => api.post(`/admin/video/creative-projects/${id}/audio`, data),
+  updateProjectAudio: (projectId, taskId, data) => api.put(`/admin/video/creative-projects/${projectId}/audio/${taskId}`, data),
+  retryProjectAudio: (projectId, taskId) => api.post(`/admin/video/creative-projects/${projectId}/audio/${taskId}/retry`),
+  deleteProjectAudio: (projectId, taskId) => api.delete(`/admin/video/creative-projects/${projectId}/audio/${taskId}`),
+  updateProjectAudioQueuePosition: (projectId, taskId, position) => api.put(`/admin/video/creative-projects/${projectId}/audio/${taskId}/queue-position`, null, { params: { position } }),
+  listProjectSubtitles: (id) => api.get(`/admin/video/creative-projects/${id}/subtitles`),
+  createProjectSubtitle: (id, data) => api.post(`/admin/video/creative-projects/${id}/subtitles`, data, { timeout: 300000 }),
+  updateProjectSubtitle: (projectId, taskId, data) => api.put(`/admin/video/creative-projects/${projectId}/subtitles/${taskId}`, data),
+  downloadProjectSubtitle: (projectId, taskId) => api.get(`/admin/video/creative-projects/${projectId}/subtitles/${taskId}/file`, { responseType: 'blob' }),
+  listProjectTimeline: (id) => api.get(`/admin/video/creative-projects/${id}/timeline`),
+  addProjectTimelineItem: (id, data) => api.post(`/admin/video/creative-projects/${id}/timeline`, data),
+  updateProjectTimelineItem: (projectId, itemId, data) => api.put(`/admin/video/creative-projects/${projectId}/timeline/${itemId}`, data),
+  deleteProjectTimelineItem: (id, itemId) => api.delete(`/admin/video/creative-projects/${id}/timeline/${itemId}`),
+  getVideoFfmpegPreflight: () => api.get('/admin/video/ffmpeg/preflight'),
+  listProjectExports: (id) => api.get(`/admin/video/creative-projects/${id}/exports`),
+  createProjectExport: (id, data) => api.post(`/admin/video/creative-projects/${id}/exports`, data),
+  downloadProjectExport: (projectId, taskId) => api.get(`/admin/video/creative-projects/${projectId}/exports/${taskId}/file`, { responseType: 'blob' }),
+  downloadProjectExportSubtitle: (projectId, taskId) => api.get(`/admin/video/creative-projects/${projectId}/exports/${taskId}/subtitle`, { responseType: 'blob' }),
+  downloadProjectExportManifest: (projectId, taskId) => api.get(`/admin/video/creative-projects/${projectId}/exports/${taskId}/manifest`, { responseType: 'blob' }),
 
   exportConfig: (model) => api.get('/admin/export-config', { params: { model } }),
 
@@ -332,6 +401,10 @@ export const adminApi = {
   listRuntimeLogs: (params) => api.get('/admin/runtime-logs', { params }),
   clearRuntimeLogs: () => api.delete('/admin/runtime-logs'),
 
+  getProxyRetryConfig: () => api.get('/admin/proxy-retry-config'),
+  updateProxyRetryConfig: (data) => api.put('/admin/proxy-retry-config', data),
+  getProxySessionConfig: () => api.get('/admin/proxy-session-config'),
+  updateProxySessionConfig: (data) => api.put('/admin/proxy-session-config', data),
   getProxyTraceConfig: () => api.get('/admin/proxy-trace-config'),
   updateProxyTraceConfig: (data) => api.put('/admin/proxy-trace-config', data),
   listProxyTraces: (params) => api.get('/admin/proxy-traces', { params }),
@@ -340,10 +413,13 @@ export const adminApi = {
   getIntelligentProtocolRoutingConfig: () => api.get('/admin/intelligent-protocol-routing-config'),
   updateIntelligentProtocolRoutingConfig: (data) => api.put('/admin/intelligent-protocol-routing-config', data),
   listProtocolCapabilities: (params) => api.get('/admin/protocol-capabilities', { params }),
+  updateProtocolCapability: (id, data) => api.put(`/admin/protocol-capabilities/${id}`, data),
   clearProtocolCapabilities: (data) => api.delete('/admin/protocol-capabilities', { data }),
 
   getThinkingModeConfig: () => api.get('/admin/thinking-mode-config'),
   updateThinkingModeConfig: (data) => api.put('/admin/thinking-mode-config', data),
+  getContextManagementCompatConfig: () => api.get('/admin/context-management-compat-config'),
+  updateContextManagementCompatConfig: (data) => api.put('/admin/context-management-compat-config', data),
 
   getUsageRetentionConfig: () => api.get('/admin/usage-retention-config'),
   updateUsageRetentionConfig: (data) => api.put('/admin/usage-retention-config', data),
@@ -420,10 +496,10 @@ export async function copyText(text) {
 }
 
 export const statsApi = {
-  getSummary: (params = {}) => api.get('/stats/summary', { params, paramsSerializer: { serialize: serializeParams } }),
-  getByKey: (params = {}) => api.get('/stats/by-key', { params, paramsSerializer: { serialize: serializeParams } }),
-  getDaily: (params = {}) => api.get('/stats/daily', { params, paramsSerializer: { serialize: serializeParams } }),
-  getLogs: (params) => api.get('/stats/logs', { params, paramsSerializer: { serialize: serializeParams } }),
+  getSummary: (params = {}) => api.get('/stats/summary', { params, timeout: STATS_REQUEST_TIMEOUT, paramsSerializer: { serialize: serializeParams } }),
+  getByKey: (params = {}) => api.get('/stats/by-key', { params, timeout: STATS_REQUEST_TIMEOUT, paramsSerializer: { serialize: serializeParams } }),
+  getDaily: (params = {}) => api.get('/stats/daily', { params, timeout: STATS_REQUEST_TIMEOUT, paramsSerializer: { serialize: serializeParams } }),
+  getLogs: (params) => api.get('/stats/logs', { params, timeout: STATS_REQUEST_TIMEOUT, paramsSerializer: { serialize: serializeParams } }),
 }
 
 export default api

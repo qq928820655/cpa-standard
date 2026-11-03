@@ -1,9 +1,9 @@
 """
 用量追踪服务
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Any
-from sqlalchemy import func, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -270,6 +270,34 @@ class UsageTracker:
 
         await db.commit()
         return persistent_log
+
+    @staticmethod
+    async def recover_stale_in_progress_records(
+        db: AsyncSession,
+        *,
+        max_age_seconds: int = 900,
+    ) -> int:
+        """将超龄未完成记录收尾为错误，不影响 Key 选择或会话绑定。"""
+        from models import UsageLog
+
+        cutoff = datetime.utcnow() - timedelta(seconds=max(60, int(max_age_seconds)))
+        stale_logs = (
+            await db.execute(
+                select(UsageLog.id)
+                .where(
+                    UsageLog.status == "in_progress",
+                    UsageLog.request_time < cutoff,
+                )
+            )
+        ).scalars().all()
+        for log_id in stale_logs:
+            await UsageTracker.finalize_record(
+                db,
+                log_id,
+                status="error",
+                error_message="cpa_request_timeout",
+            )
+        return len(stale_logs)
 
     @staticmethod
     async def record(

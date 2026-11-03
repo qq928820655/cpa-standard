@@ -63,6 +63,12 @@ const routes = [
     component: () => import('./views/ImageSquare.vue'),
   },
   {
+    path: '/plugins',
+    name: 'PluginCenter',
+    component: () => import('./views/PluginCenter.vue'),
+    meta: { requiresAdmin: true },
+  },
+  {
     path: '/openai-plus',
     name: 'OpenAIPlus',
     component: () => import('./views/OpenAIPlus.vue'),
@@ -120,8 +126,8 @@ router.beforeEach(async (to, from, next) => {
         next({ path: '/dashboard' })
         return
       }
-      // 图片广场由管理员按用户授权，未授权时禁止手工访问路由
-      if (to.path === '/images' && !authApi.isAdmin()) {
+      // 图片与视频创作均由管理员按用户授权，未授权时禁止手工访问路由
+      if ((to.path === '/images' || to.path === '/video-world') && !authApi.isAdmin()) {
         try {
           const user = await authApi.getMe()
           if (!user.show_image_square) {

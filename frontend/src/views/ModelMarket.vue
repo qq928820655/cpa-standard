@@ -14,6 +14,7 @@
           <el-option label="人民币" value="CNY" />
         </el-select>
         <el-button @click="pricingDialogVisible = true">汇率</el-button>
+        <el-button :loading="protocolCapabilitiesLoading" @click="openProtocolCapabilities">协议能力</el-button>
         <el-button @click="quickCreateDialogVisible = true">快捷批量创建</el-button>
         <el-button type="primary" @click="showAddDialog">
           <el-icon><Plus /></el-icon>
@@ -185,6 +186,60 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="protocolCapabilitiesDialogVisible" title="协议能力记录" width="min(1180px, 96vw)" top="5vh">
+      <div class="capability-toolbar">
+        <el-input v-model="protocolCapabilityFilters.provider" placeholder="Provider" clearable />
+        <el-input v-model="protocolCapabilityFilters.model" placeholder="Model" clearable />
+        <el-input v-model="protocolCapabilityFilters.protocol" placeholder="Protocol" clearable />
+        <el-button :loading="protocolCapabilitiesLoading" @click="loadProtocolCapabilities">查询</el-button>
+        <el-button type="danger" plain :loading="protocolCapabilitiesClearing" @click="clearProtocolCapabilities">清空</el-button>
+      </div>
+      <div v-if="isMobile" class="capability-mobile-list" v-loading="protocolCapabilitiesLoading">
+        <div v-if="!protocolCapabilities.length" class="capability-empty">暂无能力记录</div>
+        <div v-for="row in protocolCapabilities" :key="row.id" class="capability-mobile-item">
+          <div class="capability-mobile-head">
+            <strong>{{ row.model_id }}</strong>
+            <el-tag :type="row.supported ? 'success' : 'danger'" size="small">{{ row.supported ? '支持' : '不支持' }}</el-tag>
+          </div>
+          <div class="capability-mobile-meta">{{ row.provider }} · {{ row.protocol }} · {{ row.request_profile || 'default' }}</div>
+          <div class="capability-mobile-meta">{{ row.base_url || '-' }}</div>
+          <div class="capability-mobile-meta">来源 {{ row.source || '-' }} · 状态码 {{ row.status_code || '-' }} · {{ row.updated_at || '-' }}</div>
+          <div class="capability-mobile-actions">
+            <el-button size="small" type="primary" @click="editProtocolCapability(row)">编辑</el-button>
+            <el-button size="small" type="danger" plain @click="removeProtocolCapability(row)">删除</el-button>
+          </div>
+        </div>
+      </div>
+      <el-table v-else :data="protocolCapabilities" size="small" border v-loading="protocolCapabilitiesLoading" class="capability-table">
+        <el-table-column prop="provider" label="Provider" width="120" />
+        <el-table-column prop="base_url" label="Base URL" min-width="220" show-overflow-tooltip />
+        <el-table-column prop="model_id" label="Model" min-width="160" />
+        <el-table-column prop="protocol" label="Protocol" width="155" />
+        <el-table-column prop="request_profile" label="特征" width="90" />
+        <el-table-column label="结果" width="78"><template #default="{ row }"><el-tag :type="row.supported ? 'success' : 'danger'" size="small">{{ row.supported ? '支持' : '不支持' }}</el-tag></template></el-table-column>
+        <el-table-column prop="source" label="来源" width="86" />
+        <el-table-column prop="status_code" label="状态码" width="78" />
+        <el-table-column prop="updated_at" label="更新时间" min-width="170" show-overflow-tooltip />
+        <el-table-column label="操作" width="105" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="editProtocolCapability(row)">编辑</el-button><el-button link type="danger" @click="removeProtocolCapability(row)">删除</el-button></template></el-table-column>
+      </el-table>
+      <div class="capability-total">当前记录共 {{ protocolCapabilitiesTotal }} 条</div>
+    </el-dialog>
+
+    <el-dialog v-model="protocolCapabilityEditVisible" title="编辑协议能力记录" width="min(620px, 94vw)">
+      <el-form :model="protocolCapabilityEditForm" label-width="105px">
+        <el-form-item label="Provider"><el-input :model-value="protocolCapabilityEditForm.provider" disabled /></el-form-item>
+        <el-form-item label="Base URL"><el-input :model-value="protocolCapabilityEditForm.base_url" disabled /></el-form-item>
+        <el-form-item label="Model / 协议"><el-input :model-value="`${protocolCapabilityEditForm.model_id} / ${protocolCapabilityEditForm.protocol}`" disabled /></el-form-item>
+        <el-form-item label="请求特征"><el-input v-model="protocolCapabilityEditForm.request_profile" /></el-form-item>
+        <el-form-item label="结果"><el-switch v-model="protocolCapabilityEditForm.supported" active-text="支持" inactive-text="不支持" /></el-form-item>
+        <el-form-item label="来源"><el-input v-model="protocolCapabilityEditForm.source" /></el-form-item>
+        <el-form-item label="状态码"><el-input-number v-model="protocolCapabilityEditForm.status_code" :min="100" :max="599" :controls="false" /></el-form-item>
+        <el-form-item label="过期时间"><el-date-picker v-model="protocolCapabilityEditForm.expires_at" type="datetime" value-format="YYYY-MM-DDTHH:mm:ss" placeholder="留空表示不过期" /></el-form-item>
+        <el-form-item label="详情"><el-input v-model="protocolCapabilityEditForm.detail" type="textarea" :rows="4" /></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="protocolCapabilityEditVisible = false">取消</el-button><el-button type="primary" :loading="protocolCapabilitySaving" @click="saveProtocolCapability">保存</el-button></template>
+    </el-dialog>
+
     <el-dialog v-model="quickCreateDialogVisible" title="快捷批量创建模型" width="640px">
       <div class="form-tip">
         输入模型名，使用英文逗号分隔，例如：gpt-4o, claude-3-7-sonnet, gemini-2.5-pro
@@ -246,7 +301,7 @@
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown } from '@element-plus/icons-vue'
 import { adminApi, authApi } from '../api'
 
@@ -281,6 +336,27 @@ const importDialogVisible = ref(false)
 const quickCreateDialogVisible = ref(false)
 const pricingDialogVisible = ref(false)
 const pricingSyncing = ref(false)
+const protocolCapabilitiesDialogVisible = ref(false)
+const protocolCapabilityEditVisible = ref(false)
+const protocolCapabilitiesLoading = ref(false)
+const protocolCapabilitiesClearing = ref(false)
+const protocolCapabilitySaving = ref(false)
+const protocolCapabilities = ref([])
+const protocolCapabilitiesTotal = ref(0)
+const protocolCapabilityFilters = reactive({ provider: '', model: '', protocol: '' })
+const protocolCapabilityEditForm = reactive({
+  id: null,
+  provider: '',
+  base_url: '',
+  model_id: '',
+  protocol: '',
+  request_profile: 'default',
+  supported: true,
+  source: 'manual',
+  status_code: null,
+  detail: '',
+  expires_at: null,
+})
 const pricingConfig = reactive({
   currency: 'USD',
   exchange_rate_mode: 'fixed',
@@ -389,6 +465,81 @@ const formatPrice = (value) => {
   const amount = pricingConfig.currency === 'CNY' ? usd * exchangeRate : usd
   const prefix = pricingConfig.currency === 'CNY' ? '¥' : '$'
   return `${prefix}${amount.toLocaleString('zh-CN', { maximumFractionDigits: 6 })} / 1M`
+}
+
+const loadProtocolCapabilities = async () => {
+  protocolCapabilitiesLoading.value = true
+  try {
+    const result = await adminApi.listProtocolCapabilities({ ...protocolCapabilityFilters, limit: 500 })
+    protocolCapabilities.value = result?.items || []
+    protocolCapabilitiesTotal.value = Number(result?.total || 0)
+  } catch (error) {
+    ElMessage.error(error.message || '加载协议能力记录失败')
+  } finally {
+    protocolCapabilitiesLoading.value = false
+  }
+}
+
+const openProtocolCapabilities = async () => {
+  protocolCapabilitiesDialogVisible.value = true
+  await loadProtocolCapabilities()
+}
+
+const editProtocolCapability = (row) => {
+  Object.assign(protocolCapabilityEditForm, {
+    ...row,
+    status_code: row.status_code || null,
+    detail: row.detail || '',
+    expires_at: row.expires_at || null,
+  })
+  protocolCapabilityEditVisible.value = true
+}
+
+const saveProtocolCapability = async () => {
+  protocolCapabilitySaving.value = true
+  try {
+    const result = await adminApi.updateProtocolCapability(protocolCapabilityEditForm.id, {
+      supported: !!protocolCapabilityEditForm.supported,
+      request_profile: protocolCapabilityEditForm.request_profile,
+      source: protocolCapabilityEditForm.source,
+      status_code: protocolCapabilityEditForm.status_code,
+      detail: protocolCapabilityEditForm.detail || null,
+      expires_at: protocolCapabilityEditForm.expires_at || null,
+    })
+    const index = protocolCapabilities.value.findIndex((item) => item.id === result.id)
+    if (index >= 0) protocolCapabilities.value[index] = result
+    protocolCapabilityEditVisible.value = false
+    ElMessage.success('协议能力记录已保存')
+  } catch (error) {
+    ElMessage.error(error.message || '保存协议能力记录失败')
+  } finally {
+    protocolCapabilitySaving.value = false
+  }
+}
+
+const removeProtocolCapability = async (row) => {
+  try {
+    await ElMessageBox.confirm('确定删除这条协议能力记录吗？', '确认删除', { type: 'warning' })
+    await adminApi.clearProtocolCapabilities({ ids: [row.id] })
+    await loadProtocolCapabilities()
+    ElMessage.success('协议能力记录已删除')
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error.message || '删除协议能力记录失败')
+  }
+}
+
+const clearProtocolCapabilities = async () => {
+  try {
+    await ElMessageBox.confirm('确定清空所有协议能力记录吗？', '确认清空', { type: 'warning' })
+    protocolCapabilitiesClearing.value = true
+    await adminApi.clearProtocolCapabilities({ ids: [] })
+    await loadProtocolCapabilities()
+    ElMessage.success('协议能力记录已清空')
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error.message || '清空协议能力记录失败')
+  } finally {
+    protocolCapabilitiesClearing.value = false
+  }
 }
 
 const loadPricingConfig = async () => {
@@ -788,6 +939,62 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
+.capability-toolbar {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(140px, 1fr) minmax(140px, 1fr) auto auto;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.capability-table {
+  width: 100%;
+}
+
+.capability-total {
+  margin-top: 10px;
+  color: #8ba0ba;
+  font-size: 12px;
+}
+
+.capability-mobile-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.capability-mobile-item {
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.capability-mobile-head,
+.capability-mobile-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.capability-mobile-meta {
+  margin-top: 6px;
+  color: #60748c;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.capability-mobile-actions {
+  justify-content: flex-start;
+  margin-top: 10px;
+}
+
+.capability-empty {
+  padding: 24px 0;
+  color: #8ba0ba;
+  text-align: center;
+}
+
 .page-title {
   margin: 0;
   color: #303133;
@@ -920,6 +1127,14 @@ onBeforeUnmount(() => {
   .header-actions {
     flex-wrap: wrap;
     gap: 8px;
+  }
+
+  .capability-toolbar {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .capability-toolbar .el-button {
+    width: 100%;
   }
 }
 

@@ -3,11 +3,13 @@
 """
 from typing import Optional, Any
 from datetime import datetime
+import asyncio
 import hashlib
+import json
 import logging
 import time
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -218,59 +220,112 @@ def should_continue_with_same_key(status_code: int, response_data: Any, provider
     return False
 
 
-def get_sticky_session_key(headers: dict, model: Optional[str] = None) -> Optional[str]:
+def get_request_profile(body: Optional[dict]) -> str:
+    """按请求内容区分普通文本和图片请求。"""
+    if not isinstance(body, dict):
+        return "default"
+    serialized = json.dumps(body, ensure_ascii=False)
+    if any(marker in serialized for marker in ('"image_url"', '"input_image"', '"type": "image"', '"type":"image"')):
+        return "vision"
+    return "default"
+
+
+def get_request_protocol(path: str) -> str:
+    normalized = (path or "").lstrip("/")
+    if normalized in {"v1/messages", "messages"}:
+        return "anthropic_messages"
+    if normalized in {"v1/responses", "responses"}:
+        return "openai_responses"
+    if normalized in {"v1/chat/completions", "chat/completions"}:
+        return "openai_chat"
+    return "unknown"
+
+
+def get_sticky_session_key(
+    headers: dict,
+    model: Optional[str] = None,
+    *,
+    path: str = "",
+    body: Optional[dict] = None,
+) -> Optional[str]:
     if not settings.proxy_session_sticky_enabled:
         return None
-    for header_name in STICKY_SESSION_HEADERS:
-        header_value = headers.get(header_name)
-        if header_value:
-            return f"{header_name}:{header_value}"
+    session_value = next((headers.get(name) for name in STICKY_SESSION_HEADERS if headers.get(name)), None)
+    if session_value:
+        client_type = protocol_routing_service.identify_client(headers)
+        protocol = get_request_protocol(path) if settings.proxy_session_protocol_aware else ""
+        profile = get_request_profile(body) if settings.proxy_session_profile_aware else ""
+        raw_key = f"{session_value}\n{client_type}\n{model or ''}\n{protocol}\n{profile}"
+        return "session:" + hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
     if not settings.proxy_session_sticky_fallback_enabled:
         return None
 
     auth = headers.get("authorization") or headers.get("x-api-key") or ""
     user_agent = headers.get("user-agent") or ""
-    model_value = model or ""
-    if not auth and not user_agent and not model_value:
+    if not auth and not user_agent and not model:
         return None
+    protocol = get_request_protocol(path) if settings.proxy_session_protocol_aware else ""
+    profile = get_request_profile(body) if settings.proxy_session_profile_aware else ""
+    raw_key = f"{auth}\n{user_agent}\n{model or ''}\n{protocol}\n{profile}"
+    return "fallback:" + hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
-    raw_key = f"{auth}\n{user_agent}\n{model_value}"
-    digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
-    return f"fallback:{digest}"
+
+class ProviderDirective(list[str]):
+    """携带排除 Provider 信息的正向 Provider 列表。"""
+
+    def __init__(self, providers: list[str] | None = None, excluded_providers: list[str] | None = None, excluded_key_names: list[str] | None = None):
+        super().__init__(providers or [])
+        self.excluded_providers = excluded_providers or []
+        self.excluded_key_names = excluded_key_names or []
+
+    def __bool__(self) -> bool:
+        return bool(len(self) or self.excluded_providers)
 
 
 def _parse_model_directive(raw_model: str) -> tuple[str, list[str], Optional[str]]:
-    """解析模型名中的 {供应商|key名} 指令。
-    返回 (实际模型名, 供应商列表, key名称或None)
-
-    格式：
-      gpt-5.4              → ('gpt-5.4', [], None)
-      {bb}gpt-5.4          → ('gpt-5.4', ['bb'], None)
-      {bb,bbimg}gpt-5.4    → ('gpt-5.4', ['bb', 'bbimg'], None)
-      {bb|etnoet}gpt-5.4   → ('gpt-5.4', ['bb'], 'etnoet')
-    """
+    """解析模型名中的 Provider 和 Key 指令。"""
     import re
     if not raw_model or not raw_model.startswith('{'):
-        return raw_model, [], None
+        return raw_model, ProviderDirective(), None
 
     match = re.match(r'^\{([^}]+)\}(.*)$', raw_model)
     if not match:
-        return raw_model, [], None
+        return raw_model, ProviderDirective(), None
 
     directive = match.group(1).strip()
     actual_model = match.group(2).strip()
-
+    provider_part, separator, key_part = directive.partition('|')
     key_name = None
-    if '|' in directive:
-        parts = directive.split('|', 1)
-        provider_part = parts[0].strip()
-        key_name = parts[1].strip() or None
-    else:
-        provider_part = directive
+    excluded_key_names: list[str] = []
+    if separator:
+        key_part = key_part.strip()
+        if key_part.startswith('!'):
+            excluded_key_names = [value.strip() for value in key_part[1:].split(',') if value.strip()]
+        else:
+            key_name = key_part or None
 
-    providers = [p.strip() for p in provider_part.split(',') if p.strip()]
-    return actual_model, providers, key_name
+    providers: list[str] = []
+    excluded_providers: list[str] = []
+    provider_part = provider_part.strip()
+    if provider_part.startswith('!'):
+        excluded_providers.extend(
+            value.strip().lower()
+            for value in provider_part[1:].split(',')
+            if value.strip()
+        )
+    else:
+        providers.extend(
+            value.strip().lower()
+            for value in provider_part.split(',')
+            if value.strip()
+        )
+
+    providers = list(dict.fromkeys(providers))
+    excluded_providers = list(dict.fromkeys(excluded_providers))
+    if providers:
+        providers = [provider for provider in providers if provider not in excluded_providers]
+    return actual_model, ProviderDirective(providers, excluded_providers, excluded_key_names), key_name
 
 
 def _strip_model_suffix(model: str) -> tuple[str, str]:
@@ -498,7 +553,9 @@ def is_service_unavailable_error(response_data: Any) -> bool:
 
 
 def normalize_retryable_upstream_status(status_code: int, response_data: Any) -> int:
-    """将被上游包装成 2xx 的 HTML 或明确不可用错误归一为 502。"""
+    """将被上游包装成 2xx 的错误响应归一为可处理的失败状态。"""
+    if status_code < 400 and is_balance_insufficient_failure(response_data):
+        return 403
     if status_code < 400 and (is_nginx_error_response(response_data) or is_service_unavailable_error(response_data)):
         return 502
     return status_code
@@ -603,19 +660,14 @@ async def handle_permanent_key_failure(
                 pool_manager.reset_index(current_provider)
                 if to_provider:
                     pool_manager.reset_index(to_provider)
-                logger.warning(f"[CPA KEY MIGRATED] api_key_id={api_key.id} {current_provider}->{to_provider} remaining={remaining}")
+                await disable_failed_api_key(db, api_key, reason)
+                logger.warning(f"[CPA KEY MIGRATED AND DISABLED] api_key_id={api_key.id} {current_provider}->{to_provider} remaining={remaining}")
                 return True
 
-        # 通用降权/关闭规则
-        if remaining is not None:
-            current_provider = (getattr(api_key, "provider", "") or "").strip().lower()
-            result = _get_weight_for_remaining_quota(remaining, provider=current_provider)
-            if result == -1:
-                return True
-            if result is not None and result > 0:
-                await downgrade_key_weight(db, api_key, result, reason)
-                return True
         await disable_failed_api_key(db, api_key, reason)
+        if sticky_session_key:
+            pool_manager.clear_session_binding(sticky_session_key)
+        return True
         return True
 
     message = "\n".join(collect_upstream_error_texts(response_data)).lower()
@@ -644,8 +696,22 @@ async def select_api_key(
     filter_providers: Optional[list[str]] = None,
     filter_key_name: Optional[str] = None,
     exclude_providers: Optional[list[str]] = None,
+    exclude_key_names: Optional[list[str]] = None,
     trace_ctx: Any = None,
 ):
+    directive_excluded = getattr(filter_providers, "excluded_providers", None) or []
+    directive_excluded_keys = getattr(filter_providers, "excluded_key_names", None) or []
+    excluded_values = [
+        *(exclude_providers or []),
+        *directive_excluded,
+    ]
+    if tried_key_ids:
+        excluded_values.extend(pool_manager.unhealthy_providers())
+    exclude_providers = list(dict.fromkeys(excluded_values)) or None
+    exclude_key_names = list(dict.fromkeys([
+        *(exclude_key_names or []),
+        *directive_excluded_keys,
+    ])) or None
     sticky_ttl_seconds = settings.proxy_session_sticky_ttl_seconds if sticky_session_key else 0
     return await pool_manager.get_next_key(
         db,
@@ -654,9 +720,10 @@ async def select_api_key(
         sticky_session_key=sticky_session_key,
         sticky_ttl_seconds=sticky_ttl_seconds,
         prefer_bound_key=True,
-        providers=filter_providers or None,
+        providers=list(filter_providers) if filter_providers else None,
         key_name=filter_key_name,
         exclude_providers=exclude_providers or None,
+        exclude_key_names=exclude_key_names or None,
         trace_context=trace_ctx,
     )
 
@@ -727,6 +794,8 @@ async def _record_protocol_capability(
         "v1/responses": "openai_responses",
         "v1/messages": "anthropic_messages",
     }.get(normalized_path)
+    if getattr(api_key, "provider", "").strip().lower() in {"google", "gemini"} or getattr(api_key, "api_type", "").strip().lower() == "gemini":
+        protocol = "gemini_v1beta"
     if not protocol:
         return
     supported = status_code is not None and status_code < 400
@@ -806,12 +875,17 @@ async def forward_stream_with_retry(
     original_model: Optional[str] = None,
     force_providers: Optional[list] = None,
     force_key_name: Optional[str] = None,
+    skip_gemini: bool = False,
 ):
     raw_model = body.get("model") if isinstance(body, dict) else None
     actual_model, filter_providers, filter_key_name = _parse_model_directive(raw_model or "")
     # 接口层传入的 force_providers 优先级更高（已在接口层解析过）
     if force_providers is not None:
-        filter_providers = force_providers
+        filter_providers = ProviderDirective(
+            list(force_providers),
+            getattr(force_providers, "excluded_providers", None),
+            getattr(force_providers, "excluded_key_names", None),
+        )
     if force_key_name is not None:
         filter_key_name = force_key_name
     # 如果有指令，替换 body 里的模型为实际模型
@@ -843,7 +917,7 @@ async def forward_stream_with_retry(
     trace_started_at = time.perf_counter()
     trace_upstream_ms = 0
     trace_selected_api_key = None
-    sticky_session_key = get_sticky_session_key(headers, model)
+    sticky_session_key = get_sticky_session_key(headers, model, path=path, body=body)
     tried_key_ids = []
     last_status_code = 503
     last_response_headers = {}
@@ -851,11 +925,16 @@ async def forward_stream_with_retry(
 
     retry_count = 0
     disable_count = 0
+    same_key_retry_count = 0
+    request_deadline = time.monotonic() + max(1, settings.proxy_retry_total_budget_seconds)
     auto_continue_used = False
     service_unavailable_providers: list[str] = []
     SERVICE_UNAVAILABLE_BYPASS_LIMIT = 10
 
     while retry_count < STREAM_RETRY_LIMIT and disable_count < PERMANENT_FAILURE_DISABLE_LIMIT:
+        if time.monotonic() >= request_deadline:
+            logger.warning("[CPA RETRY BUDGET EXCEEDED] stream model=%s", model)
+            break
         api_key = await select_api_key(
             db,
             model=model,
@@ -901,13 +980,20 @@ async def forward_stream_with_retry(
         upstream_body, upstream_model = await build_upstream_body_for_key(db, api_key, body, model, filter_providers or None)
 
         # 命中流式缓冲规则，或 provider 配置了错误继续规则时，先缓冲窗口以便拦截流内错误
-        use_buffer = proxy_service._match_stream_buffer_rule(api_key, upstream_model) or has_same_key_continue_rule_for_provider(getattr(api_key, "provider", None))
+        use_buffer = (
+            not proxy_service._is_gemini_api_key(api_key)
+            and (
+                proxy_service._match_stream_buffer_rule(api_key, upstream_model)
+                or has_same_key_continue_rule_for_provider(getattr(api_key, "provider", None))
+            )
+        )
         if use_buffer:
             stream_fn = proxy_service.forward_stream_buffered
         else:
             stream_fn = proxy_service.forward_stream
 
         attempt_started_at = time.perf_counter()
+        remaining_budget_seconds = max(request_deadline - time.monotonic(), 0.1)
         status_code, response_headers, stream_response, retryable = await stream_fn(
             db=db,
             api_key=api_key,
@@ -918,6 +1004,8 @@ async def forward_stream_with_retry(
             client_request=request,
             user_id=user_id,
             original_model=original_model,
+            attempt_timeout_seconds=remaining_budget_seconds,
+            _skip_gemini=skip_gemini,
         )
         attempt_ms = int((time.perf_counter() - attempt_started_at) * 1000)
         trace_upstream_ms += attempt_ms
@@ -939,6 +1027,7 @@ async def forward_stream_with_retry(
                 response_data=stream_response,
             )
             pool_manager.clear_key_cooldown(api_key.id)
+            pool_manager.record_provider_success(getattr(api_key, "provider", None))
             if sticky_session_key:
                 pool_manager.bind_session_to_key(
                     sticky_session_key,
@@ -961,6 +1050,25 @@ async def forward_stream_with_retry(
         last_response_headers = response_headers
         last_response_body = stream_response
         await _record_protocol_capability(db, api_key, upstream_model, path, status_code, stream_response)
+        if status_code >= 500:
+            pool_manager.record_provider_failure(getattr(api_key, "provider", None))
+
+        if (
+            settings.proxy_retry_same_key_enabled
+            and same_key_retry_count < max(0, settings.proxy_retry_same_key_limit)
+            and retryable
+            and time.monotonic() < request_deadline
+        ):
+            same_key_retry_count += 1
+            delay = max(0, settings.proxy_retry_same_key_delay_ms) / 1000
+            if delay:
+                await asyncio.sleep(delay)
+            _trace_attempt(trace_ctx, api_key=api_key, requested_model=model, upstream_model=upstream_model,
+                           status_code=status_code, upstream_latency_ms=attempt_ms,
+                           action="same_key_stream_retry", response_data=stream_response)
+            tried_key_ids.pop()
+            logger.warning("[CPA SAME KEY STREAM RETRY] api_key_id=%s status=%s retry=%s", api_key.id, status_code, same_key_retry_count)
+            continue
 
         # 服务暂不可用：切换到其他提供商的 Key，不计入重试次数，对客户端透明
         if is_service_unavailable_error(stream_response):
@@ -978,12 +1086,22 @@ async def forward_stream_with_retry(
             if provider and provider not in service_unavailable_providers:
                 service_unavailable_providers.append(provider)
             pool_manager.mark_key_cooldown(api_key.id, pool_manager.get_cooldown_seconds_for_status(503))
-            if sticky_session_key:
-                pool_manager.clear_session_binding(sticky_session_key)
             logger.warning(f"[CPA SERVICE UNAVAILABLE SWITCH] api_key_id={api_key.id} provider={provider} excluded_providers={service_unavailable_providers}")
             if len(service_unavailable_providers) >= SERVICE_UNAVAILABLE_BYPASS_LIMIT:
                 break
             continue
+
+        if is_balance_insufficient_failure(stream_response):
+            failed_provider = str(getattr(api_key, "provider", "") or "").strip()
+            if failed_provider:
+                filter_providers = ProviderDirective(
+                    [failed_provider],
+                    getattr(filter_providers, "excluded_providers", None),
+                    getattr(filter_providers, "excluded_key_names", None),
+                )
+            # 原生协议能力预选或客户端固定的 Key 余额不足时，解除 Key 名限制，
+            # 保持同一 Provider 后继续选择下一把 Key。
+            filter_key_name = None
 
         if await handle_permanent_key_failure(
             db,
@@ -1005,9 +1123,6 @@ async def forward_stream_with_retry(
             )
             disable_count += 1
             continue
-
-        if sticky_session_key:
-            pool_manager.clear_session_binding(sticky_session_key)
 
         if not auto_continue_used and should_continue_with_same_key(status_code, stream_response, getattr(api_key, "provider", None)):
             _trace_attempt(
@@ -1149,11 +1264,16 @@ async def forward_request_with_retry(
     original_model: Optional[str] = None,
     force_providers: Optional[list] = None,
     force_key_name: Optional[str] = None,
+    skip_gemini: bool = False,
 ):
     raw_model = body.get("model") if isinstance(body, dict) else None
     actual_model, filter_providers, filter_key_name = _parse_model_directive(raw_model or "")
     if force_providers is not None:
-        filter_providers = force_providers
+        filter_providers = ProviderDirective(
+            list(force_providers),
+            getattr(force_providers, "excluded_providers", None),
+            getattr(force_providers, "excluded_key_names", None),
+        )
     if force_key_name is not None:
         filter_key_name = force_key_name
     if filter_providers or filter_key_name:
@@ -1183,7 +1303,7 @@ async def forward_request_with_retry(
     trace_started_at = time.perf_counter()
     trace_upstream_ms = 0
     trace_selected_api_key = None
-    sticky_session_key = get_sticky_session_key(headers, model)
+    sticky_session_key = get_sticky_session_key(headers, model, path=path, body=body)
     tried_key_ids = []
     last_status_code = 503
     last_response_headers = {}
@@ -1191,11 +1311,16 @@ async def forward_request_with_retry(
 
     retry_count = 0          # 非永久失败的重试次数
     disable_count = 0        # 永久失败禁用 Key 的次数
+    same_key_retry_count = 0
+    request_deadline = time.monotonic() + max(1, settings.proxy_retry_total_budget_seconds)
     auto_continue_used = False
     service_unavailable_providers: list[str] = []
     SERVICE_UNAVAILABLE_BYPASS_LIMIT = 10
 
     while retry_count < REQUEST_RETRY_LIMIT and disable_count < PERMANENT_FAILURE_DISABLE_LIMIT:
+        if time.monotonic() >= request_deadline:
+            logger.warning("[CPA RETRY BUDGET EXCEEDED] request model=%s", model)
+            break
         api_key = await select_api_key(
             db,
             model=model,
@@ -1239,6 +1364,7 @@ async def forward_request_with_retry(
         logger.warning(f"[CPA REQUEST RETRY] retry={retry_count} disable={disable_count} api_key_id={api_key.id} model={model} path={path}")
         upstream_body, upstream_model = await build_upstream_body_for_key(db, api_key, body, model, filter_providers or None)
         attempt_started_at = time.perf_counter()
+        remaining_budget_seconds = max(request_deadline - time.monotonic(), 0.1)
         status_code, response_headers, response_data = await proxy_service.forward_request(
             db=db,
             api_key=api_key,
@@ -1248,6 +1374,8 @@ async def forward_request_with_retry(
             body=upstream_body,
             user_id=user_id,
             original_model=original_model,
+            attempt_timeout_seconds=remaining_budget_seconds,
+            _skip_gemini=skip_gemini,
         )
         attempt_ms = int((time.perf_counter() - attempt_started_at) * 1000)
         trace_upstream_ms += attempt_ms
@@ -1257,7 +1385,8 @@ async def forward_request_with_retry(
             logger.warning("[CPA UPSTREAM RETRYABLE ERROR] normalizing status to %s api_key_id=%s path=%s", normalized_status_code, api_key.id, path)
             status_code = normalized_status_code
         if status_code < 400:
-            await _record_protocol_capability(db, api_key, upstream_model, path, status_code, response_data)
+            if not skip_gemini:
+                await _record_protocol_capability(db, api_key, upstream_model, path, status_code, response_data)
             _trace_attempt(
                 trace_ctx,
                 api_key=api_key,
@@ -1269,6 +1398,7 @@ async def forward_request_with_retry(
                 response_data=response_data,
             )
             pool_manager.clear_key_cooldown(api_key.id)
+            pool_manager.record_provider_success(getattr(api_key, "provider", None))
             if sticky_session_key:
                 pool_manager.bind_session_to_key(
                     sticky_session_key,
@@ -1290,7 +1420,28 @@ async def forward_request_with_retry(
         last_status_code = status_code
         last_response_headers = response_headers
         last_response_body = response_data
-        await _record_protocol_capability(db, api_key, upstream_model, path, status_code, response_data)
+        if not skip_gemini:
+            await _record_protocol_capability(db, api_key, upstream_model, path, status_code, response_data)
+        if status_code >= 500:
+            pool_manager.record_provider_failure(getattr(api_key, "provider", None))
+
+        if (
+            settings.proxy_retry_same_key_enabled
+            and same_key_retry_count < max(0, settings.proxy_retry_same_key_limit)
+            and should_retry_on_status(status_code, response_data)
+            and not is_permanent_key_failure(status_code, response_data)
+            and time.monotonic() < request_deadline
+        ):
+            same_key_retry_count += 1
+            delay = max(0, settings.proxy_retry_same_key_delay_ms) / 1000
+            if delay:
+                await asyncio.sleep(delay)
+            _trace_attempt(trace_ctx, api_key=api_key, requested_model=model, upstream_model=upstream_model,
+                           status_code=status_code, upstream_latency_ms=attempt_ms,
+                           action="same_key_retry", response_data=response_data)
+            logger.warning("[CPA SAME KEY RETRY] api_key_id=%s status=%s retry=%s", api_key.id, status_code, same_key_retry_count)
+            tried_key_ids.pop()
+            continue
 
         # 服务暂不可用：切换到其他提供商的 Key，不计入重试次数，对客户端透明
         if is_service_unavailable_error(response_data):
@@ -1308,12 +1459,22 @@ async def forward_request_with_retry(
             if provider and provider not in service_unavailable_providers:
                 service_unavailable_providers.append(provider)
             pool_manager.mark_key_cooldown(api_key.id, pool_manager.get_cooldown_seconds_for_status(503))
-            if sticky_session_key:
-                pool_manager.clear_session_binding(sticky_session_key)
             logger.warning(f"[CPA SERVICE UNAVAILABLE SWITCH] api_key_id={api_key.id} provider={provider} excluded_providers={service_unavailable_providers}")
             if len(service_unavailable_providers) >= SERVICE_UNAVAILABLE_BYPASS_LIMIT:
                 break
             continue
+
+        if is_balance_insufficient_failure(response_data):
+            failed_provider = str(getattr(api_key, "provider", "") or "").strip()
+            if failed_provider:
+                filter_providers = ProviderDirective(
+                    [failed_provider],
+                    getattr(filter_providers, "excluded_providers", None),
+                    getattr(filter_providers, "excluded_key_names", None),
+                )
+            # 原生协议能力预选或客户端固定的 Key 余额不足时，解除 Key 名限制，
+            # 保持同一 Provider 后继续选择下一把 Key。
+            filter_key_name = None
 
         if await handle_permanent_key_failure(
             db,
@@ -1335,9 +1496,6 @@ async def forward_request_with_retry(
             # 永久失败：禁用 Key，不消耗 retry_count，继续尝试下一个
             disable_count += 1
             continue
-
-        if sticky_session_key:
-            pool_manager.clear_session_binding(sticky_session_key)
 
         if not auto_continue_used and should_continue_with_same_key(status_code, response_data, getattr(api_key, "provider", None)):
             _trace_attempt(
@@ -1604,7 +1762,7 @@ async def forward_image_request_with_retry(
     trace_upstream_ms = 0
     trace_selected_api_key = None
 
-    sticky_session_key = get_sticky_session_key(headers, model)
+    sticky_session_key = get_sticky_session_key(headers, model, path=path, body=body)
     tried_key_ids = []
     last_status_code = 503
     last_response_headers = {}
@@ -1650,6 +1808,7 @@ async def forward_image_request_with_retry(
                 response_data=response_data,
             )
             pool_manager.clear_key_cooldown(api_key.id)
+            pool_manager.record_provider_success(getattr(api_key, "provider", None))
             if sticky_session_key:
                 pool_manager.bind_session_to_key(
                     sticky_session_key,
@@ -1690,9 +1849,6 @@ async def forward_image_request_with_retry(
                 response_data=response_data,
             )
             continue
-
-        if sticky_session_key:
-            pool_manager.clear_session_binding(sticky_session_key)
 
         if should_cooldown_key(status_code):
             cooldown_seconds = pool_manager.get_cooldown_seconds_for_status(status_code)
@@ -1765,6 +1921,89 @@ async def forward_image_request_with_retry(
         error_summary=" | ".join(collect_upstream_error_texts(last_response_body)),
     )
     return last_status_code, last_response_headers, last_response_body
+
+
+async def forward_audio_request_with_retry(
+    db: AsyncSession,
+    headers: dict,
+    data: dict,
+    files: list[tuple[str, tuple[str, bytes, str]]],
+    user_id: Optional[int] = None,
+):
+    raw_model = data.get("model")
+    model = raw_model[0] if isinstance(raw_model, list) and raw_model else raw_model
+    model = str(model or "").strip()
+    actual_model, filter_providers, filter_key_name = _parse_model_directive(model)
+    if actual_model != model:
+        data = {**data, "model": actual_model}
+    tried_key_ids = []
+    last_status_code = 503
+    last_response_headers = {}
+    last_response_body = {"error": {"message": "cpa_没有可用的 API Key"}}
+
+    for _ in range(REQUEST_RETRY_LIMIT):
+        api_key = await select_api_key(
+            db,
+            model=actual_model,
+            sticky_session_key=None,
+            tried_key_ids=tried_key_ids,
+            filter_providers=filter_providers or None,
+            filter_key_name=filter_key_name,
+        )
+        if not api_key:
+            break
+        tried_key_ids.append(api_key.id)
+        status_code, response_headers, response_data, response_content_type = await proxy_service.forward_audio_request(
+            db=db,
+            api_key=api_key,
+            method="POST",
+            path="/v1/audio/transcriptions",
+            headers=headers,
+            data=data,
+            files=files,
+            user_id=user_id,
+        )
+        if status_code < 400:
+            return status_code, response_headers, response_data, response_content_type
+        last_status_code = status_code
+        last_response_headers = response_headers
+        last_response_body = response_data
+        if await handle_permanent_key_failure(
+            db,
+            api_key,
+            status_code=status_code,
+            response_data=response_data,
+            sticky_session_key=None,
+        ):
+            continue
+        if status_code in {401, 403, 429} or status_code >= 500:
+            pool_manager.mark_key_cooldown(api_key.id, pool_manager.get_cooldown_seconds_for_status(status_code))
+            continue
+        break
+
+    return last_status_code, last_response_headers, last_response_body, "application/json"
+
+
+async def read_multipart_audio_request(request: Request) -> tuple[dict, list[tuple[str, tuple[str, bytes, str]]]]:
+    form = await request.form()
+    data: dict[str, list[str] | str] = {}
+    files: list[tuple[str, tuple[str, bytes, str]]] = []
+
+    for field_name, value in form.multi_items():
+        if hasattr(value, "filename") and hasattr(value, "read"):
+            content = await value.read()
+            files.append((field_name, (value.filename or field_name, content, value.content_type or "application/octet-stream")))
+            continue
+        text_value = str(value)
+        existing = data.get(field_name)
+        if existing is None:
+            data[field_name] = text_value
+        elif isinstance(existing, list):
+            existing.append(text_value)
+        else:
+            data[field_name] = [existing, text_value]
+
+    return data, files
 
 
 async def read_multipart_image_request(request: Request) -> tuple[dict, list[tuple[str, tuple[str, bytes, str]]]]:
@@ -2373,6 +2612,39 @@ async def openai_completions(
         return JSONResponse(content=_restore_model_in_response(response_data, original_model), status_code=status_code)
 
 
+@router.post("/v1/audio/transcriptions")
+async def openai_audio_transcriptions(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    auth_info: dict = Depends(verify_api_key),
+):
+    """OpenAI 音频转写兼容接口，透传上游实际响应格式。"""
+    data, files = await read_multipart_audio_request(request)
+    model_value = data.get("model")
+    model = model_value[0] if isinstance(model_value, list) and model_value else model_value
+    model = str(model or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="cpa_缺少 model")
+    if not any(field_name == "file" for field_name, _ in files):
+        raise HTTPException(status_code=400, detail="cpa_缺少音频文件")
+
+    actual_model, _, _ = _parse_model_directive(model)
+    _check_model_permission(auth_info, actual_model)
+    await _check_user_quota(auth_info, db)
+    status_code, response_headers, response_data, response_content_type = await forward_audio_request_with_retry(
+        db=db,
+        headers=dict(request.headers),
+        data=data,
+        files=files,
+        user_id=auth_info.get("user_id"),
+    )
+    if isinstance(response_data, bytes):
+        return Response(content=response_data, status_code=status_code, media_type=response_content_type)
+    if isinstance(response_data, dict):
+        return JSONResponse(content=response_data, status_code=status_code)
+    return Response(content=str(response_data or ""), status_code=status_code, media_type=response_content_type)
+
+
 @router.post("/v1/images/generations")
 async def openai_images_generations(
     request: Request,
@@ -2574,7 +2846,7 @@ async def openai_responses(
     vision_request = protocol_routing_service.enabled() and _is_safe_responses_vision_request(body)
     vision_messages_key_name = None
     if vision_request:
-        sticky_session_key = get_sticky_session_key(headers, body.get("model"))
+        sticky_session_key = get_sticky_session_key(headers, body.get("model"), path="/v1/responses", body=body)
         vision_candidate_key = await select_api_key(
             db,
             model=body.get("model"),
@@ -2600,8 +2872,11 @@ async def openai_responses(
     # 支持原生 Responses 的模型按上游 base_url 探测能力；结果 10 天内复用
     use_native_responses = False
     native_key_name = None
-    if is_responses_capability_candidate(body.get("model")):
-        sticky_session_key = get_sticky_session_key(headers, body.get("model"))
+    gemini_native_unsupported = False
+    candidate_model_name = str(body.get("model") or "").strip().lower()
+    is_gemini_model = candidate_model_name.startswith(("gemini-", "gemini/", "models/gemini-", "models/gemini/"))
+    if is_responses_capability_candidate(body.get("model")) or is_gemini_model:
+        sticky_session_key = get_sticky_session_key(headers, body.get("model"), path="/v1/responses", body=body)
         candidate_key = await select_api_key(
             db,
             model=body.get("model"),
@@ -2618,14 +2893,39 @@ async def openai_responses(
                 body.get("model"),
                 _dir_providers if _dir_providers else None,
             )
-            capability = await responses_capability_service.resolve(
-                candidate_key,
-                candidate_model or body.get("model"),
-                proxy_service.probe_openai_responses_capability,
-            )
+            if proxy_service._is_gemini_model(candidate_model or body.get("model")):
+                probe_model = candidate_model or body.get("model")
+                capability = await protocol_routing_service.capability_status(
+                    db,
+                    provider=getattr(candidate_key, "provider", ""),
+                    base_url=getattr(candidate_key, "base_url", ""),
+                    model=probe_model,
+                    protocol="gemini_v1beta",
+                )
+                if capability is None:
+                    capability_result = await proxy_service.probe_gemini_v1beta_capability(candidate_key, probe_model)
+                    capability = capability_result.get("supported") if isinstance(capability_result, dict) else None
+                    if isinstance(capability, bool):
+                        await protocol_routing_service.record_capability(
+                            db,
+                            provider=getattr(candidate_key, "provider", ""),
+                            base_url=getattr(candidate_key, "base_url", ""),
+                            model=probe_model,
+                            protocol="gemini_v1beta",
+                            supported=capability,
+                            status_code=capability_result.get("status_code"),
+                        )
+            else:
+                capability = await responses_capability_service.resolve(
+                    candidate_key,
+                    candidate_model or body.get("model"),
+                    proxy_service.probe_openai_responses_capability,
+                )
             if capability is True:
                 use_native_responses = True
                 native_key_name = getattr(candidate_key, "name", None)
+            elif proxy_service._is_gemini_model(candidate_model or body.get("model")) and capability is False:
+                gemini_native_unsupported = True
 
     if vision_messages_key_name:
         try:
@@ -2733,6 +3033,7 @@ async def openai_responses(
         )
 
     # 不支持或暂时无法确认 Responses 时，保持原有 Chat Completions 转换
+    # Gemini v1beta 已明确不支持时，仍复用同一 Key 的 OpenAI 兼容地址。
     try:
         chat_body = proxy_service.adapt_responses_request_to_chat(body)
     except ValueError as e:
@@ -2750,6 +3051,7 @@ async def openai_responses(
             original_model=original_model,
             force_providers=_dir_providers if _dir_providers else None,
             force_key_name=_dir_key,
+            skip_gemini=gemini_native_unsupported,
         )
         if status_code >= 400:
             return JSONResponse(content=stream_response, status_code=status_code)
@@ -2770,6 +3072,7 @@ async def openai_responses(
             original_model=original_model,
             force_providers=_dir_providers if _dir_providers else None,
             force_key_name=_dir_key,
+            skip_gemini=gemini_native_unsupported,
         )
         if status_code >= 400:
             return JSONResponse(content=response_data, status_code=status_code)
@@ -2878,6 +3181,16 @@ async def root_chat_completions(
         return await openai_responses(request, db, auth_info)
     logger.info("[CPA ROOT ROUTE] protocol=openai_chat_completions model=%s", body.get("model"))
     return await openai_chat_completions(request, db, auth_info)
+
+
+@router.post("/v1/messages/count_tokens")
+async def claude_messages_count_tokens(
+    request: Request,
+    _: dict = Depends(verify_api_key),
+):
+    """Claude count_tokens 兼容接口，仅本地估算，不访问上游或变更会话绑定。"""
+    body = await request.json()
+    return {"input_tokens": proxy_service._estimate_claude_compat_input_tokens(body)}
 
 
 @router.post("/v1/messages")

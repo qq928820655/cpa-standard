@@ -33,9 +33,17 @@
                 <el-icon><Connection /></el-icon>
                 <span>模型映射</span>
               </el-menu-item>
+              <el-menu-item v-if="showSettings" index="/plugins">
+                <el-icon><Connection /></el-icon>
+                <span>插件中心</span>
+              </el-menu-item>
               <el-menu-item v-if="showImageSquare" index="/images">
                 <el-icon><Picture /></el-icon>
                 <span>光影世界</span>
+              </el-menu-item>
+              <el-menu-item v-for="item in visiblePluginMenuItems" :key="item.path" :index="item.path">
+                <el-icon><component :is="item.icon" /></el-icon>
+                <span>{{ item.label }}</span>
               </el-menu-item>
               <el-menu-item v-if="showUserManage" index="/users">
                 <el-icon><User /></el-icon>
@@ -199,6 +207,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import zhCn from 'element-plus/dist/locale/zh-cn.mjs'
 import { adminApi, authApi } from './api'
+import { pluginMenuItems } from './plugin-runtime'
 import { Connection, Document, User, Warning, Link, Operation } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -283,11 +292,15 @@ const handleSessionChanged = () => {
 }
 
 // 主菜单项集中描述，供桌面侧栏之外的移动端底部栏与抽屉复用
+const visiblePluginMenuItems = computed(() => pluginMenuItems.filter((item) => !item.requiresImageSquareAccess || showImageSquare.value))
+
 const mainNavItems = computed(() => [
   { path: '/dashboard', label: '仪表盘', icon: 'DataAnalysis', visible: true },
   { path: '/keys', label: 'Key 管理', icon: 'Key', visible: showKeyManage.value },
   { path: '/usage', label: '用量统计', icon: 'TrendCharts', visible: true },
+  { path: '/plugins', label: '插件中心', icon: 'Connection', visible: showSettings.value },
   { path: '/images', label: '光影世界', icon: 'Picture', visible: showImageSquare.value },
+  ...visiblePluginMenuItems.value.map((item) => ({ ...item, visible: true })),
   { path: '/models', label: '模型广场', icon: 'Grid', visible: true },
   { path: '/provider-model-mappings', label: '模型映射', icon: 'Connection', visible: showSettings.value },
   { path: '/users', label: '用户管理', icon: 'User', visible: showUserManage.value },
@@ -297,7 +310,7 @@ const mainNavItems = computed(() => [
 ].filter((item) => item.visible))
 
 // 底部标签栏只放高频入口，其余进抽屉，避免小屏图标挤在一起划不准
-const MOBILE_TAB_PATHS = ['/dashboard', '/keys', '/usage', '/images']
+const MOBILE_TAB_PATHS = ['/dashboard', '/keys', '/usage', '/models']
 
 const mobileTabItems = computed(() => {
   const items = mainNavItems.value.filter((item) => MOBILE_TAB_PATHS.includes(item.path))

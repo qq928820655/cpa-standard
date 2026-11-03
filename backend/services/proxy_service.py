@@ -72,6 +72,8 @@ class ProxyService:
             pool=settings.proxy_stream_connect_timeout_seconds,
         )
         self.stream_first_byte_timeout_seconds = settings.proxy_stream_first_byte_timeout_seconds
+        self.stream_keepalive_interval_seconds = 15
+        self.stream_max_silence_seconds = 90
         # 连接池：key = (base_url, proxy_url)，复用 TCP/TLS 连接，减少 ConnectError
         self._client_pool: dict[tuple, httpx.AsyncClient] = {}
 
@@ -148,7 +150,12 @@ class ProxyService:
         headers.setdefault("content-type", "application/json")
 
         is_anthropic_messages_path = (path or "").lstrip("/") == "v1/messages"
-        if api_key.provider == "claude" or is_anthropic_messages_path:
+        if self._is_gemini_api_key(api_key):
+            headers.pop("Authorization", None)
+            headers.pop("content-type", None)
+            headers["x-goog-api-key"] = api_key.api_key
+            headers["content-type"] = "application/json"
+        elif api_key.provider == "claude" or is_anthropic_messages_path:
             headers.pop("Authorization", None)
             headers["x-api-key"] = api_key.api_key
             headers["anthropic-version"] = self._get_header_value(source_headers, "anthropic-version") or headers.get(
@@ -778,6 +785,27 @@ class ProxyService:
         yield b"data: [DONE]\n\n"
 
     @staticmethod
+    def _strip_context_management_for_compat(api_key: Any, body: Optional[dict], path: str) -> Optional[dict]:
+        """Only remove context_management for configured legacy Claude-compatible upstreams."""
+        if not isinstance(body, dict) or "context_management" not in body:
+            return body
+        if (path or "").lstrip("/") != "v1/messages":
+            return body
+        provider = str(getattr(api_key, "provider", "") or "").strip().lower()
+        model = str(body.get("model") or "").strip().lower()
+        for rule in export_config.get("context_management_compat_rules") or []:
+            if not isinstance(rule, dict) or not rule.get("enabled", False):
+                continue
+            providers = [str(value).strip().lower() for value in rule.get("providers") or [] if str(value).strip()]
+            models = [str(value).strip().lower() for value in rule.get("models") or [] if str(value).strip()]
+            if providers and provider not in providers:
+                continue
+            if models and not any(fnmatch.fnmatch(model, pattern) for pattern in models):
+                continue
+            return {key: value for key, value in body.items() if key != "context_management"}
+        return body
+
+    @staticmethod
     def _normalize_body_for_upstream(body: Optional[dict]) -> Optional[dict]:
         """归一化上游请求体，兼容不支持 developer role 与空 assistant 消息的上游。"""
         if not isinstance(body, dict):
@@ -785,22 +813,36 @@ class ProxyService:
 
         # Chat 路径上的 prompt_cache_key 只用于 Grok 亲和头回填，不发给上游 chat schema
         working = body
+        changed = False
         if "messages" in body and "prompt_cache_key" in body:
             working = {k: v for k, v in body.items() if k != "prompt_cache_key"}
+            changed = True
+
+        for token_key in ("max_tokens", "max_output_tokens"):
+            token_value = working.get(token_key)
+            if isinstance(token_value, (int, float)) and token_value < 3:
+                if not changed:
+                    working = dict(working)
+                    changed = True
+                working[token_key] = 3
 
         messages = working.get("messages")
         if not isinstance(messages, list):
             return working
         normalized = []
-        changed = working is not body
         for message in messages:
             if not isinstance(message, dict):
                 normalized.append(message)
                 continue
 
-            role = message.get("role")
+            role = str(message.get("role") or "user").strip().lower()
             if role == "developer":
                 message = {**message, "role": "system"}
+                role = "system"
+                changed = True
+            elif role not in {"system", "user", "assistant", "tool", "latest_reminder"}:
+                message = {**message, "role": "user"}
+                role = "user"
                 changed = True
 
             if role == "assistant":
@@ -814,9 +856,49 @@ class ProxyService:
 
             normalized.append(message)
 
+        # 部分客户端切换模型后可能复用不完整的工具调用历史。上游要求
+        # assistant.tool_calls 后紧跟每个 call_id 对应的 tool 消息；不完整时丢弃这一轮工具调用，避免整次请求被拒绝。
+        repaired = []
+        index = 0
+        while index < len(normalized):
+            message = normalized[index]
+            if not isinstance(message, dict) or message.get("role") != "assistant" or not message.get("tool_calls"):
+                if isinstance(message, dict) and message.get("role") == "tool":
+                    changed = True
+                    index += 1
+                    continue
+                repaired.append(message)
+                index += 1
+                continue
+
+            required_ids = {
+                str(call.get("id"))
+                for call in message.get("tool_calls")
+                if isinstance(call, dict) and call.get("id")
+            }
+            following_tools = []
+            cursor = index + 1
+            while cursor < len(normalized) and isinstance(normalized[cursor], dict) and normalized[cursor].get("role") == "tool":
+                following_tools.append(normalized[cursor])
+                cursor += 1
+            actual_ids = {
+                str(tool.get("tool_call_id") or tool.get("id"))
+                for tool in following_tools
+                if tool.get("tool_call_id") or tool.get("id")
+            }
+            if required_ids and actual_ids == required_ids and len(following_tools) == len(required_ids):
+                repaired.append(message)
+                repaired.extend(following_tools)
+            else:
+                changed = True
+                text_message = {key: value for key, value in message.items() if key != "tool_calls"}
+                if text_message.get("content") not in (None, "", []):
+                    repaired.append(text_message)
+            index = cursor if following_tools else index + 1
+
         if not changed:
             return working
-        return {**working, "messages": normalized}
+        return {**working, "messages": repaired}
 
     @staticmethod
     def _sanitize_messages_for_openai_compat(body: Optional[dict]) -> Optional[dict]:
@@ -898,10 +980,11 @@ class ProxyService:
             if not isinstance(msg, dict):
                 new_messages.append(msg)
                 continue
+            normalized_role = "system" if msg.get("role") == "developer" else msg.get("role")
             new_content, content_changed = process_content(msg.get("content"))
-            if content_changed:
+            if content_changed or normalized_role != msg.get("role"):
                 changed = True
-                new_messages.append({**msg, "content": new_content})
+                new_messages.append({**msg, "role": normalized_role, "content": new_content})
             else:
                 new_messages.append(msg)
 
@@ -1051,6 +1134,286 @@ class ProxyService:
         headers["x-forwarded-for"] = fake_ip
         headers["x-real-ip"] = fake_ip
 
+    @staticmethod
+    def _is_gemini_model(model: Any) -> bool:
+        value = str(model or "").strip().lower()
+        return value.startswith(("gemini-", "gemini/", "models/gemini-", "models/gemini/"))
+
+    @classmethod
+    def _is_gemini_api_key(cls, api_key: Any, model: Any = None) -> bool:
+        provider = str(getattr(api_key, "provider", "") or "").strip().lower()
+        api_type = str(getattr(api_key, "api_type", "") or "").strip().lower()
+        return cls._is_gemini_model(model) or provider in {"google", "gemini"} or api_type == "gemini"
+
+    async def _resolve_gemini_capability(self, db: AsyncSession, api_key: Any, model: str) -> Optional[bool]:
+        if not self._is_gemini_model(model):
+            return None
+        from services.protocol_routing_service import protocol_routing_service
+        if not protocol_routing_service.enabled():
+            return None
+        cached = await protocol_routing_service.capability_status(
+            db,
+            provider=getattr(api_key, "provider", ""),
+            base_url=getattr(api_key, "base_url", ""),
+            model=model,
+            protocol="gemini_v1beta",
+        )
+        if cached is not None:
+            return cached
+        result = await self.probe_gemini_v1beta_capability(api_key, model)
+        supported = result.get("supported") if isinstance(result, dict) else None
+        if isinstance(supported, bool):
+            try:
+                await protocol_routing_service.record_capability(
+                    db,
+                    provider=getattr(api_key, "provider", ""),
+                    base_url=getattr(api_key, "base_url", ""),
+                    model=model,
+                    protocol="gemini_v1beta",
+                    supported=supported,
+                    status_code=result.get("status_code"),
+                )
+            except Exception:
+                logger.exception("[CPA GEMINI CAPABILITY] failed to persist probe result")
+        return supported
+
+    def _build_gemini_url(self, api_key: Any, model: str, *, stream: bool = False) -> str:
+        base_url = str(getattr(api_key, "base_url", "") or "").rstrip("/")
+        if base_url.endswith("/v1beta"):
+            root = base_url
+        elif base_url.endswith("/v1beta/models"):
+            root = base_url[:-7].rstrip("/")
+        elif base_url.endswith("/v1"):
+            root = base_url[:-3].rstrip("/") + "/v1beta"
+        else:
+            root = f"{base_url}/v1beta"
+        action = "streamGenerateContent?alt=sse" if stream else "generateContent"
+        model_name = str(model or "").strip().strip("/")
+        if model_name.startswith("models/"):
+            model_name = model_name[7:]
+        return f"{root}/models/{model_name}:{action}"
+
+    async def probe_gemini_v1beta_capability(self, api_key: Any, target_model: str) -> dict:
+        """探测 Gemini 原生 v1beta 能力；仅明确不支持时返回 False。"""
+        model = str(target_model or "").strip().strip("/")
+        url = self._build_gemini_url(api_key, model)
+        headers = {"accept": "application/json", "content-type": "application/json", "x-goog-api-key": api_key.api_key}
+        body = {
+            "contents": [{"role": "user", "parts": [{"text": "Reply with exactly: gemini-probe-ok"}]}],
+            "generationConfig": {"maxOutputTokens": 8},
+        }
+        try:
+            async with httpx.AsyncClient(**self._build_client_kwargs(api_key, httpx.Timeout(90))) as client:
+                response = await client.post(url, headers=headers, json=body)
+            data = self._parse_response_body(response)
+        except (httpx.RequestError, httpx.TimeoutException):
+            return {"supported": None, "status_code": None, "response_object": None}
+        if 200 <= response.status_code < 300:
+            return {"supported": isinstance(data, dict) and isinstance(data.get("candidates"), list), "status_code": response.status_code, "response_object": "gemini"}
+        if self._is_gemini_protocol_unsupported(response.status_code, data):
+            return {"supported": False, "status_code": response.status_code, "response_object": None}
+        return {"supported": None, "status_code": response.status_code, "response_object": None}
+
+    def _adapt_chat_body_to_gemini(self, body: dict) -> dict:
+        contents = []
+        system_parts = []
+        messages = body.get("messages")
+        if not isinstance(messages, list) and "input" in body:
+            messages = self._responses_input_to_messages(body.get("input"))
+        for message in messages or []:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "user").lower()
+            content = message.get("content")
+            parts = []
+            if role == "tool":
+                tool_call_id = message.get("tool_call_id") or message.get("id") or "tool"
+                tool_content = message.get("content")
+                try:
+                    tool_response = json.loads(tool_content) if isinstance(tool_content, str) else (tool_content or {})
+                except (TypeError, json.JSONDecodeError):
+                    tool_response = {"result": str(tool_content or "")}
+                parts.append({"functionResponse": {"name": str(tool_call_id), "response": tool_response}})
+                contents.append({"role": "user", "parts": parts})
+                continue
+            values = content if isinstance(content, list) else [{"type": "text", "text": content or ""}]
+            for item in values:
+                if isinstance(item, str):
+                    parts.append({"text": item})
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type in {"text", "input_text"}:
+                    parts.append({"text": str(item.get("text") or "")})
+                elif item_type in {"image_url", "input_image"}:
+                    image = item.get("image_url")
+                    image_url = image.get("url") if isinstance(image, dict) else image
+                    if isinstance(image_url, str) and image_url.startswith("data:"):
+                        header, _, encoded = image_url.partition(",")
+                        mime = header.split(";")[0].replace("data:", "") or "image/png"
+                        parts.append({"inlineData": {"mimeType": mime, "data": encoded}})
+                    elif image_url:
+                        parts.append({"fileData": {"mimeType": "image/*", "fileUri": image_url}})
+            if role in {"system", "developer"}:
+                system_parts.extend(parts)
+                continue
+            if role == "assistant" and message.get("tool_calls"):
+                parts = [part for part in parts if part.get("text")]
+                for call in message.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function") or {}
+                    arguments = function.get("arguments")
+                    try:
+                        arguments = json.loads(arguments or "{}") if isinstance(arguments, str) else (arguments or {})
+                    except (TypeError, json.JSONDecodeError):
+                        arguments = {}
+                    parts.append({"functionCall": {"name": function.get("name") or "tool", "args": arguments}})
+            contents.append({"role": "model" if role == "assistant" else "user", "parts": parts or [{"text": ""}]})
+
+        if body.get("instructions"):
+            system_parts.insert(0, {"text": str(body["instructions"])})
+        if body.get("system"):
+            system_parts.insert(0, {"text": str(body["system"])})
+        result = {"contents": contents}
+        if system_parts:
+            result["systemInstruction"] = {"parts": system_parts}
+        generation_config = {}
+        for source, target in (("temperature", "temperature"), ("top_p", "topP"), ("max_tokens", "maxOutputTokens")):
+            if body.get(source) is not None:
+                generation_config[target] = body[source]
+        if body.get("stop") is not None:
+            generation_config["stopSequences"] = body["stop"] if isinstance(body["stop"], list) else [body["stop"]]
+        if generation_config:
+            result["generationConfig"] = generation_config
+
+        tools = []
+        for tool in body.get("tools") or []:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function") if tool.get("type") == "function" else tool
+            if not isinstance(function, dict) or not function.get("name"):
+                continue
+            tools.append({"functionDeclarations": [{
+                "name": function["name"],
+                "description": function.get("description") or "",
+                "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+            }]})
+        if tools:
+            result["tools"] = tools
+        return result
+
+    @staticmethod
+    def _is_gemini_protocol_unsupported(status_code: int, response_data: Any) -> bool:
+        if status_code in {404, 405, 415, 501}:
+            return True
+        if status_code not in {400, 422}:
+            return False
+        if isinstance(response_data, dict):
+            error = response_data.get("error")
+            if isinstance(error, dict):
+                text = " ".join(str(error.get(key) or "") for key in ("status", "code", "type", "message"))
+            else:
+                text = str(error or response_data.get("detail") or response_data)
+        else:
+            text = str(response_data or "")
+        text = text.lower()
+        return any(marker in text for marker in (
+            "unknown endpoint",
+            "invalid path",
+            "no route",
+            "unsupported endpoint",
+            "unsupported protocol",
+            "unsupported api",
+            "method not allowed",
+            "not implemented",
+        ))
+
+    def _adapt_gemini_response_to_chat(self, response_data: Any, model: str) -> dict:
+        candidates = response_data.get("candidates") if isinstance(response_data, dict) else []
+        candidate = (candidates or [{}])[0]
+        parts = ((candidate.get("content") or {}).get("parts") or []) if isinstance(candidate, dict) else []
+        text_parts = [str(part.get("text") or "") for part in parts if isinstance(part, dict) and part.get("text") is not None]
+        tool_calls = []
+        for index, part in enumerate(parts):
+            if not isinstance(part, dict) or not part.get("functionCall"):
+                continue
+            call = part["functionCall"]
+            tool_calls.append({
+                "id": f"call_gemini_{index}",
+                "type": "function",
+                "function": {"name": call.get("name") or "tool", "arguments": json.dumps(call.get("args") or {}, ensure_ascii=False)},
+            })
+        message = {"role": "assistant", "content": "".join(text_parts)}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        usage = response_data.get("usageMetadata") if isinstance(response_data, dict) else {}
+        prompt_tokens = int((usage or {}).get("promptTokenCount") or 0)
+        completion_tokens = int((usage or {}).get("candidatesTokenCount") or 0)
+        return {
+            "id": f"chatcmpl-gemini-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": int((usage or {}).get("totalTokenCount") or prompt_tokens + completion_tokens)},
+        }
+
+    async def _forward_gemini_request(self, db: AsyncSession, api_key: Any, body: dict, headers: dict, path: str = "", user_id: Optional[int] = None) -> tuple[int, dict, Any]:
+        from .usage_tracker import usage_tracker
+        model = str(body.get("model") or "")
+        stream = bool(body.get("stream"))
+        url = self._build_gemini_url(api_key, model, stream=stream)
+        forward_headers = {"content-type": "application/json", "x-goog-api-key": api_key.api_key}
+        started_at = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(**self._build_client_kwargs(api_key, self.timeout)) as client:
+                response = await client.post(url, headers=forward_headers, json=self._adapt_chat_body_to_gemini(body), timeout=self.timeout)
+            data = self._parse_response_body(response)
+            if stream:
+                return response.status_code, {"content-type": "text/event-stream"}, data
+            if response.status_code >= 400 and self._is_gemini_protocol_unsupported(response.status_code, data):
+                path_norm = path.lstrip("/")
+                fallback_body = body
+                fallback_path = path
+                response_adapter = lambda value: value
+                if path_norm == "v1/responses":
+                    fallback_body = self.adapt_responses_request_to_chat(body)
+                    fallback_path = "/v1/chat/completions"
+                    response_adapter = self.adapt_chat_response_to_responses
+                elif path_norm == "v1/messages":
+                    fallback_body = self.adapt_claude_messages_request_to_chat(body)
+                    fallback_path = "/v1/chat/completions"
+                    response_adapter = self.adapt_chat_response_to_claude_message
+                fallback_status, fallback_headers, fallback_data = await self.forward_request(
+                    db=db,
+                    api_key=api_key,
+                    method="POST",
+                    path=fallback_path,
+                    headers=headers,
+                    body=fallback_body,
+                    user_id=user_id,
+                    original_model=model,
+                    _skip_gemini=True,
+                )
+                if fallback_status < 400 and response_adapter is not None:
+                    data = response_adapter(fallback_data)
+                    return fallback_status, fallback_headers, data
+            response_data = self._adapt_gemini_response_to_chat(data, model) if response.status_code < 400 else data
+            path_norm = path.lstrip("/")
+            if response.status_code < 400 and path_norm == "v1/responses":
+                response_data = self.adapt_chat_response_to_responses(response_data)
+            elif response.status_code < 400 and path_norm == "v1/messages":
+                response_data = self.adapt_chat_response_to_claude_message(response_data, model)
+            usage = response_data.get("usage") if isinstance(response_data, dict) else {}
+            await usage_tracker.record(db=db, api_key_id=api_key.id, model=model, prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0), total_tokens=usage.get("total_tokens", 0), latency_ms=int((time.perf_counter() - started_at) * 1000), upstream_latency_ms=int((time.perf_counter() - started_at) * 1000), cpa_overhead_ms=0, status="success" if response.status_code < 400 else "error", error_message=None if response.status_code < 400 else str(response_data), user_id=user_id)
+            return response.status_code, {}, response_data
+        except httpx.TimeoutException as exc:
+            return 504, {}, {"error": {"message": self._safe_error_message("请求超时: ", exc)}}
+        except httpx.RequestError as exc:
+            return 502, {}, {"error": {"message": self._safe_error_message("请求错误: ", exc)}}
+
     def _build_url(self, api_key: Any, path: str) -> str:
         """
         构建转发请求的 URL
@@ -1062,9 +1425,14 @@ class ProxyService:
         Returns:
             完整 URL
         """
-        base_url = api_key.base_url.rstrip("/")
+        base_url = str(api_key.base_url or "").rstrip("/")
         path = path.lstrip("/")
 
+        # 智谱兼容地址：Key 可填写完整 chat/completions 地址，也可填写 /v4 根地址。
+        if path == "v1/chat/completions" and base_url.endswith("/chat/completions"):
+            return base_url
+        if base_url.endswith("/api/paas/v4") and path == "v1/chat/completions":
+            return f"{base_url}/chat/completions"
         if base_url.endswith("/v1") and path.startswith("v1/"):
             path = path[3:]
 
@@ -1290,7 +1658,7 @@ class ProxyService:
 
     async def check_key_model(self, api_key: Any, target_model: str) -> dict:
         normalized_model = (target_model or "").strip()
-        if api_key.provider == "claude":
+        if api_key.provider in {"claude", "cc"}:
             return await self._send_probe_request(
                 api_key,
                 method="POST",
@@ -1298,7 +1666,7 @@ class ProxyService:
                 headers={"accept": "application/json", "content-type": "application/json"},
                 body={
                     "model": normalized_model,
-                    "max_tokens": 1,
+                    "max_tokens": 3,
                     "messages": [{"role": "user", "content": "ping"}],
                 },
             )
@@ -1311,7 +1679,7 @@ class ProxyService:
             body={
                 "model": normalized_model,
                 "stream": False,
-                "max_tokens": 1,
+                "max_tokens": 3,
                 "messages": [{"role": "user", "content": "ping"}],
             },
         )
@@ -1568,44 +1936,49 @@ class ProxyService:
         filename = self._safe_image_filename(item.get("name"), mime_type, index)
         return filename, content, mime_type
 
-    def _download_image_from_url(self, item: dict, index: int) -> tuple[str, bytes, str]:
-        """从在线 URL 下载图片，用于官方 edits 接口的 multipart 上传"""
-        import urllib.request
-        import ssl
+    async def _download_image_from_url(self, item: dict, index: int) -> tuple[str, bytes, str]:
+        """异步下载在线参考图，限制内容大小以保护事件循环与内存。"""
         image_url = str(item.get("image_url") or "")
         if not image_url.startswith(("http://", "https://")):
             raise ValueError("参考图在线 URL 格式不正确")
 
-        request = urllib.request.Request(image_url, headers={"User-Agent": "CPA/1.0"})
+        max_bytes = 20 * 1024 * 1024
+
+        async def download(*, verify: bool) -> tuple[bytes, str]:
+            timeout = httpx.Timeout(connect=10, read=30, write=30, pool=10)
+            async with httpx.AsyncClient(timeout=timeout, verify=verify, follow_redirects=True) as client:
+                async with client.stream("GET", image_url, headers={"User-Agent": "CPA/1.0"}) as response:
+                    response.raise_for_status()
+                    declared_size = int(response.headers.get("Content-Length") or 0)
+                    if declared_size > max_bytes:
+                        raise ValueError("参考图文件超过 20MB 限制")
+                    chunks = []
+                    total = 0
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise ValueError("参考图文件超过 20MB 限制")
+                        chunks.append(chunk)
+                    return b"".join(chunks), response.headers.get("Content-Type", "image/png")
+
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                content = response.read()
-                content_type = response.headers.get("Content-Type", "image/png")
-        except Exception as exc:
-            # SSL 错误时使用忽略验证的方式重试
+            content, content_type = await download(verify=True)
+        except (httpx.HTTPError, ValueError) as exc:
             error_text = str(exc).lower()
-            if "ssl" in error_text or "eof" in error_text or "certificate" in error_text:
+            if "ssl" in error_text or "certificate" in error_text:
                 try:
-                    ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                    with urllib.request.urlopen(request, timeout=30, context=ctx) as response:
-                        content = response.read()
-                        content_type = response.headers.get("Content-Type", "image/png")
-                except Exception as retry_exc:
+                    content, content_type = await download(verify=False)
+                except (httpx.HTTPError, ValueError) as retry_exc:
                     raise ValueError(f"下载参考图失败（已尝试跳过 SSL 验证）：{retry_exc}") from retry_exc
             else:
-                # 下载失败时尝试使用本地缓存文件
-                local_content = self._try_load_local_image(item)
+                local_content = await asyncio.to_thread(self._try_load_local_image, item)
                 if local_content is not None:
                     return local_content
                 raise ValueError(f"下载参考图失败：{exc}") from exc
 
-        # 从 Content-Type 推断 MIME 类型
         mime_type = content_type.split(";")[0].strip().lower()
         if mime_type not in {"image/png", "image/jpeg", "image/webp"}:
             mime_type = "image/png"
-
         filename = self._safe_image_filename(item.get("name"), mime_type, index)
         return filename, content, mime_type
 
@@ -1620,7 +1993,9 @@ class ProxyService:
             return None
         try:
             with open(local_path, "rb") as f:
-                content = f.read()
+                content = f.read(20 * 1024 * 1024 + 1)
+            if len(content) > 20 * 1024 * 1024:
+                raise ValueError("参考图文件超过 20MB 限制")
             if not content:
                 return None
             ext = os.path.splitext(local_path)[1].lower()
@@ -1632,7 +2007,7 @@ class ProxyService:
         except Exception:
             return None
 
-    def _build_official_image_edit_payload(
+    async def _build_official_image_edit_payload(
         self,
         *,
         model: str,
@@ -1653,17 +2028,24 @@ class ProxyService:
             data["quality"] = quality
 
         files = []
+        online_downloads = []
         for index, item in enumerate(input_images or [], start=1):
             if not isinstance(item, dict):
                 continue
-            # 优先使用 data_url，没有则从在线 URL 下载
             if item.get("data_url"):
                 filename, content, mime_type = self._decode_image_data_url(item, index)
+                files.append(("image", (filename, content, mime_type)))
             elif item.get("image_url", "").startswith(("http://", "https://")):
-                filename, content, mime_type = self._download_image_from_url(item, index)
-            else:
-                continue
-            files.append(("image", (filename, content, mime_type)))
+                online_downloads.append((index, item))
+        if online_downloads:
+            semaphore = asyncio.Semaphore(3)
+
+            async def download(index: int, item: dict):
+                async with semaphore:
+                    return await self._download_image_from_url(item, index)
+
+            for filename, content, mime_type in await asyncio.gather(*(download(index, item) for index, item in online_downloads)):
+                files.append(("image", (filename, content, mime_type)))
 
         request_body = {
             "model": model,
@@ -1896,7 +2278,7 @@ class ProxyService:
                     body["resolution"] = resolution
             elif use_official_image_edit:
                 path = "v1/images/edits"
-                multipart_data, multipart_files, body = self._build_official_image_edit_payload(
+                multipart_data, multipart_files, body = await self._build_official_image_edit_payload(
                     model=model,
                     prompt=prompt,
                     size=size,
@@ -2585,6 +2967,20 @@ class ProxyService:
             "upstream_task": upstream_task,
             "error_message": error_message,
             "failure_category": self._classify_check_failure(None, error_message),
+        }
+
+    def _effort_log_fields(self, body: Optional[dict]) -> dict:
+        if not isinstance(body, dict):
+            return {}
+        thinking = body.get("thinking")
+        thinking_type = thinking.get("type") if isinstance(thinking, dict) else None
+        output_config = body.get("output_config")
+        output_config_effort = output_config.get("effort") if isinstance(output_config, dict) else None
+        return {
+            "thinking_type": thinking_type,
+            "reasoning_effort": body.get("reasoning_effort"),
+            "effort": body.get("effort"),
+            "output_config_effort": output_config_effort,
         }
 
     def _log_stream_event(self, stage: str, **kwargs):
@@ -3614,6 +4010,8 @@ class ProxyService:
         body: Optional[dict] = None,
         user_id: Optional[int] = None,
         original_model: Optional[str] = None,
+        attempt_timeout_seconds: Optional[float] = None,
+        _skip_gemini: bool = False,
     ) -> tuple[int, dict, Any]:
         """
         转发请求到目标 API
@@ -3631,6 +4029,11 @@ class ProxyService:
         """
         from .usage_tracker import usage_tracker
 
+        if not _skip_gemini and isinstance(body, dict) and self._is_gemini_model(body.get("model")):
+            capability = await self._resolve_gemini_capability(db, api_key, str(body.get("model") or ""))
+            if capability is True:
+                return await self._forward_gemini_request(db, api_key, body, headers, path=path, user_id=user_id)
+
         # 检测并升级为 Anthropic Messages 格式（支持 prompt cache）
         upgrade_to_claude = self._should_upgrade_chat_to_claude_messages(api_key, path, body)
         if upgrade_to_claude:
@@ -3642,12 +4045,23 @@ class ProxyService:
 
         # DeepSeek 思考模式参数注入
         body = self._inject_thinking_params(api_key, body, path)
+        body = self._strip_context_management_for_compat(api_key, body, path)
         # 仅 Grok 模型补齐缓存亲和参数
         body = self._apply_grok_cache_affinity(body, headers, path=path, model=original_model)
 
         url = self._build_url(api_key, path)
         forward_headers = self._build_headers(api_key, headers, path, body=body, model=original_model)
         upstream_body = self._normalize_body_for_upstream(body) if body else None
+        request_meta = {
+            "api_key_id": getattr(api_key, "id", None),
+            "provider": getattr(api_key, "provider", None),
+            "base_url": getattr(api_key, "base_url", None),
+            "path": path,
+            "model": body.get("model") if isinstance(body, dict) else None,
+            **self._effort_log_fields(body),
+        }
+        request_details = " ".join(f"{key}={value}" for key, value in request_meta.items() if value is not None)
+        logger.info(f"[CPA REQUEST] stage=start {request_details}".strip())
         self._write_upstream_request_debug_dump(
             api_key,
             method=method,
@@ -3669,11 +4083,16 @@ class ProxyService:
             # 复用连接池，避免每次新建 TCP/TLS 连接导致 ConnectError
             client = self._get_pooled_client(api_key, self.timeout)
             upstream_wait_start = time.perf_counter()
+            request_timeout = None
+            if attempt_timeout_seconds is not None:
+                remaining = max(float(attempt_timeout_seconds), 0.1)
+                request_timeout = httpx.Timeout(remaining)
             response = await client.request(
                 method=method,
                 url=url,
                 headers=forward_headers,
                 json=upstream_body,
+                timeout=request_timeout,
             )
 
             status_code = response.status_code
@@ -3898,6 +4317,72 @@ class ProxyService:
 
         return status_code, {}, response_data
 
+    async def forward_audio_request(
+        self,
+        db: AsyncSession,
+        api_key: Any,
+        method: str,
+        path: str,
+        headers: dict,
+        data: dict,
+        files: list[tuple[str, tuple[str, bytes, str]]],
+        user_id: Optional[int] = None,
+    ) -> tuple[int, dict, Any, str]:
+        """转发音频转写 multipart 请求，保留上游原始响应格式。"""
+        from .usage_tracker import usage_tracker
+
+        url = self._build_url(api_key, path)
+        forward_headers = self._build_headers(api_key, headers, path)
+        forward_headers.pop("content-type", None)
+        started_at = time.perf_counter()
+        status_code = 500
+        response_data: Any = {"error": {"message": "cpa_音频转写请求失败"}}
+        response_content_type = "application/json"
+        error_message = None
+        try:
+            async with httpx.AsyncClient(**self._build_client_kwargs(api_key, self._build_image_generation_timeout())) as client:
+                response = await client.request(method=method, url=url, headers=forward_headers, data=data, files=files)
+            status_code = response.status_code
+            response_content_type = response.headers.get("content-type", "application/octet-stream")
+            if "json" in response_content_type.lower():
+                try:
+                    response_data = response.json()
+                except ValueError:
+                    response_data = response.text
+            else:
+                response_data = response.content
+            if status_code >= 400:
+                error_message = self._extract_error_message(response_data, str(response_data))
+        except httpx.TimeoutException as exc:
+            status_code = 504
+            error_message = self._safe_error_message("请求超时: ", exc)
+            response_data = {"error": {"message": error_message}}
+        except httpx.RequestError as exc:
+            status_code = 502
+            error_message = self._safe_error_message("请求错误: ", exc)
+            response_data = {"error": {"message": error_message}}
+        except Exception as exc:
+            status_code = 500
+            error_message = self._safe_error_message("未知错误: ", exc)
+            response_data = {"error": {"message": error_message}}
+
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        await usage_tracker.record(
+            db=db,
+            api_key_id=api_key.id,
+            model=str(data.get("model") or ""),
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            latency_ms=latency_ms,
+            upstream_latency_ms=latency_ms,
+            cpa_overhead_ms=0,
+            status="success" if status_code < 400 else "error",
+            error_message=error_message,
+            user_id=user_id,
+        )
+        return status_code, {}, response_data, response_content_type
+
     # ── 流式缓冲规则匹配 ──────────────────────────────────────────────────────
 
     @staticmethod
@@ -3947,6 +4432,8 @@ class ProxyService:
         client_request: Optional[Request] = None,
         user_id: Optional[int] = None,
         original_model: Optional[str] = None,
+        attempt_timeout_seconds: Optional[float] = None,
+        _skip_gemini: bool = False,
     ) -> tuple[int, dict, Any, bool]:
         """
         完整缓冲模式的流式转发：先把上游 SSE 流完整收到内存，
@@ -3967,6 +4454,7 @@ class ProxyService:
             body = self._sanitize_messages_for_openai_compat(body)
         # DeepSeek 思考模式参数注入
         body = self._inject_thinking_params(api_key, body, path)
+        body = self._strip_context_management_for_compat(api_key, body, path)
         # 仅 Grok 模型补齐缓存亲和参数
         body = self._apply_grok_cache_affinity(body, headers, path=path, model=original_model or model)
         forward_headers = self._build_headers(api_key, headers, path, body=body, model=original_model or model)
@@ -3978,19 +4466,28 @@ class ProxyService:
             "base_url": getattr(api_key, "base_url", None),
             "path": path,
             "model": model,
+            **self._effort_log_fields(body),
         }
         self._log_stream_event("buffered_start", **request_meta)
 
         total_start = time.perf_counter()
         upstream_wait_seconds = 0.0
 
-        # 缓冲模式用更长的 read timeout，避免大请求在稳定窗口期内超时
+        # 缓冲模式在请求总预算内等待完整上游流，避免单次尝试突破重试 deadline。
         buffered_timeout = httpx.Timeout(
             connect=settings.proxy_stream_connect_timeout_seconds,
             read=max(int(settings.proxy_timeout or 300), 300),
             write=settings.proxy_stream_connect_timeout_seconds,
             pool=settings.proxy_stream_connect_timeout_seconds,
         )
+        if attempt_timeout_seconds is not None:
+            remaining = max(float(attempt_timeout_seconds), 0.1)
+            buffered_timeout = httpx.Timeout(
+                connect=min(remaining, settings.proxy_stream_connect_timeout_seconds),
+                read=remaining,
+                write=min(remaining, settings.proxy_stream_connect_timeout_seconds),
+                pool=min(remaining, settings.proxy_stream_connect_timeout_seconds),
+            )
         client = httpx.AsyncClient(**self._build_client_kwargs(api_key, buffered_timeout))
         request_obj = client.build_request(
             method=method,
@@ -4312,6 +4809,98 @@ class ProxyService:
 
     # ── 原始流式转发 ──────────────────────────────────────────────────────────
 
+    async def _forward_gemini_stream(
+        self,
+        db: AsyncSession,
+        api_key: Any,
+        body: dict,
+        headers: dict,
+        path: str = "",
+        user_id: Optional[int] = None,
+    ) -> tuple[int, dict, Any, bool]:
+        model = str(body.get("model") or "")
+        url = self._build_gemini_url(api_key, model, stream=True)
+        request_headers = {"content-type": "application/json", "x-goog-api-key": api_key.api_key}
+        payload = self._adapt_chat_body_to_gemini(body)
+        client = httpx.AsyncClient(**self._build_client_kwargs(api_key, self.stream_timeout))
+        try:
+            request = client.build_request("POST", url, headers=request_headers, json=payload)
+            response = await client.send(request, stream=True)
+            if response.status_code >= 400:
+                await response.aread()
+                error_data = self._parse_response_body(response)
+                status_code = response.status_code
+                await response.aclose()
+                await client.aclose()
+                if self._is_gemini_protocol_unsupported(status_code, error_data):
+                    fallback_body = body
+                    fallback_path = path
+                    if (path or "").lstrip("/") == "v1/responses":
+                        fallback_body = self.adapt_responses_request_to_chat(body)
+                        fallback_path = "/v1/chat/completions"
+                    elif (path or "").lstrip("/") == "v1/messages":
+                        fallback_body = self.adapt_claude_messages_request_to_chat(body)
+                        fallback_path = "/v1/chat/completions"
+                    fallback_status, fallback_headers, fallback_stream, fallback_retryable = await self.forward_stream(
+                        db=db,
+                        api_key=api_key,
+                        method="POST",
+                        path=fallback_path,
+                        headers=headers,
+                        body=fallback_body,
+                        client_request=None,
+                        user_id=user_id,
+                        original_model=model,
+                        _skip_gemini=True,
+                    )
+                    if fallback_status < 400:
+                        normalized_path = (path or "").lstrip("/")
+                        if normalized_path == "v1/responses":
+                            fallback_stream = self.adapt_chat_stream_to_responses(fallback_stream, model)
+                        elif normalized_path == "v1/messages":
+                            fallback_stream = self.adapt_chat_stream_to_claude_messages(fallback_stream, model)
+                    return fallback_status, fallback_headers, fallback_stream, fallback_retryable
+                return status_code, {}, error_data, False
+        except Exception:
+            await client.aclose()
+            raise
+
+        async def generate():
+            try:
+                index = 0
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if raw == "[DONE]":
+                        continue
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    candidates = data.get("candidates") or []
+                    parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
+                    text = "".join(str(part.get("text") or "") for part in parts if isinstance(part, dict))
+                    if not text:
+                        continue
+                    chunk = {
+                        "id": f"chatcmpl-gemini-{int(time.time() * 1000)}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [{"index": index, "delta": {"content": text}, "finish_reason": None}],
+                    }
+                    index += 1
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                final = {"id": f"chatcmpl-gemini-{int(time.time() * 1000)}", "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+            finally:
+                await response.aclose()
+                await client.aclose()
+
+        return response.status_code, {"content-type": "text/event-stream"}, generate(), False
+
     async def forward_stream(
         self,
         db: AsyncSession,
@@ -4323,6 +4912,8 @@ class ProxyService:
         client_request: Optional[Request] = None,
         user_id: Optional[int] = None,
         original_model: Optional[str] = None,
+        attempt_timeout_seconds: Optional[float] = None,
+        _skip_gemini: bool = False,
     ) -> tuple[int, dict, Any, bool]:
         """
         流式转发请求
@@ -4340,6 +4931,11 @@ class ProxyService:
         """
         from .usage_tracker import usage_tracker
 
+        if not _skip_gemini and isinstance(body, dict) and self._is_gemini_model(body.get("model")):
+            capability = await self._resolve_gemini_capability(db, api_key, str(body.get("model") or ""))
+            if capability is True:
+                return await self._forward_gemini_stream(db, api_key, body, headers, path=path, user_id=user_id)
+
         # 检测并升级为 Anthropic Messages 格式（支持 prompt cache）
         upgrade_to_claude = self._should_upgrade_chat_to_claude_messages(api_key, path, body)
         original_model_name = (body.get("model") if isinstance(body, dict) else None) or original_model
@@ -4355,6 +4951,7 @@ class ProxyService:
 
         # DeepSeek 思考模式参数注入
         body = self._inject_thinking_params(api_key, body, path)
+        body = self._strip_context_management_for_compat(api_key, body, path)
         # 仅 Grok 模型补齐缓存亲和参数
         body = self._apply_grok_cache_affinity(body, headers, path=path, model=original_model or original_model_name)
 
@@ -4385,11 +4982,21 @@ class ProxyService:
             "base_url": getattr(api_key, "base_url", None),
             "path": path,
             "model": model,
+            **self._effort_log_fields(body),
         }
 
         self._log_stream_event("start", **request_meta)
 
-        client = httpx.AsyncClient(**self._build_client_kwargs(api_key, self.stream_timeout))
+        stream_timeout = self.stream_timeout
+        if attempt_timeout_seconds is not None:
+            remaining = max(float(attempt_timeout_seconds), 0.1)
+            stream_timeout = httpx.Timeout(
+                connect=min(remaining, settings.proxy_stream_connect_timeout_seconds),
+                read=remaining,
+                write=min(remaining, settings.proxy_stream_connect_timeout_seconds),
+                pool=min(remaining, settings.proxy_stream_connect_timeout_seconds),
+            )
+        client = httpx.AsyncClient(**self._build_client_kwargs(api_key, stream_timeout))
         request = client.build_request(
             method=method,
             url=url,
@@ -4563,6 +5170,17 @@ class ProxyService:
             cache_tokens = 0
             last_synced_tokens = (0, 0, 0, 0)
             finish_reason = None
+            stream_started_at = time.perf_counter()
+            stream_deadline = (
+                stream_started_at + max(float(attempt_timeout_seconds), 0.1)
+                if attempt_timeout_seconds is not None
+                else None
+            )
+
+            def keepalive_event() -> bytes:
+                if (path or "").lstrip("/") == "v1/messages":
+                    return b'event: ping\ndata: {"type":"ping"}\n\n'
+                return b": keepalive\n\n"
 
             try:
                 stream_iterator = response.aiter_text()
@@ -4576,10 +5194,23 @@ class ProxyService:
                     upstream_wait_start = time.perf_counter()
                     try:
                         next_chunk = stream_iterator.__anext__()
-                        if not first_chunk_received:
-                            chunk = await asyncio.wait_for(next_chunk, timeout=self.stream_first_byte_timeout_seconds)
-                        else:
-                            chunk = await next_chunk
+                        now = time.perf_counter()
+                        if stream_deadline is not None and now >= stream_deadline:
+                            error_message = "流式请求超过总时间预算"
+                            self._log_stream_event("stream_total_timeout", **request_meta, error=error_message)
+                            break
+                        wait_timeout = self.stream_first_byte_timeout_seconds if not first_chunk_received else self.stream_keepalive_interval_seconds
+                        if stream_deadline is not None:
+                            wait_timeout = min(wait_timeout, max(stream_deadline - now, 0.1))
+                        try:
+                            chunk = await asyncio.wait_for(next_chunk, timeout=wait_timeout)
+                        except asyncio.TimeoutError:
+                            if stream_deadline is not None and time.perf_counter() >= stream_deadline:
+                                error_message = "流式请求超过总时间预算"
+                                self._log_stream_event("stream_total_timeout", **request_meta, error=error_message)
+                                break
+                            yield keepalive_event()
+                            continue
                     except StopAsyncIteration:
                         upstream_wait_seconds += time.perf_counter() - upstream_wait_start
                         if not first_chunk_received:

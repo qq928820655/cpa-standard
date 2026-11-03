@@ -29,8 +29,9 @@ from services.runtime_log_service import install_runtime_log_handler
 install_runtime_log_handler()
 
 from database import async_session_maker, init_db
-from routers import admin_router, proxy_router, stats_router, auth_router, openai_plus_router, grok_admin_router, grok_proxy_router
+from routers import admin_router, proxy_router, stats_router, auth_router, openai_plus_router, grok_admin_router, grok_proxy_router, plugins_router
 from services import usage_rollup_service
+from services.plugin_service import plugin_service
 
 logger = logging.getLogger(__name__)
 
@@ -78,28 +79,52 @@ async def _periodic_clear_stale_result_meta() -> None:
             logger.warning("periodic_clear_stale_result_meta failed: %s", exc)
 
 
+async def _periodic_recover_stale_usage_logs() -> None:
+    """后台回收异常中断后遗留的用量记录。"""
+    from services.usage_tracker import usage_tracker
+
+    while True:
+        await asyncio.sleep(300)
+        try:
+            async with async_session_maker() as db:
+                recovered = await usage_tracker.recover_stale_in_progress_records(db)
+                if recovered:
+                    logger.warning("recovered stale usage logs count=%s", recovered)
+        except Exception as exc:
+            logger.warning("periodic_recover_stale_usage_logs failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and tear down application resources."""
     install_runtime_log_handler()
+    plugin_service.load_plugin_models()
     await init_db()
+    await plugin_service.migrate_plugins()
     async with async_session_maker() as session:
         await usage_rollup_service.maintain(session)
+    plugin_service.load_backend_plugins(app)
 
     cleanup_task = asyncio.create_task(_periodic_close_stale_image_tasks())
     meta_cleanup_task = asyncio.create_task(_periodic_clear_stale_result_meta())
+    usage_cleanup_task = asyncio.create_task(_periodic_recover_stale_usage_logs())
 
     logger.info("[CPA] System started")
     logger.info("[CPA] Master Key loaded")
     yield
     cleanup_task.cancel()
     meta_cleanup_task.cancel()
+    usage_cleanup_task.cancel()
     try:
         await cleanup_task
     except asyncio.CancelledError:
         pass
     try:
         await meta_cleanup_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await usage_cleanup_task
     except asyncio.CancelledError:
         pass
     logger.info("[CPA] System stopped")
@@ -136,6 +161,7 @@ async def log_plus_requests(request: Request, call_next):
 
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
+app.include_router(plugins_router, prefix="/api/admin", tags=["plugins"])
 app.include_router(stats_router, prefix="/api/stats", tags=["stats"])
 app.include_router(proxy_router, tags=["proxy"])
 app.include_router(openai_plus_router, tags=["openai-plus"])

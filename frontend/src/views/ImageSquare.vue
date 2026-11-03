@@ -289,6 +289,7 @@
                 <el-button v-if="showUserFilter" link type="primary" @click.stop="openModelKeys(item)">
                   {{ item.available_key_count }} Key
                 </el-button>
+                <el-button v-if="showUserFilter" link type="primary" @click.stop="editImageModel(item)">编辑</el-button>
                 <span v-else class="model-capacity__status">{{ item.available_key_count > 0 ? '可用' : '暂无可用' }}</span>
                 <span>{{ formatRemainingImageCount(item.total_remaining_image_count) }}</span>
               </div>
@@ -743,10 +744,10 @@
       </div>
     </el-dialog>
 
-    <el-dialog v-model="imageModelDialogVisible" title="新增生图模型" width="520px">
+    <el-dialog v-model="imageModelDialogVisible" :title="editingImageModel ? '编辑生图模型' : '新增生图模型'" width="520px" @closed="resetImageModelForm">
       <el-form :model="imageModelForm" label-position="top">
         <el-form-item label="模型 ID">
-          <el-input v-model="imageModelForm.model" placeholder="例如：my-image-model" />
+          <el-input v-model="imageModelForm.model" :disabled="!!editingImageModel" placeholder="例如：my-image-model" />
         </el-form-item>
         <el-form-item label="显示名称">
           <el-input v-model="imageModelForm.display_name" placeholder="例如：My Image Model" />
@@ -767,7 +768,7 @@
       </el-form>
       <template #footer>
         <el-button @click="imageModelDialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="creatingImageModel" @click="submitImageModel">新增</el-button>
+        <el-button type="primary" :loading="creatingImageModel" @click="submitImageModel">{{ editingImageModel ? '保存' : '新增' }}</el-button>
       </template>
     </el-dialog>
 
@@ -1142,6 +1143,7 @@ const currentTask = ref(null)
 const detailTask = ref(null)
 const detailVisible = ref(false)
 const imageModelDialogVisible = ref(false)
+const editingImageModel = ref(null)
 const creatingImageModel = ref(false)
 const imageModelForm = reactive({
   model: '',
@@ -2046,6 +2048,25 @@ const loadModels = async () => {
   }
 }
 
+const editImageModel = (item) => {
+  editingImageModel.value = item.model
+  imageModelForm.model = item.model
+  imageModelForm.display_name = item.display_name
+  imageModelForm.provider = item.provider
+  imageModelForm.request_formats = [...item.request_formats]
+  imageModelForm.max_count = item.max_count
+  imageModelDialogVisible.value = true
+}
+
+const resetImageModelForm = () => {
+  editingImageModel.value = null
+  imageModelForm.model = ''
+  imageModelForm.display_name = ''
+  imageModelForm.provider = 'openai'
+  imageModelForm.request_formats = ['images']
+  imageModelForm.max_count = 1
+}
+
 const submitImageModel = async () => {
   const payload = {
     model: imageModelForm.model.trim(),
@@ -2061,19 +2082,17 @@ const submitImageModel = async () => {
 
   creatingImageModel.value = true
   try {
-    const created = await adminApi.createImageModel(payload)
+    const editing = !!editingImageModel.value
+    const saved = editing
+      ? await adminApi.updateImageModel(editingImageModel.value, payload)
+      : await adminApi.createImageModel(payload)
     imageModelDialogVisible.value = false
-    imageModelForm.model = ''
-    imageModelForm.display_name = ''
-    imageModelForm.provider = 'openai'
-    imageModelForm.request_formats = ['images']
-    imageModelForm.max_count = 1
     await loadModels()
-    form.model = created.model
+    if (!editing) form.model = saved.model
     handleModelChange()
-    ElMessage.success('生图模型已新增')
+    ElMessage.success(editing ? '生图模型已更新' : '生图模型已新增')
   } catch (error) {
-    ElMessage.error(error.message || '新增生图模型失败')
+    ElMessage.error(error.message || '保存生图模型失败')
   } finally {
     creatingImageModel.value = false
   }

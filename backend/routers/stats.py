@@ -338,6 +338,7 @@ async def get_usage_by_key(
     providers: Optional[List[str]] = Query(default=None),
     models: Optional[List[str]] = Query(default=None),
     user_id: Optional[int] = Query(default=None),
+    include_lifetime_only: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
     auth_info: dict = Depends(verify_admin_key),
 ):
@@ -414,7 +415,7 @@ async def get_usage_by_key(
                 last_request_times[row.api_key_id] = row.last_request_time
 
     # 管理员查看全部用户时，补齐没有当前区间明细的 Key，确保生命周期累计不随明细清理而消失。
-    if effective_user_id is None and not model_values:
+    if include_lifetime_only and effective_user_id is None and not model_values:
         lifetime_keys_query = select(ApiKey)
         if provider_values:
             lifetime_keys_query = lifetime_keys_query.where(ApiKey.provider.in_(provider_values))

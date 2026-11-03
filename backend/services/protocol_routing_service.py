@@ -83,6 +83,30 @@ class ProtocolRoutingService:
                 return [str(item).strip() for item in protocols if str(item).strip()]
         return []
 
+    async def capability_status(
+        self,
+        db: AsyncSession,
+        *,
+        provider: str,
+        base_url: str,
+        model: str,
+        protocol: str,
+        request_profile: str = "default",
+    ) -> bool | None:
+        from models import ProviderModelProtocolCapability
+
+        query = select(ProviderModelProtocolCapability).where(
+            ProviderModelProtocolCapability.provider == str(provider or "").strip().lower(),
+            ProviderModelProtocolCapability.base_url == self.normalize_base_url(base_url),
+            ProviderModelProtocolCapability.model_id == self.normalize_model(model),
+            ProviderModelProtocolCapability.protocol == str(protocol or "").strip().lower(),
+            ProviderModelProtocolCapability.request_profile == str(request_profile or "default").strip().lower(),
+        )
+        row = (await db.execute(query.order_by(ProviderModelProtocolCapability.checked_at.desc()))).scalars().first()
+        if row is None or (row.expires_at is not None and row.expires_at <= datetime.utcnow()):
+            return None
+        return bool(row.supported)
+
     async def supported_protocols(
         self,
         db: AsyncSession,
@@ -186,6 +210,34 @@ class ProtocolRoutingService:
         count_query = select(func.count()).select_from(ProviderModelProtocolCapability).where(*filters)
         total = int((await db.execute(count_query)).scalar() or 0)
         return rows, total
+
+    async def update_capability(
+        self,
+        db: AsyncSession,
+        capability_id: int,
+        *,
+        supported: bool,
+        request_profile: str,
+        source: str,
+        status_code: int | None,
+        detail: str | None,
+        expires_at: datetime | None,
+    ) -> Any:
+        from models import ProviderModelProtocolCapability
+
+        row = await db.get(ProviderModelProtocolCapability, capability_id)
+        if row is None:
+            return None
+        row.supported = bool(supported)
+        row.request_profile = str(request_profile or "default").strip().lower() or "default"
+        row.source = str(source or "manual").strip().lower() or "manual"
+        row.status_code = status_code
+        row.detail = detail
+        row.expires_at = expires_at
+        row.updated_at = datetime.utcnow()
+        await db.commit()
+        await db.refresh(row)
+        return row
 
     async def clear_capabilities(self, db: AsyncSession, *, ids: list[int] | None = None) -> int:
         from models import ProviderModelProtocolCapability

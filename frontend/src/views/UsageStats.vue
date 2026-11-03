@@ -927,8 +927,9 @@ const currentPage = ref(Number(savedState.currentPage) > 0 ? Number(savedState.c
 const pageSize = ref([10, 20, 50, 100].includes(Number(savedState.pageSize)) ? Number(savedState.pageSize) : 50)
 const totalLogs = ref(0)
 const pageSizeOptions = [10, 20, 50, 100]
-const AUTO_REFRESH_INTERVAL = 5000
+const AUTO_REFRESH_INTERVAL = 20000
 let refreshTimer = null
+let summaryAndDailyRequest = null
 
 const parseServerTime = (time) => {
   if (!time) return null
@@ -1058,13 +1059,18 @@ const chartOption = computed(() => {
 })
 
 const loadSummaryAndDaily = async () => {
+  if (summaryAndDailyRequest) return summaryAndDailyRequest
   const params = buildStatsParams()
-  const [summaryData, dailyData] = await Promise.all([
+  summaryAndDailyRequest = Promise.all([
     statsApi.getSummary(params),
     statsApi.getDaily(params),
-  ])
-  summary.value = summaryData
-  dailyUsage.value = dailyData
+  ]).then(([summaryData, dailyData]) => {
+    summary.value = summaryData
+    dailyUsage.value = dailyData
+  }).finally(() => {
+    summaryAndDailyRequest = null
+  })
+  return summaryAndDailyRequest
 }
 
 const loadData = async ({ resetLogsPage = false } = {}) => {
@@ -1078,7 +1084,7 @@ const loadData = async ({ resetLogsPage = false } = {}) => {
   }
 }
 
-const loadLogs = async () => {
+const loadLogs = async ({ silent = false } = {}) => {
   loadingLogs.value = true
   try {
     const params = {
@@ -1098,7 +1104,7 @@ const loadLogs = async () => {
       totalLogs.value = result.total || 0
     }
   } catch (e) {
-    ElMessage.error(e.message || '加载日志失败')
+    if (!silent) ElMessage.error(e.message || '加载日志失败')
   } finally {
     loadingLogs.value = false
   }
@@ -1205,9 +1211,9 @@ const stopAutoRefresh = () => {
 }
 
 const refreshDataSilently = async () => {
-  if (document.hidden || loadingLogs.value) return
+  if (document.hidden || loadingLogs.value || summaryAndDailyRequest) return
   try {
-    await Promise.all([loadSummaryAndDaily(), loadLogs()])
+    await Promise.all([loadSummaryAndDaily(), loadLogs({ silent: true })])
   } catch {
     // ignore background refresh errors
   }

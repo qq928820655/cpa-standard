@@ -24,6 +24,13 @@ def normalize_image_model_name(model: str | None) -> str:
     return (model or "").strip().lower()
 
 
+def _get_table_columns(sync_conn, table_name: str):
+    inspector = inspect(sync_conn)
+    if not inspector.has_table(table_name):
+        return []
+    return inspector.get_columns(table_name)
+
+
 engine = create_async_engine(
     settings.database_url,
     echo=False,
@@ -85,123 +92,127 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
 
         def has_supported_models(sync_conn):
-            columns = inspect(sync_conn).get_columns("api_keys")
+            columns = _get_table_columns(sync_conn, "api_keys")
             return any(column["name"] == "supported_models" for column in columns)
 
         def has_enable_proxy(sync_conn):
-            columns = inspect(sync_conn).get_columns("api_keys")
+            columns = _get_table_columns(sync_conn, "api_keys")
             return any(column["name"] == "enable_proxy" for column in columns)
 
         def has_proxy_url(sync_conn):
-            columns = inspect(sync_conn).get_columns("api_keys")
+            columns = _get_table_columns(sync_conn, "api_keys")
             return any(column["name"] == "proxy_url" for column in columns)
 
         def has_proxy_username(sync_conn):
-            columns = inspect(sync_conn).get_columns("api_keys")
+            columns = _get_table_columns(sync_conn, "api_keys")
             return any(column["name"] == "proxy_username" for column in columns)
 
         def has_proxy_password(sync_conn):
-            columns = inspect(sync_conn).get_columns("api_keys")
+            columns = _get_table_columns(sync_conn, "api_keys")
             return any(column["name"] == "proxy_password" for column in columns)
 
         def has_enable_fake_ip(sync_conn):
-            columns = inspect(sync_conn).get_columns("api_keys")
+            columns = _get_table_columns(sync_conn, "api_keys")
             return any(column["name"] == "enable_fake_ip" for column in columns)
 
         def has_fake_ip(sync_conn):
-            columns = inspect(sync_conn).get_columns("api_keys")
+            columns = _get_table_columns(sync_conn, "api_keys")
             return any(column["name"] == "fake_ip" for column in columns)
 
         def has_api_key_api_type(sync_conn):
-            columns = inspect(sync_conn).get_columns("api_keys")
+            columns = _get_table_columns(sync_conn, "api_keys")
             return any(column["name"] == "api_type" for column in columns)
 
         def has_provider_model_priority_model_normalized(sync_conn):
-            columns = inspect(sync_conn).get_columns("provider_model_priorities")
+            columns = _get_table_columns(sync_conn, "provider_model_priorities")
             return any(column["name"] == "model_normalized" for column in columns)
 
         def has_supports_gemini(sync_conn):
-            columns = inspect(sync_conn).get_columns("model_catalog")
+            columns = _get_table_columns(sync_conn, "model_catalog")
             return any(column["name"] == "supports_gemini" for column in columns)
 
         def has_model_catalog_cache_read_price(sync_conn):
-            columns = inspect(sync_conn).get_columns("model_catalog")
+            columns = _get_table_columns(sync_conn, "model_catalog")
             return any(column["name"] == "cache_read_price" for column in columns)
 
         def has_model_catalog_cache_write_price(sync_conn):
-            columns = inspect(sync_conn).get_columns("model_catalog")
+            columns = _get_table_columns(sync_conn, "model_catalog")
             return any(column["name"] == "cache_write_price" for column in columns)
 
         def has_upstream_latency_ms(sync_conn):
-            columns = inspect(sync_conn).get_columns("usage_logs")
+            columns = _get_table_columns(sync_conn, "usage_logs")
             return any(column["name"] == "upstream_latency_ms" for column in columns)
 
         def has_cpa_overhead_ms(sync_conn):
-            columns = inspect(sync_conn).get_columns("usage_logs")
+            columns = _get_table_columns(sync_conn, "usage_logs")
             return any(column["name"] == "cpa_overhead_ms" for column in columns)
 
         def has_openai_plus_usage_latency_ms(sync_conn):
-            columns = inspect(sync_conn).get_columns("openai_plus_usage_logs")
+            columns = _get_table_columns(sync_conn, "openai_plus_usage_logs")
             return any(column["name"] == "latency_ms" for column in columns)
 
         def has_openai_plus_usage_cache_tokens(sync_conn):
-            columns = inspect(sync_conn).get_columns("openai_plus_usage_logs")
+            columns = _get_table_columns(sync_conn, "openai_plus_usage_logs")
             return any(column["name"] == "cache_tokens" for column in columns)
 
         def has_openai_plus_account_cache_tokens(sync_conn):
-            columns = inspect(sync_conn).get_columns("openai_plus_accounts")
+            columns = _get_table_columns(sync_conn, "openai_plus_accounts")
             return any(column["name"] == "cache_tokens" for column in columns)
 
         def has_protocol_capability_request_profile(sync_conn):
-            columns = inspect(sync_conn).get_columns("provider_model_protocol_capabilities")
+            columns = _get_table_columns(sync_conn, "provider_model_protocol_capabilities")
             return any(column["name"] == "request_profile" for column in columns)
 
         def has_image_generation_task_is_deleted(sync_conn):
-            columns = inspect(sync_conn).get_columns("image_generation_tasks")
+            columns = _get_table_columns(sync_conn, "image_generation_tasks")
             return any(column["name"] == "is_deleted" for column in columns)
 
         def has_image_generation_task_duration_ms(sync_conn):
-            columns = inspect(sync_conn).get_columns("image_generation_tasks")
+            columns = _get_table_columns(sync_conn, "image_generation_tasks")
             return any(column["name"] == "duration_ms" for column in columns)
 
         def has_image_generation_task_result_duration_ms(sync_conn):
-            columns = inspect(sync_conn).get_columns("image_generation_task_results")
+            columns = _get_table_columns(sync_conn, "image_generation_task_results")
             return any(column["name"] == "duration_ms" for column in columns)
 
         def has_image_generation_task_pending_refresh(sync_conn):
-            columns = inspect(sync_conn).get_columns("image_generation_tasks")
+            columns = _get_table_columns(sync_conn, "image_generation_tasks")
             return any(column["name"] == "pending_refresh" for column in columns)
 
         def has_admin_user_role(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "role" for column in columns)
 
         def has_admin_user_api_key(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "api_key" for column in columns)
 
         def has_admin_user_supported_models(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "supported_models" for column in columns)
 
         def has_usage_log_user_id(sync_conn):
-            columns = inspect(sync_conn).get_columns("usage_logs")
+            columns = _get_table_columns(sync_conn, "usage_logs")
             return any(column["name"] == "user_id" for column in columns)
 
         def has_image_generation_task_user_id(sync_conn):
-            columns = inspect(sync_conn).get_columns("image_generation_tasks")
+            columns = _get_table_columns(sync_conn, "image_generation_tasks")
             return any(column["name"] == "user_id" for column in columns)
 
         def has_usage_daily_summary_user_id(sync_conn):
-            columns = inspect(sync_conn).get_columns("usage_daily_summaries")
+            columns = _get_table_columns(sync_conn, "usage_daily_summaries")
             return any(column["name"] == "user_id" for column in columns)
 
         def has_image_key_model_stats_rows(sync_conn):
+            if not inspect(sync_conn).has_table("image_key_model_stats"):
+                return False
             result = sync_conn.execute(text("SELECT COUNT(1) FROM image_key_model_stats"))
             return int(result.scalar() or 0) > 0
 
         def has_image_key_model_stats_float_units(sync_conn):
             """检查 spent_units 列是否已为 REAL/FLOAT 类型"""
+            if not inspect(sync_conn).has_table("image_key_model_stats"):
+                return True
             result = sync_conn.execute(text("PRAGMA table_info(image_key_model_stats)"))
             for row in result.fetchall():
                 if row[1] == "spent_units":
@@ -276,39 +287,39 @@ async def init_db():
             )
 
         def has_cache_tokens_log(sync_conn):
-            columns = inspect(sync_conn).get_columns("usage_logs")
+            columns = _get_table_columns(sync_conn, "usage_logs")
             return any(column["name"] == "cache_tokens" for column in columns)
 
         def has_cache_tokens_summary(sync_conn):
-            columns = inspect(sync_conn).get_columns("usage_daily_summaries")
+            columns = _get_table_columns(sync_conn, "usage_daily_summaries")
             return any(column["name"] == "cache_tokens" for column in columns)
 
         if not await conn.run_sync(has_cache_tokens_log):
             await conn.exec_driver_sql("ALTER TABLE usage_logs ADD COLUMN cache_tokens INTEGER DEFAULT 0")
 
         def has_api_key_password(sync_conn):
-            columns = inspect(sync_conn).get_columns("api_keys")
+            columns = _get_table_columns(sync_conn, "api_keys")
             return any(column["name"] == "password" for column in columns)
 
         if not await conn.run_sync(has_api_key_password):
             await conn.exec_driver_sql("ALTER TABLE api_keys ADD COLUMN password TEXT")
 
         def has_api_key_wz_url(sync_conn):
-            columns = inspect(sync_conn).get_columns("api_keys")
+            columns = _get_table_columns(sync_conn, "api_keys")
             return any(column["name"] == "wz_url" for column in columns)
 
         if not await conn.run_sync(has_api_key_wz_url):
             await conn.exec_driver_sql("ALTER TABLE api_keys ADD COLUMN wz_url VARCHAR(500)")
 
         def has_api_key_security_violation_count(sync_conn):
-            columns = inspect(sync_conn).get_columns("api_keys")
+            columns = _get_table_columns(sync_conn, "api_keys")
             return any(column["name"] == "security_violation_count" for column in columns)
 
         if not await conn.run_sync(has_api_key_security_violation_count):
             await conn.exec_driver_sql("ALTER TABLE api_keys ADD COLUMN security_violation_count INTEGER DEFAULT 0")
 
         def has_api_key_last_security_violation(sync_conn):
-            columns = inspect(sync_conn).get_columns("api_keys")
+            columns = _get_table_columns(sync_conn, "api_keys")
             return any(column["name"] == "last_security_violation" for column in columns)
 
         if not await conn.run_sync(has_api_key_last_security_violation):
@@ -316,7 +327,7 @@ async def init_db():
 
         def has_api_key_lifetime_column(column_name: str):
             def _check(sync_conn):
-                columns = inspect(sync_conn).get_columns("api_keys")
+                columns = _get_table_columns(sync_conn, "api_keys")
                 return any(column["name"] == column_name for column in columns)
             return _check
 
@@ -336,7 +347,7 @@ async def init_db():
                 api_key_lifetime_columns_added = True
 
         def has_actual_model(sync_conn):
-            columns = inspect(sync_conn).get_columns("usage_logs")
+            columns = _get_table_columns(sync_conn, "usage_logs")
             return any(column["name"] == "actual_model" for column in columns)
 
         if not await conn.run_sync(has_actual_model):
@@ -376,7 +387,7 @@ async def init_db():
 
         def has_admin_user_lifetime_column(column_name: str):
             def _check(sync_conn):
-                columns = inspect(sync_conn).get_columns("admin_users")
+                columns = _get_table_columns(sync_conn, "admin_users")
                 return any(column["name"] == column_name for column in columns)
             return _check
 
@@ -519,11 +530,11 @@ async def init_db():
             await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN supported_models TEXT")
 
         def has_admin_user_show_image_square(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "show_image_square" for column in columns)
 
         def has_admin_user_supported_image_models(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "supported_image_models" for column in columns)
 
         if not await conn.run_sync(has_admin_user_show_image_square):
@@ -533,15 +544,15 @@ async def init_db():
             await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN supported_image_models TEXT")
 
         def has_admin_user_daily_token_limit(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "daily_token_limit" for column in columns)
 
         def has_admin_user_weekly_token_limit(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "weekly_token_limit" for column in columns)
 
         def has_admin_user_monthly_token_limit(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "monthly_token_limit" for column in columns)
 
         if not await conn.run_sync(has_admin_user_daily_token_limit):
@@ -554,11 +565,11 @@ async def init_db():
             await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN monthly_token_limit INTEGER")
 
         def has_admin_user_quota_exceeded_mode(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "quota_exceeded_mode" for column in columns)
 
         def has_admin_user_quota_exceeded_message(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "quota_exceeded_message" for column in columns)
 
         if not await conn.run_sync(has_admin_user_quota_exceeded_mode):
@@ -568,18 +579,18 @@ async def init_db():
             await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN quota_exceeded_message TEXT")
 
         def has_admin_user_model_mapping(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "model_mapping" for column in columns)
 
         if not await conn.run_sync(has_admin_user_model_mapping):
             await conn.exec_driver_sql("ALTER TABLE admin_users ADD COLUMN model_mapping TEXT")
 
         def has_admin_user_show_quota(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "show_quota_to_user" for column in columns)
 
         def has_admin_user_quota_reset_at(sync_conn):
-            columns = inspect(sync_conn).get_columns("admin_users")
+            columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "quota_reset_at" for column in columns)
 
         if not await conn.run_sync(has_admin_user_show_quota):
@@ -610,6 +621,63 @@ async def init_db():
 
         await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_usage_daily_summaries_user_id ON usage_daily_summaries(user_id)")
 
+        def has_usage_summary_user_unique(sync_conn):
+            inspector = inspect(sync_conn)
+            if not inspector.has_table("usage_daily_summaries"):
+                return True
+            expected = {"summary_date", "api_key_id", "user_id"}
+            return any(set(item.get("column_names") or []) == expected for item in inspector.get_unique_constraints("usage_daily_summaries"))
+
+        if not await conn.run_sync(has_usage_summary_user_unique):
+            await conn.exec_driver_sql("""
+                CREATE TABLE usage_daily_summaries_migrated (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    summary_date DATE NOT NULL,
+                    api_key_id INTEGER NOT NULL,
+                    user_id INTEGER,
+                    total_requests INTEGER DEFAULT 0,
+                    success_requests INTEGER DEFAULT 0,
+                    error_requests INTEGER DEFAULT 0,
+                    in_progress_requests INTEGER DEFAULT 0,
+                    total_tokens INTEGER DEFAULT 0,
+                    prompt_tokens INTEGER DEFAULT 0,
+                    completion_tokens INTEGER DEFAULT 0,
+                    cache_tokens INTEGER DEFAULT 0,
+                    latency_sum_ms INTEGER DEFAULT 0,
+                    latency_count INTEGER DEFAULT 0,
+                    upstream_latency_sum_ms INTEGER DEFAULT 0,
+                    upstream_latency_count INTEGER DEFAULT 0,
+                    cpa_overhead_sum_ms INTEGER DEFAULT 0,
+                    cpa_overhead_count INTEGER DEFAULT 0,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    UNIQUE(summary_date, api_key_id, user_id)
+                )
+            """)
+            await conn.exec_driver_sql("""
+                INSERT INTO usage_daily_summaries_migrated (
+                    id, summary_date, api_key_id, user_id, total_requests,
+                    success_requests, error_requests, in_progress_requests,
+                    total_tokens, prompt_tokens, completion_tokens, cache_tokens,
+                    latency_sum_ms, latency_count, upstream_latency_sum_ms,
+                    upstream_latency_count, cpa_overhead_sum_ms, cpa_overhead_count,
+                    created_at, updated_at
+                )
+                SELECT
+                    id, summary_date, api_key_id, user_id, total_requests,
+                    success_requests, error_requests, in_progress_requests,
+                    total_tokens, prompt_tokens, completion_tokens, cache_tokens,
+                    latency_sum_ms, latency_count, upstream_latency_sum_ms,
+                    upstream_latency_count, cpa_overhead_sum_ms, cpa_overhead_count,
+                    created_at, updated_at
+                FROM usage_daily_summaries
+            """)
+            await conn.exec_driver_sql("DROP TABLE usage_daily_summaries")
+            await conn.exec_driver_sql("ALTER TABLE usage_daily_summaries_migrated RENAME TO usage_daily_summaries")
+            await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_usage_daily_summaries_summary_date ON usage_daily_summaries(summary_date)")
+            await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_usage_daily_summaries_api_key_id ON usage_daily_summaries(api_key_id)")
+            await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_usage_daily_summaries_user_id ON usage_daily_summaries(user_id)")
+
         if not await conn.run_sync(has_image_key_model_stats_float_units):
             # 将 image_key_model_stats 的 spent_units/remaining_units 从 INTEGER 迁移为 REAL
             await conn.exec_driver_sql("""
@@ -632,8 +700,16 @@ async def init_db():
                 )
             """)
             await conn.exec_driver_sql("""
-                INSERT OR IGNORE INTO image_key_model_stats_migrated
-                SELECT * FROM image_key_model_stats
+                INSERT OR IGNORE INTO image_key_model_stats_migrated (
+                    id, api_key_id, api_key_name, provider, model, model_normalized,
+                    total_count, success_count, error_count, spent_units, remaining_units,
+                    last_generated_at, created_at, updated_at
+                )
+                SELECT
+                    id, api_key_id, api_key_name, provider, model, model_normalized,
+                    total_count, success_count, error_count, spent_units, remaining_units,
+                    last_generated_at, created_at, updated_at
+                FROM image_key_model_stats
             """)
             await conn.exec_driver_sql("DROP TABLE IF EXISTS image_key_model_stats")
             await conn.exec_driver_sql("ALTER TABLE image_key_model_stats_migrated RENAME TO image_key_model_stats")

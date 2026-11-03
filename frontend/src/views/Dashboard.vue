@@ -278,7 +278,7 @@
               {{ row.provider }}
             </el-tag>
             <el-tag size="small" type="info">{{ Number(row.total_requests || 0).toLocaleString('zh-CN') }} 次</el-tag>
-            <el-tag size="small" type="info">历史 {{ formatNumber(row.lifetime_total_tokens) }} token</el-tag>
+            <el-tag size="small" type="info">区间 {{ formatNumber(row.total_tokens) }} Token</el-tag>
           </div>
 
           <div v-show="isKeyRowExpanded(row.api_key_id)" class="key-rank-card__rows">
@@ -325,9 +325,9 @@
               {{ Number(row.total_requests || 0).toLocaleString('zh-CN') }}
             </template>
           </el-table-column>
-          <el-table-column prop="lifetime_total_tokens" label="历史 Token" min-width="140" sortable="custom">
+          <el-table-column prop="total_tokens" label="区间 Token" min-width="140" sortable="custom">
             <template #default="{ row }">
-              {{ formatNumber(row.lifetime_total_tokens) }}
+              {{ formatNumber(row.total_tokens) }}
             </template>
           </el-table-column>
           <el-table-column prop="success_rate" label="成功率" min-width="180" sortable="custom">
@@ -678,10 +678,10 @@ const sortedKeyUsage = computed(() => {
       if (timeResult) return timeResult
     }
     if (usageOrder) {
-      const usageResult = compareByOrder(left, right, 'lifetime_total_tokens', usageOrder)
+      const usageResult = compareByOrder(left, right, 'total_tokens', usageOrder)
       if (usageResult) return usageResult
     }
-    return compareByOrder(left, right, 'lifetime_total_tokens', 'descending')
+    return compareByOrder(left, right, 'total_tokens', 'descending')
   })
   return items
 })

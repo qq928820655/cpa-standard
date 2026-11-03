@@ -1,0 +1,3 @@
+ArcReel style thumbnails and templates included in this directory are derived from https://github.com/ArcReel/ArcReel.
+
+Copyright notices and license terms are preserved under the GNU Affero General Public License, version 3 (AGPL-3.0-only). See the upstream repository for the complete license text and corresponding source.

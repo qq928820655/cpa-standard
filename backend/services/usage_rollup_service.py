@@ -126,12 +126,19 @@ class UsageRollupService:
 
         now = now or datetime.utcnow()
         summary_start = cls.get_summary_boundary(now).date()
-        summary_end = cls.get_realtime_boundary(now).date()
+        realtime_boundary = cls.get_realtime_boundary(now)
+        summary_boundary = cls.get_summary_boundary(now)
+        summary_end = realtime_boundary.date()
 
+        existing_dates = select(func.date(UsageLog.request_time)).where(
+            UsageLog.request_time < realtime_boundary,
+            UsageLog.request_time >= summary_boundary,
+        )
         await db.execute(
             delete(UsageDailySummary).where(
                 UsageDailySummary.summary_date >= summary_start,
                 UsageDailySummary.summary_date <= summary_end,
+                UsageDailySummary.summary_date.in_(existing_dates),
             )
         )
 
@@ -139,6 +146,7 @@ class UsageRollupService:
             select(
                 func.date(UsageLog.request_time).label("summary_date"),
                 UsageLog.api_key_id.label("api_key_id"),
+                UsageLog.user_id.label("user_id"),
                 func.count(UsageLog.id).label("total_requests"),
                 func.sum(case((UsageLog.status == "success", 1), else_=0)).label("success_requests"),
                 func.sum(case((UsageLog.status == "error", 1), else_=0)).label("error_requests"),
@@ -154,9 +162,9 @@ class UsageRollupService:
                 func.coalesce(func.sum(case((UsageLog.upstream_latency_ms > 0, UsageLog.cpa_overhead_ms), else_=0)), 0).label("cpa_overhead_sum_ms"),
                 func.coalesce(func.sum(case((UsageLog.upstream_latency_ms > 0, 1), else_=0)), 0).label("cpa_overhead_count"),
             )
-            .where(UsageLog.request_time < cls.get_realtime_boundary(now))
-            .where(UsageLog.request_time >= cls.get_summary_boundary(now))
-            .group_by(func.date(UsageLog.request_time), UsageLog.api_key_id)
+            .where(UsageLog.request_time < realtime_boundary)
+            .where(UsageLog.request_time >= summary_boundary)
+            .group_by(func.date(UsageLog.request_time), UsageLog.api_key_id, UsageLog.user_id)
         )
 
         result = await db.execute(query)
@@ -166,7 +174,7 @@ class UsageRollupService:
                 UsageDailySummary(
                     summary_date=datetime.strptime(str(row.summary_date), "%Y-%m-%d").date(),
                     api_key_id=row.api_key_id,
-                    user_id=None,
+                    user_id=getattr(row, "user_id", None),
                     total_requests=row.total_requests or 0,
                     success_requests=row.success_requests or 0,
                     error_requests=row.error_requests or 0,
@@ -205,6 +213,7 @@ class UsageRollupService:
     async def maintain(cls, db: AsyncSession, *, now: Optional[datetime] = None):
         now = now or datetime.utcnow()
         await cls.rebuild_recent_summaries(db, now=now)
+        await cls.cleanup_old_data(db, now=now)
 
 
 usage_rollup_service = UsageRollupService()
