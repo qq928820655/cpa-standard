@@ -103,7 +103,6 @@ async def lifespan(app: FastAPI):
     await plugin_service.migrate_plugins()
     async with async_session_maker() as session:
         await usage_rollup_service.maintain(session)
-    plugin_service.load_backend_plugins(app)
 
     cleanup_task = asyncio.create_task(_periodic_close_stale_image_tasks())
     meta_cleanup_task = asyncio.create_task(_periodic_clear_stale_result_meta())
@@ -167,6 +166,10 @@ app.include_router(proxy_router, tags=["proxy"])
 app.include_router(openai_plus_router, tags=["openai-plus"])
 app.include_router(grok_admin_router, prefix="/api/admin/grok", tags=["grok-admin"])
 app.include_router(grok_proxy_router, prefix="/grok", tags=["grok-proxy"])
+
+# 本地修复：插件后端路由必须在下方 SPA catch-all (/{full_path:path}) 之前注册，
+# 否则被 catch-all 遮蔽会全部返回前端 index.html（上游包在 lifespan 内注册导致）。
+plugin_service.load_backend_plugins(app)
 
 
 def _guess_media_type(filepath: Path) -> str | None:
