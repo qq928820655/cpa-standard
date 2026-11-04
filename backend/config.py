@@ -155,7 +155,7 @@ class Settings(BaseSettings):
     # 代理超时配置（秒）
     proxy_timeout: int = 300
     proxy_request_timeout_seconds: int = 180
-    proxy_stream_connect_timeout_seconds: int = 15
+    proxy_stream_connect_timeout_seconds: int = 5
     proxy_stream_first_byte_timeout_seconds: int = 15
     proxy_stream_read_timeout_seconds: int = 180
     proxy_retry_same_key_enabled: bool = True

@@ -100,6 +100,19 @@ def should_cooldown_key(status_code: int) -> bool:
     return status_code in {401, 403, 429} or status_code >= 500
 
 
+TRANSPORT_ERROR_COOLDOWN_SECONDS = 10
+
+
+def is_transport_stage_error(response_data: Any) -> bool:
+    """传输层失败（建连/发送阶段异常，未收到上游任何 HTTP 响应）。
+
+    这类错误指向本机出站链路抖动而非上游故障：上游可能完全健康。
+    因此只做短冷却（防打爆），且不计入 provider 熔断，
+    避免一次网络抖动把健康 key 封禁 120s、客户端长时间 503。
+    """
+    return isinstance(response_data, dict) and bool(response_data.get("cpa_transport_error"))
+
+
 def is_nginx_error_response(response_data: Any) -> bool:
     """判断是否是 nginx/代理层返回的错误页（非业务错误），这类错误应该换 Key 重试"""
     if not isinstance(response_data, dict):
@@ -1050,7 +1063,7 @@ async def forward_stream_with_retry(
         last_response_headers = response_headers
         last_response_body = stream_response
         await _record_protocol_capability(db, api_key, upstream_model, path, status_code, stream_response)
-        if status_code >= 500:
+        if status_code >= 500 and not is_transport_stage_error(stream_response):
             pool_manager.record_provider_failure(getattr(api_key, "provider", None))
 
         if (
@@ -1204,9 +1217,13 @@ async def forward_stream_with_retry(
             last_response_body = stream_response
 
         if should_cooldown_key(status_code):
-            cooldown_seconds = pool_manager.get_cooldown_seconds_for_status(status_code)
-            pool_manager.mark_key_cooldown(api_key.id, cooldown_seconds)
-            logger.warning(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
+            if is_transport_stage_error(stream_response):
+                pool_manager.mark_key_cooldown(api_key.id, TRANSPORT_ERROR_COOLDOWN_SECONDS)
+                logger.warning(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={TRANSPORT_ERROR_COOLDOWN_SECONDS} path={path} reason=transport_stage")
+            else:
+                cooldown_seconds = pool_manager.get_cooldown_seconds_for_status(status_code)
+                pool_manager.mark_key_cooldown(api_key.id, cooldown_seconds)
+                logger.warning(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
 
         if not retryable:
             _trace_attempt(
@@ -1422,7 +1439,7 @@ async def forward_request_with_retry(
         last_response_body = response_data
         if not skip_gemini:
             await _record_protocol_capability(db, api_key, upstream_model, path, status_code, response_data)
-        if status_code >= 500:
+        if status_code >= 500 and not is_transport_stage_error(response_data):
             pool_manager.record_provider_failure(getattr(api_key, "provider", None))
 
         if (
@@ -1657,9 +1674,13 @@ async def forward_request_with_retry(
             last_response_body = response_data
 
         if should_cooldown_key(status_code):
-            cooldown_seconds = pool_manager.get_cooldown_seconds_for_status(status_code)
-            pool_manager.mark_key_cooldown(api_key.id, cooldown_seconds)
-            logger.warning(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
+            if is_transport_stage_error(response_data):
+                pool_manager.mark_key_cooldown(api_key.id, TRANSPORT_ERROR_COOLDOWN_SECONDS)
+                logger.warning(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={TRANSPORT_ERROR_COOLDOWN_SECONDS} path={path} reason=transport_stage")
+            else:
+                cooldown_seconds = pool_manager.get_cooldown_seconds_for_status(status_code)
+                pool_manager.mark_key_cooldown(api_key.id, cooldown_seconds)
+                logger.warning(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
 
         # 透传错误：不重试，直接返回上游响应
         if should_pass_through_error(status_code):
@@ -1851,9 +1872,13 @@ async def forward_image_request_with_retry(
             continue
 
         if should_cooldown_key(status_code):
-            cooldown_seconds = pool_manager.get_cooldown_seconds_for_status(status_code)
-            pool_manager.mark_key_cooldown(api_key.id, cooldown_seconds)
-            logger.warning(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
+            if is_transport_stage_error(response_data):
+                pool_manager.mark_key_cooldown(api_key.id, TRANSPORT_ERROR_COOLDOWN_SECONDS)
+                logger.warning(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={TRANSPORT_ERROR_COOLDOWN_SECONDS} path={path} reason=transport_stage")
+            else:
+                cooldown_seconds = pool_manager.get_cooldown_seconds_for_status(status_code)
+                pool_manager.mark_key_cooldown(api_key.id, cooldown_seconds)
+                logger.warning(f"[CPA KEY COOLDOWN] api_key_id={api_key.id} status={status_code} seconds={cooldown_seconds} path={path}")
 
         # 透传错误：不重试，直接返回上游响应
         if should_pass_through_error(status_code):

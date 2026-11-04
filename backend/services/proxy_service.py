@@ -1410,9 +1410,9 @@ class ProxyService:
             await usage_tracker.record(db=db, api_key_id=api_key.id, model=model, prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0), total_tokens=usage.get("total_tokens", 0), latency_ms=int((time.perf_counter() - started_at) * 1000), upstream_latency_ms=int((time.perf_counter() - started_at) * 1000), cpa_overhead_ms=0, status="success" if response.status_code < 400 else "error", error_message=None if response.status_code < 400 else str(response_data), user_id=user_id)
             return response.status_code, {}, response_data
         except httpx.TimeoutException as exc:
-            return 504, {}, {"error": {"message": self._safe_error_message("请求超时: ", exc)}}
+            return 504, {}, {"error": {"message": self._safe_error_message("请求超时: ", exc)}, "cpa_transport_error": True}
         except httpx.RequestError as exc:
-            return 502, {}, {"error": {"message": self._safe_error_message("请求错误: ", exc)}}
+            return 502, {}, {"error": {"message": self._safe_error_message("请求错误: ", exc)}, "cpa_transport_error": True}
 
     def _build_url(self, api_key: Any, path: str) -> str:
         """
@@ -4107,7 +4107,7 @@ class ProxyService:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
             status = "error"
             error_message = self._safe_error_message("请求超时: ", e)
-            response_data = {"error": {"message": error_message}}
+            response_data = {"error": {"message": error_message}, "cpa_transport_error": True}
         except httpx.RemoteProtocolError as e:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
@@ -4117,7 +4117,7 @@ class ProxyService:
                 error_message = self._safe_error_message("上游服务断开连接: ", e)
             else:
                 error_message = self._safe_error_message("上游协议错误: ", e)
-            response_data = {"error": {"message": error_message}}
+            response_data = {"error": {"message": error_message}, "cpa_transport_error": True}
         except httpx.RequestError as e:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
@@ -4134,13 +4134,13 @@ class ProxyService:
                 if old_client is not None:
                     import asyncio
                     asyncio.ensure_future(old_client.aclose())
-            response_data = {"error": {"message": error_message}}
+            response_data = {"error": {"message": error_message}, "cpa_transport_error": True}
         except Exception as e:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
             status = "error"
             error_message = self._safe_error_message("未知错误: ", e)
-            response_data = {"error": {"message": error_message}}
+            response_data = {"error": {"message": error_message}, "cpa_transport_error": True}
 
         # 计算耗时
         latency_ms = int((time.perf_counter() - total_start) * 1000)
@@ -4269,7 +4269,7 @@ class ProxyService:
             status_code = 504
             status = "error"
             error_message = self._safe_error_message("请求超时: ", e)
-            response_data = {"error": {"message": error_message}}
+            response_data = {"error": {"message": error_message}, "cpa_transport_error": True}
         except httpx.RemoteProtocolError as e:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
@@ -4280,21 +4280,21 @@ class ProxyService:
                 error_message = self._safe_error_message("上游服务断开连接: ", e)
             else:
                 error_message = self._safe_error_message("上游协议错误: ", e)
-            response_data = {"error": {"message": error_message}}
+            response_data = {"error": {"message": error_message}, "cpa_transport_error": True}
         except httpx.RequestError as e:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
             status_code = 502
             status = "error"
             error_message = self._safe_error_message("请求错误: ", e)
-            response_data = {"error": {"message": error_message}}
+            response_data = {"error": {"message": error_message}, "cpa_transport_error": True}
         except Exception as e:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
             status_code = 500
             status = "error"
             error_message = self._safe_error_message("未知错误: ", e)
-            response_data = {"error": {"message": error_message}}
+            response_data = {"error": {"message": error_message}, "cpa_transport_error": True}
 
         latency_ms = int((time.perf_counter() - total_start) * 1000)
         upstream_latency_ms = int(upstream_wait_seconds * 1000)
@@ -4356,15 +4356,15 @@ class ProxyService:
         except httpx.TimeoutException as exc:
             status_code = 504
             error_message = self._safe_error_message("请求超时: ", exc)
-            response_data = {"error": {"message": error_message}}
+            response_data = {"error": {"message": error_message}, "cpa_transport_error": True}
         except httpx.RequestError as exc:
             status_code = 502
             error_message = self._safe_error_message("请求错误: ", exc)
-            response_data = {"error": {"message": error_message}}
+            response_data = {"error": {"message": error_message}, "cpa_transport_error": True}
         except Exception as exc:
             status_code = 500
             error_message = self._safe_error_message("未知错误: ", exc)
-            response_data = {"error": {"message": error_message}}
+            response_data = {"error": {"message": error_message}, "cpa_transport_error": True}
 
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         await usage_tracker.record(
@@ -4513,7 +4513,7 @@ class ProxyService:
                 latency_ms=latency_ms, upstream_latency_ms=int(upstream_wait_seconds * 1000),
                 status="error", error_message=error_message, user_id=user_id,
             )
-            return 504, {}, {"error": {"message": error_message}}, True
+            return 504, {}, {"error": {"message": error_message}, "cpa_transport_error": True}, True
         except (httpx.RemoteProtocolError, httpx.RequestError) as e:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
@@ -4528,7 +4528,7 @@ class ProxyService:
                 latency_ms=latency_ms, upstream_latency_ms=int(upstream_wait_seconds * 1000),
                 status="error", error_message=error_message, user_id=user_id,
             )
-            return 502, {}, {"error": {"message": error_message}}, True
+            return 502, {}, {"error": {"message": error_message}, "cpa_transport_error": True}, True
         except Exception as e:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
@@ -4540,7 +4540,7 @@ class ProxyService:
                 latency_ms=latency_ms, upstream_latency_ms=int(upstream_wait_seconds * 1000),
                 status="error", error_message=error_message, user_id=user_id,
             )
-            return 500, {}, {"error": {"message": error_message}}, True
+            return 500, {}, {"error": {"message": error_message}, "cpa_transport_error": True}, True
 
         content_type = response.headers.get("content-type", "")
 
@@ -5034,7 +5034,7 @@ class ProxyService:
                 error_message=error_message,
                 user_id=user_id,
             )
-            return 504, {}, {"error": {"message": error_message}}, True
+            return 504, {}, {"error": {"message": error_message}, "cpa_transport_error": True}, True
         except httpx.RemoteProtocolError as e:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
@@ -5056,7 +5056,7 @@ class ProxyService:
                 error_message=error_message,
                 user_id=user_id,
             )
-            return 502, {}, {"error": {"message": error_message}}, True
+            return 502, {}, {"error": {"message": error_message}, "cpa_transport_error": True}, True
         except httpx.RequestError as e:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
@@ -5074,7 +5074,7 @@ class ProxyService:
                 error_message=error_message,
                 user_id=user_id,
             )
-            return 502, {}, {"error": {"message": error_message}}, True
+            return 502, {}, {"error": {"message": error_message}, "cpa_transport_error": True}, True
         except Exception as e:
             if upstream_wait_start is not None:
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
@@ -5092,7 +5092,7 @@ class ProxyService:
                 error_message=error_message,
                 user_id=user_id,
             )
-            return 500, {}, {"error": {"message": error_message}}, True
+            return 500, {}, {"error": {"message": error_message}, "cpa_transport_error": True}, True
 
         content_type = response.headers.get("content-type", "")
 
