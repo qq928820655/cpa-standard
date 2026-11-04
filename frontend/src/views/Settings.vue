@@ -930,7 +930,7 @@
           <h4>2. 使用代理接口</h4>
           <p>将您的应用配置为使用本系统的代理地址：</p>
           <el-descriptions :column="1" border>
-            <el-descriptions-item label="代理地址"><code>http://127.0.0.1:8000</code></el-descriptions-item>
+            <el-descriptions-item label="代理地址"><code>{{ proxyBaseUrl }}</code></el-descriptions-item>
             <el-descriptions-item label="认证方式"><code>Authorization: Bearer {{ masterKey || 'YOUR_MASTER_KEY' }}</code></el-descriptions-item>
           </el-descriptions>
           <h4>3. 兼容接口</h4>
@@ -946,7 +946,7 @@
 
 client = OpenAI(
     api_key="{{ masterKey || 'YOUR_MASTER_KEY' }}",
-    base_url="http://127.0.0.1:8000/v1"
+    base_url="{{ proxyBaseUrl }}/v1"
 )
 
 response = client.chat.completions.create(
@@ -959,7 +959,7 @@ response = client.chat.completions.create(
 
 client = anthropic.Anthropic(
     api_key="{{ masterKey || 'YOUR_MASTER_KEY' }}",
-    base_url="http://127.0.0.1:8000"
+    base_url="{{ proxyBaseUrl }}"
 )
 
 message = client.messages.create(
@@ -969,7 +969,7 @@ message = client.messages.create(
 )</pre>
             </el-tab-pane>
             <el-tab-pane label="cURL">
-              <pre class="code-block">curl http://127.0.0.1:8000/v1/chat/completions \
+              <pre class="code-block">curl {{ proxyBaseUrl }}/v1/chat/completions \
   -H "Authorization: Bearer {{ masterKey || 'YOUR_MASTER_KEY' }}" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1070,6 +1070,10 @@ import { useDisplaySettings } from '../stores/displaySettings'
 
 const { state: displayState, setTokenUnitAutoM } = useDisplaySettings()
 const tokenUnitAutoM = ref(displayState.tokenUnitAutoM)
+
+// 「使用说明」里的示例地址按当前访问来源生成，不再写死 127.0.0.1:8000：
+// 通过反向代理/自定义域名/局域网 IP 打开面板时，示例里应是用户真正能访问的地址。
+const proxyBaseUrl = computed(() => window.location.origin)
 
 const handleTokenUnitChange = (val) => {
   setTokenUnitAutoM(val)
