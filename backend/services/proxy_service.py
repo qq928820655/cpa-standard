@@ -4086,7 +4086,14 @@ class ProxyService:
             request_timeout = None
             if attempt_timeout_seconds is not None:
                 remaining = max(float(attempt_timeout_seconds), 0.1)
-                request_timeout = httpx.Timeout(remaining)
+                # 重试总预算（60s）不是单次读超时：一次合法的长生成不该在 60s
+                # 整被杀。连接/写/池仍按预算收敛（快速失败），读放宽到配置值。
+                request_timeout = httpx.Timeout(
+                    settings.proxy_request_timeout_seconds,
+                    connect=min(remaining, settings.proxy_stream_connect_timeout_seconds),
+                    write=min(remaining, settings.proxy_stream_connect_timeout_seconds),
+                    pool=min(remaining, settings.proxy_stream_connect_timeout_seconds),
+                )
             response = await client.request(
                 method=method,
                 url=url,
@@ -4484,7 +4491,7 @@ class ProxyService:
             remaining = max(float(attempt_timeout_seconds), 0.1)
             buffered_timeout = httpx.Timeout(
                 connect=min(remaining, settings.proxy_stream_connect_timeout_seconds),
-                read=remaining,
+                read=max(int(settings.proxy_timeout or 300), 300),
                 write=min(remaining, settings.proxy_stream_connect_timeout_seconds),
                 pool=min(remaining, settings.proxy_stream_connect_timeout_seconds),
             )
@@ -4628,7 +4635,21 @@ class ProxyService:
 
         try:
             upstream_wait_start = time.perf_counter()
-            async for chunk in stream_iter:
+            # 缓冲模式要等上游首字节才能判断这个 Key 是否可用。没有首包超时的话，
+            # 一个不响应的上游会一直占着连接直到总 deadline，期间其他 Key 完全
+            # 没机会接手。
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        stream_iter.__anext__(), timeout=self.stream_first_byte_timeout_seconds
+                    )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    raise httpx.ReadTimeout(
+                        f"缓冲窗口内 {self.stream_first_byte_timeout_seconds}s 未收到上游数据（首包保护）",
+                        request=None,
+                    )
                 upstream_wait_seconds += time.perf_counter() - upstream_wait_start
                 upstream_wait_start = time.perf_counter()
                 buffer += chunk
@@ -4992,7 +5013,7 @@ class ProxyService:
             remaining = max(float(attempt_timeout_seconds), 0.1)
             stream_timeout = httpx.Timeout(
                 connect=min(remaining, settings.proxy_stream_connect_timeout_seconds),
-                read=remaining,
+                read=settings.proxy_stream_read_timeout_seconds,
                 write=min(remaining, settings.proxy_stream_connect_timeout_seconds),
                 pool=min(remaining, settings.proxy_stream_connect_timeout_seconds),
             )
@@ -5171,11 +5192,7 @@ class ProxyService:
             last_synced_tokens = (0, 0, 0, 0)
             finish_reason = None
             stream_started_at = time.perf_counter()
-            stream_deadline = (
-                stream_started_at + max(float(attempt_timeout_seconds), 0.1)
-                if attempt_timeout_seconds is not None
-                else None
-            )
+            stream_deadline = stream_started_at + max(float(settings.proxy_request_timeout_seconds), 0.1)
 
             def keepalive_event() -> bytes:
                 if (path or "").lstrip("/") == "v1/messages":
