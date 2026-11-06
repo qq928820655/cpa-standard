@@ -61,6 +61,57 @@ class PluginServiceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 service.uninstall("missing-plugin")
 
+    def test_loading_a_plugin_clears_the_restart_badge(self):
+        """A loaded plugin must not keep claiming it needs a restart.
+
+        Installing sets restart_required=True so the panel can say "restart
+        CPA". Nothing used to clear it, so a plugin that was loaded and serving
+        every route still showed "等待重启" forever — which reads as "the
+        install never finished".
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._make_service(temp_dir, "demo-plugin")
+            installed = service.INSTALLED_DIR / "demo-plugin"
+            (installed / "backend").mkdir(parents=True)
+            (installed / "backend" / "entry.py").write_text(
+                "def register(app):\n    app['loaded'] = True\n",
+                encoding="utf-8")
+            registry = service._registry()
+            registry["plugins"]["demo-plugin"].update({
+                "backend_entry": "backend/entry.py:register",
+                "restart_required": True,
+            })
+            service._save_registry(registry)
+
+            app = {}
+            service.load_backend_plugins(app)
+
+            self.assertTrue(app.get("loaded"))
+            entry = service._registry()["plugins"]["demo-plugin"]
+            self.assertEqual(entry["load_error"], "")
+            self.assertFalse(entry["restart_required"])
+
+    def test_a_failed_load_keeps_the_restart_badge_and_reports_the_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._make_service(temp_dir, "demo-plugin")
+            installed = service.INSTALLED_DIR / "demo-plugin"
+            (installed / "backend").mkdir(parents=True)
+            (installed / "backend" / "entry.py").write_text(
+                "def register(app):\n    raise RuntimeError('boom')\n",
+                encoding="utf-8")
+            registry = service._registry()
+            registry["plugins"]["demo-plugin"].update({
+                "backend_entry": "backend/entry.py:register",
+                "restart_required": True,
+            })
+            service._save_registry(registry)
+
+            service.load_backend_plugins({})
+
+            entry = service._registry()["plugins"]["demo-plugin"]
+            self.assertIn("boom", entry["load_error"])
+            self.assertTrue(entry["restart_required"])
+
     @staticmethod
     def _make_service(temp_dir, plugin_id):
         root = Path(temp_dir) / "plugins"

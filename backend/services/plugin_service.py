@@ -384,7 +384,13 @@ class PluginService:
                 factory = getattr(module, factory_name)
                 factory(app)
                 registry = self._registry()
-                registry.setdefault("plugins", {}).setdefault(str(item["id"]), {})["load_error"] = ""
+                entry = registry.setdefault("plugins", {}).setdefault(str(item["id"]), {})
+                entry["load_error"] = ""
+                # The plugin is loaded and serving: the "restart pending" badge
+                # has done its job. Nothing else ever clears this flag, so
+                # leaving it True makes the panel show "等待重启" forever even
+                # though every route and asset works.
+                entry["restart_required"] = False
                 self._save_registry(registry)
             except Exception as exc:
                 registry = self._registry()
