@@ -13,6 +13,12 @@ if [ -f "${PACKAGE_DIR}/config.sh" ]; then
   source "${PACKAGE_DIR}/config.sh"
 fi
 
+# 本机部署覆盖（不入库）：venv 路径、出口代理等按机器而异的设置放这里
+if [ -f "${PACKAGE_DIR}/config.local.sh" ]; then
+  # shellcheck source=/dev/null
+  source "${PACKAGE_DIR}/config.local.sh"
+fi
+
 echo "========================================"
 echo "   CPA - Linux Status"
 echo "========================================"
