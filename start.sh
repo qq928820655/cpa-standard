@@ -67,7 +67,7 @@ echo "[Start] CPA service on port ${BACKEND_PORT}..."
   cd "${BACKEND_DIR}"
   export PYTHONUTF8=1
   export PYTHONDONTWRITEBYTECODE=1
-  nohup "${PYTHON_BIN}" -m uvicorn main:app --host "${BACKEND_HOST}" --port "${BACKEND_PORT}" >> "${LOG_FILE}" 2>&1 &
+  nohup "${PYTHON_BIN}" -m uvicorn main:app --host "${BACKEND_HOST}" --port "${BACKEND_PORT}" --proxy-headers --forwarded-allow-ips "*" --timeout-keep-alive 120 --http httptools >> "${LOG_FILE}" 2>&1 &
   echo $! > "${PID_FILE}"
 )
 

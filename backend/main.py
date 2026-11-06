@@ -21,6 +21,7 @@ mimetypes.add_type("application/wasm", ".wasm")
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 
 from config import settings, export_config
@@ -144,6 +145,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 大响应（Key 导出、任务列表等）gzip 压缩，降低预览链路传输耗时
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 @app.middleware("http")
