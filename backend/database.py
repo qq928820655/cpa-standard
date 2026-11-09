@@ -10,6 +10,12 @@ IMAGE_KEY_INITIAL_AMOUNT_UNITS = 1
 IMAGE_MODEL_PRICE_UNITS = {
     "gpt-image-2": 0.04,
     "gpt-image-2-pro": 0.08,
+    "gpt-image-2.5": 0.04,
+    "gpt-image-2.5-flare": 0.08,
+    "gpt-image-2.5-sunburst": 0.08,
+    "gpt-image-2.6": 0.04,
+    "gpt-image-2.6-flare": 0.08,
+    "gpt-image-2.6-sunburst": 0.08,
     "gpt-image-1-vip": 0.04,
     "gpt-image-1": 0.04,
     "nano-banana-pro": 0.06,

@@ -2252,7 +2252,11 @@ class ProxyService:
             use_official_image_edit = (
                 normalized_format == "images"
                 and is_image_to_image
-                and normalized_model in {"gpt-image-2", "gpt-image-2-pro"}
+                and normalized_model in {
+                    "gpt-image-2", "gpt-image-2-pro",
+                    "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst",
+                    "gpt-image-2.6", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst",
+                }
             )
             multipart_data = None
             multipart_files = None

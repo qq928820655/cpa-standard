@@ -605,7 +605,7 @@
     <el-dialog v-model="modelKeyDialogVisible" :title="`${selectedKeyModel?.display_name || '模型'} 满足条件的 Key`" width="1360px" class="model-key-dialog">
       <el-alert
         v-if="selectedKeyModel && !canValidateImageModel(selectedKeyModel.model)"
-        title="当前模型暂未开放生图验证，支持 GPT Image 2、GPT Image 1、Nano Banana Pro、Nano Banana Pro 4K。"
+        title="当前模型暂未开放生图验证，支持 GPT Image 2 / 2.5 / 2.6 系列、GPT Image 1、Nano Banana Pro、Nano Banana Pro 4K。"
         type="info"
         show-icon
         :closable="false"
@@ -1213,7 +1213,7 @@ const promptTipPanels = ref([])
 const inputImageFileRef = ref(null)
 const isEditMode = ref(false)
 const inputImageAllowedTypes = ['image/png', 'image/jpeg', 'image/webp']
-const imageValidateModels = new Set(['gpt-image-2', 'gpt-image-2-pro', 'gpt-image-1', 'nano-banana-pro', 'nano-banana-pro-4k'])
+const imageValidateModels = new Set(['gpt-image-2', 'gpt-image-2-pro', 'gpt-image-2.5', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst', 'gpt-image-2.6', 'gpt-image-2.6-flare', 'gpt-image-2.6-sunburst', 'gpt-image-1', 'nano-banana-pro', 'nano-banana-pro-4k'])
 const maxInputImageCount = 4
 const imageEnhancementEnabled = ref(false)
 
