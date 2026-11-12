@@ -3326,6 +3326,7 @@ const loadKeyDetailLogs = async (keyId) => {
       days: 7,
       page: keyDetailLogsPage.value,
       limit: keyDetailLogsPageSize.value,
+      include_image_models: true,
     })
     keyDetailLogs.value = Array.isArray(result) ? result : (result.items || [])
     keyDetailLogsTotal.value = Array.isArray(result) ? result.length : (result.total || 0)

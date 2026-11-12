@@ -222,6 +222,28 @@ def _apply_usage_log_model_filter(query, UsageLog, models: Optional[List[str]]):
     )
 
 
+# 图片模型调用有自己的记录体系（图片生成任务表 + 用量页图片 tab），
+# 文本模型调用列表默认排除这些行，避免 token 全 0 的图片记录混入。
+_IMAGE_MODEL_ILIKE_PATTERNS = ("gpt-image%", "nano-banana%", "dall-e%", "%imagine-image%")
+
+
+def _get_image_model_exclude_condition(UsageLog):
+    """图片模型用量行的排除条件（模型清单与光影世界同源 + 前缀兜底）。"""
+    from sqlalchemy import or_
+
+    try:
+        from routers.admin import get_all_image_model_options
+
+        names = {str(item["model"]) for item in get_all_image_model_options()}
+    except Exception:
+        names = set()
+    conditions = []
+    if names:
+        conditions.append(func.lower(UsageLog.model).in_({name.lower() for name in names}))
+    conditions.extend(func.lower(UsageLog.model).ilike(pattern) for pattern in _IMAGE_MODEL_ILIKE_PATTERNS)
+    return or_(*conditions)
+
+
 async def _get_summary_metrics(
     db: AsyncSession,
     days: int,
@@ -582,6 +604,7 @@ async def get_usage_logs(
     models: Optional[List[str]] = Query(default=None),
     status: Optional[str] = Query(default=None),
     user_id: Optional[int] = Query(default=None),
+    include_image_models: bool = Query(default=False, description="是否包含图片模型调用行（默认排除，图片调用见图片 tab）"),
     db: AsyncSession = Depends(get_db),
     auth_info: dict = Depends(verify_admin_key),
 ):
@@ -604,6 +627,8 @@ async def get_usage_logs(
     if provider_values:
         count_query = count_query.join(ApiKey, ApiKey.id == UsageLog.api_key_id).where(ApiKey.provider.in_(provider_values))
     count_query = _apply_usage_log_model_filter(count_query, UsageLog, model_values)
+    if not include_image_models:
+        count_query = count_query.where(~_get_image_model_exclude_condition(UsageLog))
     if status:
         count_query = count_query.where(UsageLog.status == status)
     if effective_user_id:
@@ -620,6 +645,8 @@ async def get_usage_logs(
     if provider_values:
         query = query.join(ApiKey, ApiKey.id == UsageLog.api_key_id).where(ApiKey.provider.in_(provider_values))
     query = _apply_usage_log_model_filter(query, UsageLog, model_values)
+    if not include_image_models:
+        query = query.where(~_get_image_model_exclude_condition(UsageLog))
     if status:
         query = query.where(UsageLog.status == status)
     if effective_user_id:

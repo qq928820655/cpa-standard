@@ -1392,10 +1392,12 @@ onMounted(async () => {
   mobileMediaQuery = window.matchMedia(MOBILE_QUERY)
   isMobile.value = mobileMediaQuery.matches
   mobileMediaQuery.addEventListener('change', syncMobile)
+  // 过滤选项与统计数据并发加载：远程访问时省一整轮往返
+  const tasks = [loadData()]
   if (showUserFilter.value) {
-    await Promise.all([loadKeyOptions(), loadProviderOptions(), loadModelOptions(), loadUserOptions()])
+    tasks.push(loadKeyOptions(), loadProviderOptions(), loadModelOptions(), loadUserOptions())
   }
-  loadData()
+  await Promise.all(tasks)
   document.addEventListener('visibilitychange', handleVisibilityChange)
   startAutoRefresh()
 })
