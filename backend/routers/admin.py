@@ -6001,6 +6001,58 @@ async def quick_assign_openai_plus_proxy(
     return MihomoQuickAssignResponse(proxy_url=proxy_url, port=picked["port"], node=picked["node"])
 
 
+class MihomoProbeItem(BaseModel):
+    port: int
+    node: str = ""
+    kind: str = ""
+    ok: bool = False
+    ms: Optional[int] = None
+    exit_ip: str = ""
+
+
+class MihomoProbeResponse(BaseModel):
+    results: List[MihomoProbeItem] = []
+
+
+@router.post("/openai-plus/proxy-exits/probe", response_model=MihomoProbeResponse)
+async def probe_openai_plus_proxy_exits(
+    _: dict = Depends(require_admin_access),
+):
+    """一键探测：并行经每个 mihomo 出口端口握手访问 api.ipify.org，
+    返回连通性、握手耗时（ms）与真实出口 IP，供前端按延迟标注节点可用性。"""
+    import asyncio
+
+    pool_url, token = _mihomo_pool_settings()
+    if not pool_url:
+        raise HTTPException(status_code=400, detail="尚未配置 mihomo-pool 面板地址")
+    exits = _fetch_mihomo_exits(pool_url, token)
+    online = [item for item in exits if not item["error"]]
+    if not online:
+        return MihomoProbeResponse(results=[])
+
+    semaphore = asyncio.Semaphore(16)
+
+    async def _probe(item: Dict[str, Any]) -> MihomoProbeItem:
+        proxy = f"http://127.0.0.1:{item['port']}"
+        result = MihomoProbeItem(port=item["port"], node=item["node"], kind=item["kind"])
+        start = time.time()
+        try:
+            async with semaphore:
+                async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(4.0)) as client:
+                    resp = await client.get("https://api.ipify.org", params={"format": "json"})
+            result.ms = int((time.time() - start) * 1000)
+            if resp.status_code == 200:
+                result.ok = True
+                result.exit_ip = str((resp.json() or {}).get("ip") or "")
+        except Exception:
+            result.ok = False
+            result.ms = None
+        return result
+
+    results = await asyncio.gather(*[_probe(item) for item in online])
+    return MihomoProbeResponse(results=list(results))
+
+
 @router.get("/key-check-default-config", response_model=KeyCheckDefaultConfigResponse)
 async def get_key_check_default_config(
     _: dict = Depends(require_admin_access),

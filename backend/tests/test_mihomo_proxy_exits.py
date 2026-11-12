@@ -73,6 +73,9 @@ def client(pool_stub, monkeypatch):
 
     stub, base = pool_stub
     monkeypatch.setattr(settings, "master_key", "test-admin-key", raising=False)
+    # 测试期间禁止真实落盘：quick-assign 会调 persist_export_config，
+    # 不 patch 会把测试地址写进 backend/data/export_config.json
+    monkeypatch.setattr(admin_router, "persist_export_config", lambda: None)
     admin_router.export_config["mihomo_pool_url"] = base
     admin_router.export_config["mihomo_pool_token"] = "test-token"
     admin_router._mihomo_exits_cache["at"] = 0.0
@@ -180,6 +183,31 @@ def test_quick_assign_404_when_all_offline(client):
             json={},
         )
     assert resp.status_code == 404
+
+
+def test_probe_requires_configured_pool(monkeypatch):
+    from config import settings
+
+    monkeypatch.setattr(settings, "master_key", "test-admin-key", raising=False)
+    admin_router.export_config["mihomo_pool_url"] = ""
+    with _admin_client() as http:
+        resp = http.post(
+            "/api/admin/openai-plus/proxy-exits/probe",
+            headers=_AUTH,
+        )
+    assert resp.status_code == 400
+
+
+def test_probe_returns_empty_when_no_online_exits(client):
+    stub = client
+    stub.exits = [dict(item, error="down") for item in stub.exits]
+    with _admin_client() as http:
+        resp = http.post(
+            "/api/admin/openai-plus/proxy-exits/probe",
+            headers=_AUTH,
+        )
+    assert resp.status_code == 200
+    assert resp.json()["results"] == []
 
 
 def test_unconfigured_pool_returns_not_configured(monkeypatch):
