@@ -24,6 +24,13 @@ DEFAULT_EXPORT_CONFIG = {
     # mihomo-pool 面板地址与令牌：端口→节点名映射与快速分配的数据源；留空表示未接
     "mihomo_pool_url": "",
     "mihomo_pool_token": "",
+    # 通用 mihomo 内核控制口（external-controller）：任何标准 mihomo 应用通用。
+    # 与 mihomo_pool_url 二选一：配了 pool 优先用 pool，否则走 controller。
+    "clash_controller_url": "",
+    "clash_controller_secret": "",
+    # controller 模式下的共享出口端口（逗号分隔）与主选择组名；留空自动探测
+    "clash_shared_ports": "",
+    "clash_main_group": "",
     # provider 扩展配置：{ "bb": { "password": "xxx" }, ... }
     "provider_ext": {},
     # 是否向管理员显示实际使用的模型（格式：请求模型/映射模型），默认关闭

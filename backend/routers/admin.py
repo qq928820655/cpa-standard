@@ -19,6 +19,7 @@ import re
 import struct
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional, List, Any, Dict, TypedDict
@@ -587,11 +588,15 @@ class MihomoExitItem(BaseModel):
     group: str = ""
     kind: str = ""
     error: str = ""
+    history_ms: Optional[int] = None
 
 
 class MihomoProxyExitsResponse(BaseModel):
     configured: bool = False
     pool_url: str = ""
+    mode: str = "pool"
+    switch_group: str = ""
+    shared_port: Optional[int] = None
     exits: List[MihomoExitItem] = []
 
 
@@ -613,6 +618,17 @@ class MihomoQuickAssignResponse(BaseModel):
     proxy_url: str
     port: int
     node: str = ""
+
+
+class MihomoSwitchRequest(BaseModel):
+    node: str
+
+
+class MihomoSwitchResponse(BaseModel):
+    ok: bool
+    group: str = ""
+    node: str = ""
+    proxy_url: str = ""
 
 
 _mihomo_exits_cache: Dict[str, Any] = {"at": 0.0, "exits": []}
@@ -5941,17 +5957,205 @@ def _fetch_mihomo_exits(pool_url: str, token: str, force: bool = False) -> List[
     return exits
 
 
+def _pick_exits_source() -> str:
+    """pool 优先，其次通用 controller，都未配返回空。"""
+    pool_url, _ = _mihomo_pool_settings()
+    if pool_url:
+        return "pool"
+    if str(export_config.get("clash_controller_url") or "").strip():
+        return "controller"
+    return ""
+
+
+def _controller_settings() -> tuple:
+    url = str(export_config.get("clash_controller_url") or "").strip().rstrip("/")
+    secret = str(export_config.get("clash_controller_secret") or "").strip()
+    return url, secret
+
+
+def _last_delay_ms(entry: Dict[str, Any]) -> Optional[int]:
+    history = (entry or {}).get("history") or []
+    for item in reversed(history):
+        try:
+            mean = int(item.get("mean_delay") or item.get("delay") or 0)
+        except (TypeError, ValueError):
+            continue
+        if mean > 0:
+            return mean
+    return None
+
+
+_VIRTUAL_PROXY_TYPES = {"Direct", "Reject", "Compatible", "Pass", "RejectDrop", "LoadBomb"}
+_GROUP_PROXY_TYPES = {"Selector", "URLTest", "Fallback", "LoadBalance"}
+_VIRTUAL_PROXY_NAMES = re.compile(r"^(PASS|REJECT|DIRECT|GLOBAL)", re.IGNORECASE)
+
+
+def _is_real_node(name: str, entry: Dict[str, Any]) -> bool:
+    if entry.get("type") in _VIRTUAL_PROXY_TYPES or entry.get("type") in _GROUP_PROXY_TYPES:
+        return False
+    if _VIRTUAL_PROXY_NAMES.match(name or ""):
+        return False
+    return True
+
+
+_controller_cache: Dict[str, Any] = {"at": 0.0, "exits": [], "group": "", "shared_port": None, "nodes": []}
+
+
+def _controller_headers() -> Dict[str, str]:
+    _, secret = _controller_settings()
+    headers = {"User-Agent": "cpa-mihomo-picker"}
+    if secret:
+        headers["Authorization"] = "Bearer " + secret
+    return headers
+
+
+def _controller_get(path: str, timeout: float = 5.0) -> Any:
+    url, _ = _controller_settings()
+    req = urllib.request.Request(url + path, headers=_controller_headers(), method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _pick_main_group(proxies: Dict[str, Any]) -> str:
+    """主选择组：显式配置 > Selector 内名称启发式 > 成员最多的 Selector > 成员最多的任意组。
+
+    只推荐 Selector：URLTest/Fallback 的选择会被内核自动测试覆盖，
+    LoadBalance 按连接分发、切换单个节点无意义。"""
+    preferred = str(export_config.get("clash_main_group") or "").strip()
+    if preferred and preferred in proxies:
+        return preferred
+    groups = {
+        name: entry for name, entry in proxies.items()
+        if entry.get("type") in ("Selector", "URLTest", "Fallback", "LoadBalance")
+    }
+    general = [g for g in groups if g != "GLOBAL" and not g.startswith("HUB-")]
+    selectors = [g for g in general if groups[g].get("type") == "Selector"]
+    for pattern in ("PROXY", "节点选择", "节点", "🚀"):
+        for name in selectors:
+            if pattern in name:
+                return name
+    if selectors:
+        return max(selectors, key=lambda name: len(groups[name].get("all") or []))
+    if general:
+        return max(general, key=lambda name: len(groups[name].get("all") or []))
+    if groups:
+        return max(groups, key=lambda name: len(groups[name].get("all") or []))
+    return ""
+
+
+def _shared_ports_from_configs() -> List[int]:
+    configured = normalize_string_list(
+        str(export_config.get("clash_shared_ports") or "").replace("，", ",").split(",")
+    )
+    ports = []
+    for item in configured:
+        try:
+            port = int(item)
+        except (TypeError, ValueError):
+            continue
+        if port > 0:
+            ports.append(port)
+    if ports:
+        return ports
+    try:
+        data = _controller_get("/configs")
+    except Exception:
+        return []
+    for key in ("mixed-port", "socks-port", "port"):
+        value = data.get(key)
+        if isinstance(value, int) and value > 0:
+            return [value]
+    return []
+
+
+def _fetch_controller_exits(force: bool = False) -> Dict[str, Any]:
+    """通用 mihomo 内核 controller 适配：返回共享口出口项与可切换节点清单。
+
+    标准 controller 不暴露 listeners 的端口→节点绑定，因此逐节点专属口只在
+    mihomo-pool 模式可用；controller 模式下「选节点」等价于切换主选择组，
+    出口 URL 统一指向共享口。"""
+    now = time.time()
+    with _mihomo_exits_lock:
+        if not force and now - _controller_cache["at"] < MIHOMO_EXITS_TTL_SECONDS:
+            return dict(_controller_cache)
+
+    proxies = (_controller_get("/proxies") or {}).get("proxies") or {}
+    group = _pick_main_group(proxies)
+    group_entry = proxies.get(group) or {}
+    shared_ports = _shared_ports_from_configs()
+    shared_port = shared_ports[0] if shared_ports else None
+
+    exits: List[Dict[str, Any]] = []
+    for port in shared_ports:
+        exits.append({
+            "port": port,
+            "node": str(group_entry.get("now") or ""),
+            "group": group,
+            "kind": "shared",
+            "error": "",
+            "history_ms": _last_delay_ms(group_entry),
+        })
+    nodes = [
+        name for name in (group_entry.get("all") or [])
+        if _is_real_node(name, proxies.get(name) or {})
+    ]
+    for name in nodes:
+        entry = proxies.get(name) or {}
+        exits.append({
+            "port": shared_port or 0,
+            "node": name,
+            "group": group,
+            "kind": "switch",
+            "error": "" if entry.get("alive", True) else "unreachable",
+            "history_ms": _last_delay_ms(entry),
+        })
+
+    snapshot = {
+        "at": time.time(),
+        "exits": exits,
+        "group": group,
+        "shared_port": shared_port,
+        "nodes": nodes,
+    }
+    with _mihomo_exits_lock:
+        _controller_cache.update(snapshot)
+    return dict(snapshot)
+
+
+def _controller_switch_node(node: str, group: str) -> None:
+    url, _ = _controller_settings()
+    path = "/proxies/" + urllib.parse.quote(group, safe="")
+    body = json.dumps({"name": node}).encode("utf-8")
+    req = urllib.request.Request(
+        url + path, data=body, headers=_controller_headers(), method="PUT"
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        resp.read()
+
+
 @router.get("/openai-plus/proxy-exits", response_model=MihomoProxyExitsResponse)
 async def get_openai_plus_proxy_exits(
     _: dict = Depends(require_admin_access),
 ):
-    """列出 mihomo-pool 各代理端口当前对应的节点，供前端下拉按节点名选择。"""
-    pool_url, token = _mihomo_pool_settings()
-    if not pool_url:
-        return MihomoProxyExitsResponse(configured=False, pool_url="", exits=[])
-    exits = _fetch_mihomo_exits(pool_url, token)
-    items = [MihomoExitItem(**item) for item in exits]
-    return MihomoProxyExitsResponse(configured=bool(token), pool_url=pool_url, exits=items)
+    """列出 mihomo 出口：pool 模式（逐节点口映射）或通用 controller 模式（共享口+切组）。"""
+    source = _pick_exits_source()
+    if source == "pool":
+        pool_url, token = _mihomo_pool_settings()
+        exits = _fetch_mihomo_exits(pool_url, token)
+        items = [MihomoExitItem(**item) for item in exits]
+        return MihomoProxyExitsResponse(configured=bool(token), pool_url=pool_url, mode="pool", exits=items)
+    if source == "controller":
+        snapshot = _fetch_controller_exits()
+        items = [MihomoExitItem(**item) for item in snapshot["exits"]]
+        return MihomoProxyExitsResponse(
+            configured=True,
+            pool_url=_controller_settings()[0],
+            mode="controller",
+            switch_group=snapshot["group"],
+            shared_port=snapshot["shared_port"],
+            exits=items,
+        )
+    return MihomoProxyExitsResponse(configured=False, pool_url="", mode="pool", exits=[])
 
 
 @router.put("/openai-plus/mihomo-config", response_model=MihomoPoolConfigResponse)
@@ -5979,6 +6183,9 @@ async def quick_assign_openai_plus_proxy(
     """快速分配：随机挑一个在线的 mihomo 节点专属口写入 openai_plus_proxy_url 并持久化。
 
     专属口（17901+）硬绑定单一节点；全部不可用时退回在线的共享口，保证链路始终可用。"""
+    source = _pick_exits_source()
+    if source == "controller":
+        return await _quick_assign_controller()
     pool_url, token = _mihomo_pool_settings()
     if not pool_url:
         raise HTTPException(status_code=400, detail="尚未配置 mihomo-pool 面板地址")
@@ -6001,6 +6208,48 @@ async def quick_assign_openai_plus_proxy(
     return MihomoQuickAssignResponse(proxy_url=proxy_url, port=picked["port"], node=picked["node"])
 
 
+async def _quick_assign_controller() -> MihomoQuickAssignResponse:
+    """controller 模式快速分配：随机切主选择组到某个真实节点，出口指向共享口。"""
+    snapshot = _fetch_controller_exits(force=True)
+    shared_port = snapshot.get("shared_port")
+    if not shared_port:
+        raise HTTPException(status_code=400, detail="未能确定共享出口端口（配置 clash_shared_ports）")
+    nodes = [
+        name for name in snapshot.get("nodes") or []
+        if any(item["node"] == name and not item["error"] for item in snapshot["exits"])
+    ]
+    if not nodes:
+        raise HTTPException(status_code=404, detail="mihomo controller 当前没有可用节点")
+    picked = random.choice(nodes)
+    _controller_switch_node(picked, snapshot["group"])
+    proxy_url = f"http://127.0.0.1:{shared_port}"
+    export_config["openai_plus_proxy_url"] = proxy_url
+    persist_export_config()
+    return MihomoQuickAssignResponse(proxy_url=proxy_url, port=shared_port, node=picked)
+
+
+@router.post("/openai-plus/proxy-exits/switch", response_model=MihomoSwitchResponse)
+async def switch_openai_plus_proxy_node(
+    data: MihomoSwitchRequest,
+    _: dict = Depends(require_admin_access),
+):
+    """controller 模式手动切节点：把主选择组切到指定节点，出口仍指向共享口。"""
+    source = _pick_exits_source()
+    if source != "controller":
+        raise HTTPException(status_code=400, detail="仅通用 controller 模式支持切换节点")
+    snapshot = _fetch_controller_exits(force=True)
+    group = snapshot.get("group")
+    shared_port = snapshot.get("shared_port")
+    if not group:
+        raise HTTPException(status_code=400, detail="未找到可用选择组（配置 clash_main_group）")
+    node = (data.node or "").strip()
+    if not node:
+        raise HTTPException(status_code=400, detail="缺少节点名")
+    _controller_switch_node(node, group)
+    proxy_url = f"http://127.0.0.1:{shared_port}" if shared_port else ""
+    return MihomoSwitchResponse(ok=True, group=group, node=node, proxy_url=proxy_url)
+
+
 class MihomoProbeItem(BaseModel):
     port: int
     node: str = ""
@@ -6018,9 +6267,13 @@ class MihomoProbeResponse(BaseModel):
 async def probe_openai_plus_proxy_exits(
     _: dict = Depends(require_admin_access),
 ):
-    """一键探测：并行经每个 mihomo 出口端口握手访问 api.ipify.org，
-    返回连通性、握手耗时（ms）与真实出口 IP，供前端按延迟标注节点可用性。"""
+    """一键探测：pool 模式并行经各端口握手测延迟与出口 IP；
+    controller 模式改用内核侧测速（/proxies/{node}/delay），逐节点返回延迟。"""
     import asyncio
+
+    source = _pick_exits_source()
+    if source == "controller":
+        return await _probe_controller()
 
     pool_url, token = _mihomo_pool_settings()
     if not pool_url:
@@ -6050,6 +6303,47 @@ async def probe_openai_plus_proxy_exits(
         return result
 
     results = await asyncio.gather(*[_probe(item) for item in online])
+    return MihomoProbeResponse(results=list(results))
+
+
+async def _probe_controller() -> MihomoProbeResponse:
+    """controller 模式探测：内核侧逐节点测速，不占用端口握手。"""
+    import asyncio
+    from urllib.parse import quote as _quote
+
+    snapshot = _fetch_controller_exits(force=True)
+    group = snapshot.get("group") or ""
+    if not group:
+        raise HTTPException(status_code=400, detail="未找到可用选择组（配置 clash_main_group）")
+    nodes = [
+        name for name in snapshot.get("nodes") or []
+        if any(item["node"] == name and not item["error"] for item in snapshot["exits"])
+    ]
+
+    semaphore = asyncio.Semaphore(12)
+
+    async def _probe_node(name: str) -> MihomoProbeItem:
+        result = MihomoProbeItem(port=snapshot.get("shared_port") or 0, node=name, kind="switch")
+        loop = asyncio.get_running_loop()
+        try:
+            async with semaphore:
+                path = "/proxies/{}/delay".format(_quote(name, safe=""))
+                resp = await loop.run_in_executor(
+                    None,
+                    lambda: _controller_get(
+                        path + "?url=" + _quote("https://api.ipify.org", safe="") + "&timeout=5000",
+                        timeout=8.0,
+                    ),
+                )
+            ms = int((resp or {}).get("delay") or 0)
+            result.ok = ms > 0
+            result.ms = ms if ms > 0 else None
+        except Exception:
+            result.ok = False
+            result.ms = None
+        return result
+
+    results = await asyncio.gather(*[_probe_node(name) for name in nodes])
     return MihomoProbeResponse(results=list(results))
 
 
