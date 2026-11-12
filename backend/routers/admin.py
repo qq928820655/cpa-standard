@@ -507,6 +507,7 @@ class ImageGenerationTaskResponse(BaseModel):
     failure_category_stats: dict[str, int] = Field(default_factory=dict)
     error_summary: Optional[str] = None
     pending_refresh: bool = False
+    source: str = "panel"
     created_at: datetime
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
@@ -4048,6 +4049,7 @@ def to_image_task_response(task: Any, results: Optional[List[Any]] = None) -> Im
         failure_category_stats=load_json_object(task.failure_category_stats_json),
         error_summary=task.error_summary,
         pending_refresh=bool(getattr(task, "pending_refresh", False)),
+        source=str(getattr(task, "source", "panel") or "panel"),
         created_at=task.created_at,
         started_at=task.started_at,
         finished_at=task.finished_at,
@@ -5378,6 +5380,7 @@ async def list_image_tasks(
     status: Optional[str] = None,
     api_key_id: Optional[int] = None,
     user_id: Optional[int] = Query(default=None),
+    source: Optional[str] = None,
     page: Optional[int] = None,
     limit: int = 20,
     offset: Optional[int] = None,
@@ -5386,7 +5389,7 @@ async def list_image_tasks(
 ):
     """查询图片生成历史任务"""
     await require_image_square_access(db, auth_info)
-    from models import ImageGenerationTask
+    from models import ImageGenerationTask, ImageGenerationTaskResult
 
     # 普通用户只能看自己的任务
     effective_user_id = user_id if auth_info.get("is_admin") else auth_info.get("user_id")
@@ -5394,6 +5397,11 @@ async def list_image_tasks(
     page_value, limit_value, offset_value = parse_pagination(page, limit, offset)
     query = select(ImageGenerationTask).where(ImageGenerationTask.is_deleted.is_(False))
     count_query = select(func.count(ImageGenerationTask.id)).where(ImageGenerationTask.is_deleted.is_(False))
+
+    source_value = normalize_optional_text(source)
+    if source_value in {"panel", "api"}:
+        query = query.where(ImageGenerationTask.source == source_value)
+        count_query = count_query.where(ImageGenerationTask.source == source_value)
 
     model_value = normalize_optional_text(model)
     status_value = normalize_optional_text(status)
@@ -5415,8 +5423,26 @@ async def list_image_tasks(
     result = await db.execute(query)
     tasks = list(result.scalars().all())
 
+    # 当页任务的结果（图片 URL）批量取出，供列表直接展示“查看图片”
+    results_by_task: Dict[int, list] = {}
+    if tasks:
+        task_ids = [item.id for item in tasks]
+        rows = (
+            (
+                await db.execute(
+                    select(ImageGenerationTaskResult)
+                    .where(ImageGenerationTaskResult.task_id.in_(task_ids))
+                    .order_by(ImageGenerationTaskResult.id.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            results_by_task.setdefault(row.task_id, []).append(row)
+
     return ImageGenerationTaskListResponse(
-        items=[to_image_task_response(item) for item in tasks],
+        items=[to_image_task_response(item, results_by_task.get(item.id, [])) for item in tasks],
         total=total,
         page=page_value,
         limit=limit_value,

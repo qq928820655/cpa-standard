@@ -185,6 +185,10 @@ async def init_db():
             columns = _get_table_columns(sync_conn, "image_generation_tasks")
             return any(column["name"] == "pending_refresh" for column in columns)
 
+        def has_image_generation_task_source(sync_conn):
+            columns = _get_table_columns(sync_conn, "image_generation_tasks")
+            return any(column["name"] == "source" for column in columns)
+
         def has_admin_user_role(sync_conn):
             columns = _get_table_columns(sync_conn, "admin_users")
             return any(column["name"] == "role" for column in columns)
@@ -494,6 +498,9 @@ async def init_db():
 
         if not await conn.run_sync(has_image_generation_task_pending_refresh):
             await conn.exec_driver_sql("ALTER TABLE image_generation_tasks ADD COLUMN pending_refresh BOOLEAN DEFAULT 0")
+
+        if not await conn.run_sync(has_image_generation_task_source):
+            await conn.exec_driver_sql("ALTER TABLE image_generation_tasks ADD COLUMN source VARCHAR(20) DEFAULT 'panel'")
 
         await conn.exec_driver_sql(
             """

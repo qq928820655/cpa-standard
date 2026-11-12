@@ -376,6 +376,23 @@ class PluginService:
                 registry.setdefault("plugins", {}).setdefault(str(item["id"]), {})["load_error"] = str(exc)[:1000]
                 self._save_registry(registry)
 
+    def early_mount_v1_routers(self, app: Any) -> None:
+        """在 SPA catch-all 路由之前挂载插件的 v1 外部 API 路由。
+
+        插件完整加载（含面板路由、迁移）仍在启动期 load_backend_plugins 完成；
+        这里只提前挂载插件暴露的 `v1_router`（外部 API 前缀），保证 GET 请求
+        不会被 main.py 中先注册的 SPA fallback 接管。
+        """
+        for item, root in self.enabled_plugins():
+            try:
+                module = self._load_module(item, root)
+                v1_router = getattr(module, "v1_router", None)
+                if v1_router is not None:
+                    app.include_router(v1_router, prefix="/api/v1", tags=["plugin-v1"])
+            except Exception:
+                # 启动期完整加载会重试并记录 load_error，这里保持静默
+                continue
+
     def load_backend_plugins(self, app: Any) -> None:
         for item, root in self.enabled_plugins():
             try:

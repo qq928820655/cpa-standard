@@ -2,6 +2,9 @@
 from fastapi import FastAPI
 from sqlalchemy import inspect
 
+# 模块顶层暴露 v1_router，供主工程在 SPA catch-all 之前早挂载（外部 API GET 路由）
+from .video import router, v1_router  # noqa: F401
+
 
 def register_models() -> None:
     from .models import (
@@ -22,9 +25,8 @@ def register_models() -> None:
 
 
 def register(app: FastAPI) -> None:
-    from .video import router
-
     app.include_router(router, prefix="/api/admin", tags=["video-world"])
+    app.include_router(v1_router, prefix="/api/v1", tags=["video-world"])
 
 
 async def migrate() -> None:
@@ -42,6 +44,8 @@ async def migrate() -> None:
 
         if not await conn.run_sync(has_column("video_generation_tasks", "project_id")):
             await conn.exec_driver_sql("ALTER TABLE video_generation_tasks ADD COLUMN project_id INTEGER")
+        if not await conn.run_sync(has_column("video_generation_tasks", "source")):
+            await conn.exec_driver_sql("ALTER TABLE video_generation_tasks ADD COLUMN source VARCHAR(20) DEFAULT 'panel'")
         if not await conn.run_sync(has_column("video_model_configs", "protocol_options_json")):
             await conn.exec_driver_sql("ALTER TABLE video_model_configs ADD COLUMN protocol_options_json TEXT")
         for name, definition in {

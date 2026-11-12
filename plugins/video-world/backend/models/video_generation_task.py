@@ -57,3 +57,5 @@ class VideoGenerationTask(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     finished_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    # 调用来源：panel=管理面板视频页；api=外部 API Key 调用（/v1/videos/*）
+    source: Mapped[str] = mapped_column(String(20), default="panel", nullable=False)

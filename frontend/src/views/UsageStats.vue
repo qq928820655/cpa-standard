@@ -195,6 +195,8 @@
           </div>
         </div>
       </template>
+      <el-tabs v-model="activeTab" class="logs-tabs">
+        <el-tab-pane label="文本模型调用" name="text">
       <!-- 窄屏：15 列表格改为卡片流，详细字段折叠在「详情」里 -->
       <div v-if="isMobile" class="log-card-list" v-loading="loadingLogs">
         <div v-if="!logs.length" class="log-card-empty">暂无数据</div>
@@ -386,6 +388,91 @@
           @size-change="handlePageSizeChange"
         />
       </div>
+      </el-tab-pane>
+      <el-tab-pane label="图片模型调用" name="image">
+        <div v-loading="imageLoading">
+          <div v-if="!imageTasks.length" class="log-card-empty">暂无图片调用记录（外部 API 调用与面板生成的图片任务均在此显示）</div>
+          <el-table v-else :data="imageTasks" stripe border size="small" height="600">
+            <el-table-column prop="id" label="ID" width="64" />
+            <el-table-column prop="created_at" label="时间" width="108">
+              <template #default="{ row }">
+                {{ formatTableTime(row.created_at) }}
+              </template>
+            </el-table-column>
+            <el-table-column prop="source" label="来源" width="70" align="center">
+              <template #default="{ row }">
+                <el-tag :type="row.source === 'api' ? 'warning' : 'success'" size="small">
+                  {{ row.source === 'api' ? 'API' : '面板' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="api_key_name" label="命中 Key" width="110" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.api_key_name || '-' }}</template>
+            </el-table-column>
+            <el-table-column prop="model" label="模型" width="150" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.model || '-' }}</template>
+            </el-table-column>
+            <el-table-column prop="prompt" label="提示词" min-width="200">
+              <template #default="{ row }">
+                <el-tooltip
+                  v-if="row.prompt"
+                  effect="dark"
+                  placement="top"
+                  popper-class="error-message-tooltip"
+                  :show-after="150"
+                >
+                  <template #content>
+                    <div class="error-message-tooltip__content">{{ row.prompt }}</div>
+                  </template>
+                  <div class="error-message-cell">{{ row.prompt }}</div>
+                </el-tooltip>
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="status" label="状态" width="70" align="center">
+              <template #default="{ row }">
+                <el-tag :type="row.status === 'success' ? 'success' : 'danger'" size="small">
+                  {{ row.status === 'success' ? '成功' : '失败' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="duration_ms" label="耗时" width="88" align="right">
+              <template #default="{ row }">
+                {{ row.duration_ms ? row.duration_ms + 'ms' : '-' }}
+              </template>
+            </el-table-column>
+            <el-table-column label="生成图片" width="150">
+              <template #default="{ row }">
+                <template v-if="(row.results || []).some((r) => r.image_url)">
+                  <a
+                    v-for="(result, index) in (row.results || []).filter((r) => r.image_url)"
+                    :key="index"
+                    :href="result.image_url"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style="color: var(--el-color-primary); margin-right: 8px; white-space: nowrap;"
+                  >查看图片{{ (row.results || []).filter((r) => r.image_url).length > 1 ? index + 1 : '' }}</a>
+                </template>
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
+          </el-table>
+          <div class="pagination">
+            <el-pagination
+              v-model:current-page="imagePage"
+              v-model:page-size="imagePageSize"
+              :page-sizes="pageSizeOptions"
+              :total="imageTotal"
+              :small="isMobile"
+              :pager-count="isMobile ? 5 : 7"
+              :layout="isMobile ? 'prev, pager, next, sizes, total' : 'total, sizes, prev, pager, next'"
+              @current-change="handleImagePageChange"
+              @size-change="handleImagePageSizeChange"
+            />
+          </div>
+        </div>
+      </el-tab-pane>
+    </el-tabs>
     </el-card>
 
     <el-dialog
@@ -927,6 +1014,13 @@ const currentPage = ref(Number(savedState.currentPage) > 0 ? Number(savedState.c
 const pageSize = ref([10, 20, 50, 100].includes(Number(savedState.pageSize)) ? Number(savedState.pageSize) : 50)
 const totalLogs = ref(0)
 const pageSizeOptions = [10, 20, 50, 100]
+const activeTab = ref('text')
+const imageTasks = ref([])
+const imageTotal = ref(0)
+const imagePage = ref(1)
+const imagePageSize = ref(20)
+const imageLoading = ref(false)
+let imageLoadedOnce = false
 const AUTO_REFRESH_INTERVAL = 20000
 let refreshTimer = null
 let summaryAndDailyRequest = null
@@ -1108,6 +1202,39 @@ const loadLogs = async ({ silent = false } = {}) => {
   } finally {
     loadingLogs.value = false
   }
+}
+
+const loadImageTasks = async ({ silent = false } = {}) => {
+  imageLoading.value = true
+  try {
+    const result = await adminApi.listImageTasks({
+      page: imagePage.value,
+      limit: imagePageSize.value,
+    })
+    const data = Array.isArray(result) ? { items: result, total: result.length } : result
+    imageTasks.value = data.items || []
+    imageTotal.value = data.total || 0
+    imageLoadedOnce = true
+  } catch (e) {
+    if (!silent) ElMessage.error(e.message || '加载图片调用记录失败')
+  } finally {
+    imageLoading.value = false
+  }
+}
+
+const handleTabChange = (tab) => {
+  if (tab === 'image' && !imageLoadedOnce) loadImageTasks()
+}
+
+const handleImagePageChange = (page) => {
+  imagePage.value = page
+  loadImageTasks()
+}
+
+const handleImagePageSizeChange = (size) => {
+  imagePageSize.value = size
+  imagePage.value = 1
+  loadImageTasks()
 }
 
 const loadKeyOptions = async () => {

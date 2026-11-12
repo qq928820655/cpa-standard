@@ -214,8 +214,17 @@ async def health():
     return {"status": "ok"}
 
 
+# 插件的外部 API（v1_router）必须在 SPA catch-all 之前挂载，否则 GET 会被接管
+plugin_service.early_mount_v1_routers(app)
+
+
 @app.get("/{full_path:path}", include_in_schema=False)
 async def spa_fallback(full_path: str):
+    # API 路径（含插件在 startup 阶段注册、晚于本 fallback 的路由前缀）不落 SPA 页面
+    if full_path == "api" or full_path.startswith("api/"):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
     return _serve_frontend_file(full_path)
 
 

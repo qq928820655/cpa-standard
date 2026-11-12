@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings, export_config
-from database import get_db
+from database import get_db, async_session_maker
 from services.pool_manager import pool_manager
 from services.proxy_service import proxy_service
 from services.proxy_trace_service import proxy_trace_service
@@ -1736,6 +1736,101 @@ async def forward_request_with_retry(
     return last_status_code, last_response_headers, last_response_body, None
 
 
+async def record_external_image_call(
+    db: AsyncSession,
+    auth_info: dict,
+    *,
+    source_path: str,
+    model: str,
+    prompt: str,
+    request_params: Optional[dict],
+    status_code: int,
+    response_data: Any,
+    started_at: float,
+    key_info: Optional[dict],
+) -> None:
+    """外部 API Key 调用图片模型后落库：与面板生成共用任务/结果表，source=api。
+
+    任何记录异常都不影响主响应——记录失败只打日志。"""
+    try:
+        from models import ImageGenerationTask, ImageGenerationTaskResult
+
+        images: list[dict] = []
+        error_message = ""
+        if isinstance(response_data, dict):
+            for item in response_data.get("data") or []:
+                if not isinstance(item, dict):
+                    continue
+                images.append({
+                    "b64": item.get("b64_json") or "",
+                    "url": item.get("url") or "",
+                })
+            error = response_data.get("error")
+            if isinstance(error, dict):
+                error_message = str(error.get("message") or "")
+            elif error:
+                error_message = str(error)
+        if status_code >= 400 or not images:
+            ok = False
+        else:
+            ok = True
+
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        now = datetime.utcnow()
+        task = ImageGenerationTask(
+            provider=(key_info or {}).get("provider") or "",
+            api_key_id=(key_info or {}).get("id"),
+            api_key_name=(key_info or {}).get("name") or "",
+            base_url=(key_info or {}).get("base_url") or "",
+            model=model,
+            prompt=prompt or "",
+            request_params_json=json.dumps(request_params or {}, ensure_ascii=False),
+            source="api",
+            status="success" if ok else "failed",
+            total_count=len(images) if ok else 1,
+            completed_count=len(images) if ok else 1,
+            success_count=len(images) if ok else 0,
+            error_count=0 if ok else 1,
+            duration_ms=duration_ms,
+            error_summary=None if ok else (error_message or f"上游返回 {status_code}"),
+            started_at=now,
+            finished_at=now,
+            updated_at=now,
+            user_id=auth_info.get("user_id"),
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        if ok:
+            for index, image in enumerate(images):
+                # 按需求只保存上游返回的在线地址，不落图片本体（b64 不入库）
+                if not image["url"]:
+                    continue
+                result = ImageGenerationTaskResult(
+                    task_id=task.id,
+                    image_index=index + 1,
+                    api_key_id=(key_info or {}).get("id"),
+                    provider=(key_info or {}).get("provider") or "",
+                    api_key_name=(key_info or {}).get("name") or "",
+                    model=model,
+                    status="success",
+                    image_url=image["url"],
+                    duration_ms=duration_ms,
+                )
+                db.add(result)
+            await db.commit()
+        logger.warning(
+            f"[CPA IMAGE API RECORD] task_id={task.id} model={model} ok={ok} images={len(images)} path={source_path}"
+        )
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        logger.warning(f"[CPA IMAGE API RECORD] 记录外部图片调用失败: {exc}")
+
+
 async def forward_image_request_with_retry(
     db: AsyncSession,
     method: str,
@@ -1745,7 +1840,12 @@ async def forward_image_request_with_retry(
     data: Optional[dict] = None,
     files: Optional[list[tuple[str, tuple[str, bytes, str]]]] = None,
     user_id: Optional[int] = None,
+    key_info_out: Optional[dict] = None,
 ):
+    """转发图片请求（带 Key 轮询重试）。
+
+    key_info_out 传入一个 dict 时，会把最终命中的上游 Key 摘要写回
+    {id, name, provider, base_url}，供调用方做外部调用记录。"""
     model = None
     if isinstance(body, dict):
         model = body.get("model")
@@ -1786,6 +1886,13 @@ async def forward_image_request_with_retry(
             break
 
         tried_key_ids.append(api_key.id)
+        if key_info_out is not None:
+            key_info_out.update({
+                "id": api_key.id,
+                "name": getattr(api_key, "name", ""),
+                "provider": getattr(api_key, "provider", ""),
+                "base_url": getattr(api_key, "base_url", ""),
+            })
         logger.warning(f"[CPA IMAGE RETRY] attempt={attempt + 1} api_key_id={api_key.id} model={model} path={path}")
         attempt_started_at = time.perf_counter()
         status_code, response_headers, response_data = await proxy_service.forward_image_request(
@@ -2672,6 +2779,8 @@ async def openai_images_generations(
     _check_model_permission(auth_info, _actual_model_for_check)
     await _check_user_quota(auth_info, db)
 
+    key_info: dict = {}
+    started_at = time.perf_counter()
     status_code, _, response_data = await forward_image_request_with_retry(
         db=db,
         method="POST",
@@ -2679,7 +2788,29 @@ async def openai_images_generations(
         headers=headers,
         body=body,
         user_id=auth_info.get("user_id"),
+        key_info_out=key_info,
     )
+    # 外部 API 调用同样落图片任务库（source=api），面板历史可见。
+    # 用独立 session：请求结束原 session 即关闭，后台任务不能复用。
+    async def _record_external_call():
+        async with async_session_maker() as session:
+            await record_external_image_call(
+                session,
+                auth_info,
+                source_path="/v1/images/generations",
+                model=model,
+                prompt=str(body.get("prompt") or "") if isinstance(body, dict) else "",
+                request_params={
+                    key: value for key, value in (body or {}).items()
+                    if key in {"model", "size", "quality", "n", "response_format", "background", "output_format"}
+                },
+                status_code=status_code,
+                response_data=response_data,
+                started_at=started_at,
+                key_info=key_info,
+            )
+
+    asyncio.create_task(_record_external_call())
     return JSONResponse(content=response_data, status_code=status_code)
 
 
@@ -2705,6 +2836,8 @@ async def openai_images_edits(
     _check_model_permission(auth_info, str(model))
     await _check_user_quota(auth_info, db)
 
+    key_info: dict = {}
+    started_at = time.perf_counter()
     status_code, _, response_data = await forward_image_request_with_retry(
         db=db,
         method="POST",
@@ -2713,7 +2846,27 @@ async def openai_images_edits(
         data=data,
         files=files,
         user_id=auth_info.get("user_id"),
+        key_info_out=key_info,
     )
+    async def _record_external_call():
+        async with async_session_maker() as session:
+            await record_external_image_call(
+                session,
+                auth_info,
+                source_path="/v1/images/edits",
+                model=str(model),
+                prompt=str(data.get("prompt") or "") if isinstance(data, dict) else "",
+                request_params={
+                    key: value for key, value in (data or {}).items()
+                    if key in {"model", "size", "quality", "n", "response_format", "background", "output_format", "input_image_names"}
+                },
+                status_code=status_code,
+                response_data=response_data,
+                started_at=started_at,
+                key_info=key_info,
+            )
+
+    asyncio.create_task(_record_external_call())
     return JSONResponse(content=response_data, status_code=status_code)
 
 

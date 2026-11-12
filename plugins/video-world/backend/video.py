@@ -22,7 +22,7 @@ from config import DATA_DIR
 from models import ImageGenerationTask, ImageGenerationTaskResult
 from .models import VideoCreativeProject, VideoGenerationTask, VideoModelConfig, VideoProjectAttachment, VideoProjectExportTask, VideoProjectImageAsset, VideoProjectRoleConfig, VideoProjectWorkflow, VideoProjectWorkflowTask, VideoProjectAudioTask, VideoProjectSubtitleTask, VideoProjectTimelineItem, VideoProjectVoiceProfile
 from routers.admin import require_image_square_access, verify_admin_key
-from routers.proxy import build_upstream_body_for_key, forward_request_with_retry
+from routers.proxy import build_upstream_body_for_key, forward_request_with_retry, verify_api_key
 from services.pool_manager import pool_manager
 from .project_audio_service import project_audio_service
 from services.proxy_service import proxy_service
@@ -433,6 +433,7 @@ def serialize_task(item: VideoGenerationTask) -> dict:
         "native_audio_checked_at": item.native_audio_checked_at,
         "error_detail": item.error_detail, "created_at": item.created_at, "updated_at": item.updated_at,
         "finished_at": item.finished_at,
+        "source": getattr(item, "source", "panel") or "panel",
     }
 
 
@@ -2630,7 +2631,7 @@ async def generate_video(data: VideoGenerateRequest, db: AsyncSession = Depends(
         raise HTTPException(status_code=400, detail="没有支持该视频模型的可用 Key")
     payload = data.model_dump(exclude={"source"}, exclude_none=True)
     payload["n"] = 1
-    task = VideoGenerationTask(project_id=data.project_id, user_id=auth.get("user_id"), api_key_id=key.id, provider=key.provider, model=data.model, prompt=data.prompt, mode=data.mode, seconds=data.seconds, request_params_json=json.dumps(payload, ensure_ascii=False), status="creating", attempted_key_ids_json=json.dumps([key.id]))
+    task = VideoGenerationTask(project_id=data.project_id, user_id=auth.get("user_id"), api_key_id=key.id, provider=key.provider, model=data.model, prompt=data.prompt, mode=data.mode, seconds=data.seconds, request_params_json=json.dumps(payload, ensure_ascii=False), status="creating", attempted_key_ids_json=json.dumps([key.id]), source="panel")
     db.add(task)
     await db.commit()
     try:
@@ -2756,3 +2757,142 @@ async def delete_video_model(model_id: int, db: AsyncSession = Depends(get_db), 
     await db.delete(item)
     await db.commit()
     return {"id": model_id, "deleted": True}
+
+
+# ============ 外部 API Key 视频调用（OpenAI 风格 /v1/videos/*） ============
+
+v1_router = APIRouter()
+
+
+@v1_router.post("/videos/generations")
+async def v1_video_generations(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    auth_info: dict = Depends(verify_api_key),
+):
+    """外部 API Key 视频生成：与面板生成共用任务表（source=api），历史可查。
+
+    POST /v1/videos/generations
+    {"model": "...", "prompt": "...", "mode": "text", "seconds": "5", "size": "720P", "aspect_ratio": "16:9"}
+    """
+    body = await request.json()
+    model = str(body.get("model") or "").strip()
+    prompt = str(body.get("prompt") or "").strip()
+    if not model or not prompt:
+        raise HTTPException(status_code=400, detail="缺少 model 或 prompt")
+    config = await db.scalar(
+        select(VideoModelConfig).where(VideoModelConfig.model == model, VideoModelConfig.enabled == True)
+    )
+    if not config:
+        raise HTTPException(status_code=404, detail="视频模型不可用")
+    capabilities = json.loads(config.capabilities_json or "{}")
+    allowed_modes = set(capabilities.get("modes") or [])
+    allowed_seconds = {str(item) for item in capabilities.get("seconds") or []}
+    allowed_sizes = set(capabilities.get("sizes") or [])
+    allowed_ratios = set(capabilities.get("aspect_ratios") or [])
+    mode = str(body.get("mode") or (sorted(allowed_modes)[0] if allowed_modes else "text"))
+    seconds = str(body.get("seconds") or (sorted(allowed_seconds)[0] if allowed_seconds else "5"))
+    size = str(body.get("size") or (sorted(allowed_sizes)[0] if allowed_sizes else "720P"))
+    aspect_ratio = str(body.get("aspect_ratio") or (sorted(allowed_ratios)[0] if allowed_ratios else "16:9"))
+    if allowed_modes and mode not in allowed_modes:
+        raise HTTPException(status_code=400, detail=f"当前视频模型不支持该生成模式，可选：{sorted(allowed_modes)}")
+    if allowed_seconds and seconds not in allowed_seconds:
+        raise HTTPException(status_code=400, detail=f"当前视频模型不支持该时长，可选：{sorted(allowed_seconds)}")
+    if allowed_sizes and size not in allowed_sizes:
+        raise HTTPException(status_code=400, detail=f"当前视频模型不支持该分辨率，可选：{sorted(allowed_sizes)}")
+    if allowed_ratios and aspect_ratio not in allowed_ratios:
+        raise HTTPException(status_code=400, detail=f"当前视频模型不支持该画幅，可选：{sorted(allowed_ratios)}")
+
+    provider = str(body.get("provider") or "").strip() or (config.provider or None)
+    key = await pool_manager.get_next_key(db, provider=provider, model=model)
+    if not key:
+        raise HTTPException(status_code=400, detail="没有支持该视频模型的可用 Key")
+
+    payload = {
+        "model": model, "prompt": prompt, "mode": mode, "seconds": seconds,
+        "size": size, "aspect_ratio": aspect_ratio, "n": 1,
+    }
+    now = datetime.utcnow()
+    task = VideoGenerationTask(
+        user_id=auth_info.get("user_id"),
+        api_key_id=key.id,
+        provider=key.provider,
+        model=model,
+        prompt=prompt,
+        mode=mode,
+        seconds=seconds,
+        request_params_json=json.dumps(payload, ensure_ascii=False),
+        status="creating",
+        attempted_key_ids_json=json.dumps([key.id]),
+        source="api",
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+    try:
+        upstream = await video_service.create_task(key, config, payload)
+        task.upstream_video_id = video_service.extract_task_id(upstream)
+        task.status = "pending"
+        await db.commit()
+    except Exception as exc:
+        task.status = "failed"
+        task.error_detail = str(exc)
+        task.finished_at = datetime.utcnow()
+        await db.commit()
+    await db.refresh(task)
+    return serialize_task(task)
+
+
+@v1_router.get("/videos/tasks/{task_id}")
+async def v1_video_task_detail(
+    task_id: int,
+    refresh: bool = True,
+    db: AsyncSession = Depends(get_db),
+    auth_info: dict = Depends(verify_api_key),
+):
+    """查询外部视频任务详情；未完成任务可带 refresh=1 拉一次上游结果。"""
+    task = await db.get(VideoGenerationTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="视频任务不存在")
+    if refresh and task.status in {"pending", "creating"} and task.upstream_video_id:
+        config = await db.scalar(select(VideoModelConfig).where(VideoModelConfig.model == task.model))
+        key = await pool_manager.get_key_by_id(db, task.api_key_id) if task.api_key_id else None
+        if key and key.is_active and config:
+            try:
+                result = await video_service.query_task(key, config, task.upstream_video_id)
+                task.status, task.video_url, task.cover_url, task.error_detail = video_service.normalize_result(result)
+                if task.status in {"completed", "failed"}:
+                    task.finished_at = datetime.utcnow()
+                await db.commit()
+                await db.refresh(task)
+            except Exception as exc:
+                task.error_detail = str(exc)
+                await db.commit()
+                await db.refresh(task)
+    return serialize_task(task)
+
+
+@v1_router.get("/videos/models")
+async def v1_video_models(
+    db: AsyncSession = Depends(get_db),
+    auth_info: dict = Depends(verify_api_key),
+):
+    """列出当前可用的视频模型（含能力参数），便于外部调用方选择。"""
+    items = (
+        (await db.execute(select(VideoModelConfig).where(VideoModelConfig.enabled == True)))
+        .scalars()
+        .all()
+    )
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": item.model,
+                "provider": item.provider,
+                "capabilities": json.loads(item.capabilities_json or "{}"),
+            }
+            for item in items
+        ],
+    }

@@ -42,6 +42,8 @@ class ImageGenerationTask(Base):
     failure_category_stats_json: Mapped[str] = mapped_column(Text, nullable=True)
     error_summary: Mapped[str] = mapped_column(Text, nullable=True)
     retry_of_task_id: Mapped[int] = mapped_column(Integer, ForeignKey("image_generation_tasks.id"), nullable=True)
+    # 调用来源：panel=管理面板图片广场；api=外部 API Key 调用（/v1/images/*）
+    source: Mapped[str] = mapped_column(String(20), default="panel", nullable=False)
     report_file_path: Mapped[str] = mapped_column(String(500), nullable=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     pending_refresh: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
