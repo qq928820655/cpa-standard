@@ -21,6 +21,9 @@ DEFAULT_EXPORT_CONFIG = {
     "image_auto_refresh_max_attempts": 10,
     "image_stale_task_cleanup_interval_seconds": 60,
     "openai_plus_proxy_url": "",
+    # mihomo-pool 面板地址与令牌：端口→节点名映射与快速分配的数据源；留空表示未接
+    "mihomo_pool_url": "",
+    "mihomo_pool_token": "",
     # provider 扩展配置：{ "bb": { "password": "xxx" }, ... }
     "provider_ext": {},
     # 是否向管理员显示实际使用的模型（格式：请求模型/映射模型），默认关闭

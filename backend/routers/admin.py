@@ -7,6 +7,8 @@ import binascii
 import hashlib
 import hmac
 import httpx
+import threading
+import time
 import importlib.util
 import ipaddress
 import json
@@ -19,7 +21,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional, List, Any, TypedDict
+from typing import Optional, List, Any, Dict, TypedDict
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Query
@@ -577,6 +579,46 @@ class OpenAIPlusProxyConfigResponse(BaseModel):
 class OpenAIPlusProxyConfigUpdate(BaseModel):
     openai_plus_proxy_url: str = ""
     openai_plus_cache_friendly: bool = False
+
+
+class MihomoExitItem(BaseModel):
+    port: int
+    node: str = ""
+    group: str = ""
+    kind: str = ""
+    error: str = ""
+
+
+class MihomoProxyExitsResponse(BaseModel):
+    configured: bool = False
+    pool_url: str = ""
+    exits: List[MihomoExitItem] = []
+
+
+class MihomoPoolConfigResponse(BaseModel):
+    mihomo_pool_url: str = ""
+    mihomo_pool_token_set: bool = False
+
+
+class MihomoPoolConfigUpdate(BaseModel):
+    mihomo_pool_url: str = ""
+    mihomo_pool_token: str = ""
+
+
+class MihomoQuickAssignRequest(BaseModel):
+    exclude_port: Optional[int] = None
+
+
+class MihomoQuickAssignResponse(BaseModel):
+    proxy_url: str
+    port: int
+    node: str = ""
+
+
+_mihomo_exits_cache: Dict[str, Any] = {"at": 0.0, "exits": []}
+_mihomo_exits_lock = threading.Lock()
+MIHOMO_EXITS_TTL_SECONDS = 15.0
+MIHOMO_NODE_PORT_MIN = 17900
 
 
 class ImageAutoRefreshConfigResponse(BaseModel):
@@ -5849,6 +5891,114 @@ async def update_openai_plus_proxy_config(
     export_config["openai_plus_cache_friendly"] = cache_friendly
     persist_export_config()
     return OpenAIPlusProxyConfigResponse(openai_plus_proxy_url=proxy_url, openai_plus_cache_friendly=cache_friendly)
+
+
+def _mihomo_pool_settings() -> tuple:
+    url = str(export_config.get("mihomo_pool_url") or "").strip()
+    token = str(export_config.get("mihomo_pool_token") or "").strip()
+    return url, token
+
+
+def _fetch_mihomo_exits(pool_url: str, token: str, force: bool = False) -> List[Dict[str, Any]]:
+    """拉取 mihomo-pool 的端口→节点映射；失败退回空列表并同样按 TTL 缓存，
+    避免面板不可达时每次渲染都吃满 5s 超时。"""
+    now = time.time()
+    with _mihomo_exits_lock:
+        if not force and now - _mihomo_exits_cache["at"] < MIHOMO_EXITS_TTL_SECONDS:
+            return list(_mihomo_exits_cache["exits"])
+    base = (pool_url or "").strip().rstrip("/")
+    headers = {"User-Agent": "cpa-mihomo-picker"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    exits: List[Dict[str, Any]] = []
+    try:
+        req = urllib.request.Request(base + "/api/v1/hub-exits", headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+        for entry in (payload or {}).get("exits") or []:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                port = int(entry.get("port"))
+            except (TypeError, ValueError):
+                continue
+            exits.append({
+                "port": port,
+                "node": str(entry.get("node") or "").strip(),
+                "group": str(entry.get("group") or "").strip(),
+                "kind": str(entry.get("kind") or "").strip(),
+                "error": str(entry.get("error") or "").strip(),
+            })
+    except Exception as exc:
+        logger.warning("mihomo-pool %s 拉取出口映射失败: %s", base, exc)
+        with _mihomo_exits_lock:
+            _mihomo_exits_cache["at"] = time.time()
+            _mihomo_exits_cache["exits"] = []
+        return []
+    with _mihomo_exits_lock:
+        _mihomo_exits_cache["at"] = time.time()
+        _mihomo_exits_cache["exits"] = list(exits)
+    return exits
+
+
+@router.get("/openai-plus/proxy-exits", response_model=MihomoProxyExitsResponse)
+async def get_openai_plus_proxy_exits(
+    _: dict = Depends(require_admin_access),
+):
+    """列出 mihomo-pool 各代理端口当前对应的节点，供前端下拉按节点名选择。"""
+    pool_url, token = _mihomo_pool_settings()
+    if not pool_url:
+        return MihomoProxyExitsResponse(configured=False, pool_url="", exits=[])
+    exits = _fetch_mihomo_exits(pool_url, token)
+    items = [MihomoExitItem(**item) for item in exits]
+    return MihomoProxyExitsResponse(configured=bool(token), pool_url=pool_url, exits=items)
+
+
+@router.put("/openai-plus/mihomo-config", response_model=MihomoPoolConfigResponse)
+async def update_mihomo_pool_config(
+    data: MihomoPoolConfigUpdate,
+    _: dict = Depends(require_admin_access),
+):
+    """配置 mihomo-pool 面板地址与令牌（端口→节点映射与快速分配的数据源）。"""
+    pool_url = (data.mihomo_pool_url or "").strip()
+    token = (data.mihomo_pool_token or "").strip()
+    export_config["mihomo_pool_url"] = pool_url
+    export_config["mihomo_pool_token"] = token
+    persist_export_config()
+    with _mihomo_exits_lock:
+        _mihomo_exits_cache["at"] = 0.0
+        _mihomo_exits_cache["exits"] = []
+    return MihomoPoolConfigResponse(mihomo_pool_url=pool_url, mihomo_pool_token_set=bool(token))
+
+
+@router.post("/openai-plus/proxy-exits/quick-assign", response_model=MihomoQuickAssignResponse)
+async def quick_assign_openai_plus_proxy(
+    data: MihomoQuickAssignRequest,
+    _: dict = Depends(require_admin_access),
+):
+    """快速分配：随机挑一个在线的 mihomo 节点专属口写入 openai_plus_proxy_url 并持久化。
+
+    专属口（17901+）硬绑定单一节点；全部不可用时退回在线的共享口，保证链路始终可用。"""
+    pool_url, token = _mihomo_pool_settings()
+    if not pool_url:
+        raise HTTPException(status_code=400, detail="尚未配置 mihomo-pool 面板地址")
+    exits = _fetch_mihomo_exits(pool_url, token, force=True)
+    exclude = int(data.exclude_port) if data.exclude_port else None
+    candidates = [
+        item for item in exits
+        if not item["error"]
+        and item["port"] >= MIHOMO_NODE_PORT_MIN
+        and item["port"] != exclude
+    ]
+    if not candidates:
+        candidates = [item for item in exits if not item["error"] and item["port"] != exclude]
+    if not candidates:
+        raise HTTPException(status_code=404, detail="mihomo-pool 当前没有在线出口")
+    picked = random.choice(candidates)
+    proxy_url = f"http://127.0.0.1:{picked['port']}"
+    export_config["openai_plus_proxy_url"] = proxy_url
+    persist_export_config()
+    return MihomoQuickAssignResponse(proxy_url=proxy_url, port=picked["port"], node=picked["node"])
 
 
 @router.get("/key-check-default-config", response_model=KeyCheckDefaultConfigResponse)
