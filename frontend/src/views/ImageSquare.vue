@@ -788,126 +788,11 @@
       </template>
     </el-dialog>
 
-    <el-dialog
-      v-model="imageKeyDetailDialogVisible"
-      title="Key 详情"
-      width="1040px"
-      @closed="handleImageKeyDetailDialogClosed"
-    >
-      <div v-loading="imageKeyDetailLoading" class="key-detail-dialog">
-        <el-descriptions :column="isMobile ? 1 : 2" border>
-          <el-descriptions-item label="Key ID">{{ imageKeyDetail.id || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="名称">
-            <span>{{ imageKeyDetail.name || '-' }}</span>
-            <el-button
-              v-if="imageKeyDetail.password"
-              link
-              size="small"
-              style="margin-left: 6px; padding: 0"
-              title="复制登录密码"
-              @click="copyKeyPassword(imageKeyDetail.password)"
-            ><el-icon><View /></el-icon></el-button>
-          </el-descriptions-item>
-          <el-descriptions-item label="提供商">{{ imageKeyDetail.provider || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="启用状态">
-            <el-button
-              :type="imageKeyDetail.is_active ? 'success' : 'danger'"
-              size="small"
-              :loading="imageKeyDetailToggling"
-              @click="toggleImageKeyDetailActive"
-            >
-              {{ imageKeyDetail.is_active ? '已启用' : '已关闭' }}
-            </el-button>
-          </el-descriptions-item>
-          <el-descriptions-item label="API Key">{{ imageKeyDetail.api_key_masked || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="请求地址">
-            <a v-if="imageKeyDetail.base_url" :href="imageKeyDetail.base_url" target="_blank" rel="noopener noreferrer" style="color:var(--el-color-primary);word-break:break-all;">{{ imageKeyDetail.base_url }}</a>
-            <span v-else>-</span>
-          </el-descriptions-item>
-          <el-descriptions-item label="独立 fake IP">
-            <el-tag :type="imageKeyDetail.enable_fake_ip ? 'success' : 'info'" size="small">
-              {{ imageKeyDetail.enable_fake_ip ? '已启用' : '未启用' }}
-            </el-tag>
-          </el-descriptions-item>
-          <el-descriptions-item label="fake IP">{{ imageKeyDetail.fake_ip || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="生图总次数">{{ formatNumber(imageKeyDetailImageStats.total_count || 0) }}</el-descriptions-item>
-          <el-descriptions-item label="生图成功率">{{ imageKeySuccessRate }}%</el-descriptions-item>
-          <el-descriptions-item label="成功次数">{{ formatNumber(imageKeyDetailImageStats.success_count || 0) }}</el-descriptions-item>
-          <el-descriptions-item label="失败次数">{{ formatNumber(imageKeyDetailImageStats.error_count || 0) }}</el-descriptions-item>
-          <el-descriptions-item label="当前余额">
-            <span v-if="imageKeyDetailBalanceLoading" style="color: #909399; font-size: 13px">查询中...</span>
-            <span v-else-if="imageKeyDetailBalance">
-              <span style="color: #10b981; font-weight: 600">${{ imageKeyDetailBalance.balance_usd.toFixed(4) }}</span>
-              <span style="color: #909399; font-size: 12px; margin-left: 8px">已用 ${{ imageKeyDetailBalance.used_usd.toFixed(4) }}</span>
-            </span>
-            <span v-else style="color: #909399; font-size: 13px">-</span>
-          </el-descriptions-item>
-          <el-descriptions-item label="生图记录数">{{ formatNumber(imageKeyDetailTasksTotal) }}</el-descriptions-item>
-        </el-descriptions>
-
-        <el-card shadow="never" class="key-detail-history-card">
-          <template #header>
-            <div class="card-header">
-              <div>
-                <div class="panel-title">生图历史</div>
-                <div class="panel-subtitle">查看该 Key 命中的图片生成任务</div>
-              </div>
-            </div>
-          </template>
-
-          <el-table :data="imageKeyDetailTasks" stripe border size="small" v-loading="imageKeyDetailTasksLoading" max-height="360">
-            <el-table-column prop="id" label="任务" width="72">
-              <template #default="{ row }">#{{ row.id }}</template>
-            </el-table-column>
-            <el-table-column prop="model" label="模型" min-width="210" show-overflow-tooltip />
-            <el-table-column label="模式" width="110">
-              <template #default="{ row }">
-                <div class="mode-cell">
-                  <el-tag :type="taskMode(row) === 'image_to_image' ? 'warning' : 'info'" size="small">
-                    {{ taskModeLabel(row) }}
-                  </el-tag>
-                  <span v-if="taskInputImageCount(row)">参考图 {{ taskInputImageCount(row) }} 张</span>
-                </div>
-              </template>
-            </el-table-column>
-            <el-table-column prop="status" label="状态" width="86" align="center">
-              <template #default="{ row }">
-                <el-tag :type="statusType(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="结果" width="82" align="center">
-              <template #default="{ row }">{{ row.success_count }} / {{ row.total_count }}</template>
-            </el-table-column>
-            <el-table-column label="用时" width="92" align="center">
-              <template #default="{ row }">{{ formatDuration(row.duration_ms) }}</template>
-            </el-table-column>
-            <el-table-column prop="created_at" label="创建时间" width="180">
-              <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
-            </el-table-column>
-            <el-table-column label="操作" width="76" fixed="right" align="center">
-              <template #default="{ row }">
-                <el-button link type="primary" @click="openTask(row.id)">查看</el-button>
-              </template>
-            </el-table-column>
-          </el-table>
-
-          <div class="pagination key-detail-pagination">
-            <el-pagination
-              v-model:current-page="imageKeyDetailTasksPage"
-              v-model:page-size="imageKeyDetailTasksPageSize"
-              :page-sizes="[10, 20, 50]"
-              :total="imageKeyDetailTasksTotal"
-              layout="total, sizes, prev, pager, next"
-              @current-change="handleImageKeyDetailTasksPageChange"
-              @size-change="handleImageKeyDetailTasksPageSizeChange"
-            />
-          </div>
-        </el-card>
-      </div>
-      <template #footer>
-        <el-button @click="imageKeyDetailDialogVisible = false">关闭</el-button>
-      </template>
-    </el-dialog>
+    <ImageKeyDetailDialog
+      ref="imageKeyDetailDialogRef"
+      @view-task="openTask"
+      @key-toggled="handleImageKeyToggled"
+    />
 
     <el-dialog v-model="detailVisible" title="图片任务详情" width="860px">
       <div v-if="detailTask" class="detail-body">
@@ -1109,6 +994,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowDown, Plus, Refresh, View } from '@element-plus/icons-vue'
 import { adminApi, authApi, copyText } from '../api'
+import ImageKeyDetailDialog from '../components/ImageKeyDetailDialog.vue'
 
 // 手机竖屏改用卡片流，桌面端保持原表格
 const MOBILE_QUERY = '(max-width: 768px)'
@@ -1164,18 +1050,13 @@ const imageValidateDetailVisible = ref(false)
 const selectedImageValidateResult = ref(null)
 const promptExampleVisible = ref(false)
 const selectedPromptExample = ref(null)
-const imageKeyDetailDialogVisible = ref(false)
-const imageKeyDetailLoading = ref(false)
-const imageKeyDetail = ref({})
-const imageKeyDetailImageStats = ref({})
-const imageKeyDetailTasks = ref([])
-const imageKeyDetailTasksLoading = ref(false)
-const imageKeyDetailTasksPage = ref(1)
-const imageKeyDetailTasksPageSize = ref(10)
-const imageKeyDetailTasksTotal = ref(0)
-const imageKeyDetailBalance = ref(null)
-const imageKeyDetailBalanceLoading = ref(false)
-const imageKeyDetailToggling = ref(false)
+const imageKeyDetailDialogRef = ref(null)
+const openImageKeyDetail = (apiKeyId) => {
+  imageKeyDetailDialogRef.value?.open?.(apiKeyId)
+}
+const handleImageKeyToggled = () => {
+  loadKeyStats()
+}
 const loadingModels = ref(false)
 const modelsCollapsed = ref(true)
 const loadingStats = ref(false)
@@ -1896,12 +1777,6 @@ const formatDuration = (value) => {
 
 const formatNumber = (value) => Number(value || 0).toLocaleString('zh-CN')
 
-const imageKeySuccessRate = computed(() => {
-  const total = Number(imageKeyDetailImageStats.value?.total_count || 0)
-  if (!total) return '0.00'
-  return ((Number(imageKeyDetailImageStats.value?.success_count || 0) / total) * 100).toFixed(2)
-})
-
 const selectModel = (model) => {
   form.model = model
   handleModelChange()
@@ -2555,110 +2430,6 @@ const openTask = async (id) => {
   if (task.status === 'running' && task.pending_refresh) {
     startPendingRefreshCheck(task.id)
   }
-}
-
-const loadImageKeyDetailTasks = async (apiKeyId = imageKeyDetail.value?.id) => {
-  if (!apiKeyId) return
-  imageKeyDetailTasksLoading.value = true
-  try {
-    const res = await adminApi.listImageTasks({
-      api_key_id: apiKeyId,
-      page: imageKeyDetailTasksPage.value,
-      limit: imageKeyDetailTasksPageSize.value,
-    })
-    imageKeyDetailTasks.value = res.items || []
-    imageKeyDetailTasksTotal.value = res.total || 0
-  } catch (error) {
-    ElMessage.error(error.message || '加载 Key 生图历史失败')
-  } finally {
-    imageKeyDetailTasksLoading.value = false
-  }
-}
-
-const loadImageKeyStats = async (apiKeyId) => {
-  if (!apiKeyId) return
-  const res = await adminApi.getImageKeyStats()
-  imageKeyDetailImageStats.value = (res.items || []).find((item) => Number(item.api_key_id) === Number(apiKeyId)) || {}
-}
-
-const openImageKeyDetail = async (apiKeyId) => {
-  if (!apiKeyId) return
-  imageKeyDetailDialogVisible.value = true
-  imageKeyDetailLoading.value = true
-  imageKeyDetailBalance.value = null
-  try {
-    const keyData = await adminApi.getKey(apiKeyId)
-    imageKeyDetail.value = keyData || {}
-    imageKeyDetailTasksPage.value = 1
-    await Promise.all([
-      loadImageKeyStats(apiKeyId),
-      loadImageKeyDetailTasks(apiKeyId),
-    ])
-    // 异步加载余额，不阻塞弹窗
-    loadImageKeyDetailBalance(apiKeyId)
-  } catch (error) {
-    ElMessage.error(error.message || '加载 Key 详情失败')
-  } finally {
-    imageKeyDetailLoading.value = false
-  }
-}
-
-const loadImageKeyDetailBalance = async (keyId) => {
-  imageKeyDetailBalanceLoading.value = true
-  try {
-    const data = await adminApi.getProviderBalance(keyId)
-    imageKeyDetailBalance.value = data
-  } catch {
-    imageKeyDetailBalance.value = null
-  } finally {
-    imageKeyDetailBalanceLoading.value = false
-  }
-}
-
-const toggleImageKeyDetailActive = async () => {
-  const keyId = imageKeyDetail.value?.id
-  if (!keyId || imageKeyDetailToggling.value) return
-  imageKeyDetailToggling.value = true
-  try {
-    const updated = await adminApi.toggleKey(keyId)
-    imageKeyDetail.value = { ...imageKeyDetail.value, is_active: updated.is_active }
-    ElMessage.success(updated.is_active ? 'Key 已启用' : 'Key 已关闭')
-  } catch (e) {
-    ElMessage.error(e.message || '操作失败')
-  } finally {
-    imageKeyDetailToggling.value = false
-  }
-}
-
-const copyKeyPassword = async (password) => {
-  if (!password) return
-  try {
-    await copyText(password)
-    ElMessage.success('密码已复制')
-  } catch {
-    ElMessage.error('复制失败')
-  }
-}
-
-const handleImageKeyDetailTasksPageChange = (page) => {
-  imageKeyDetailTasksPage.value = page
-  loadImageKeyDetailTasks()
-}
-
-const handleImageKeyDetailTasksPageSizeChange = (size) => {
-  imageKeyDetailTasksPageSize.value = size
-  imageKeyDetailTasksPage.value = 1
-  loadImageKeyDetailTasks()
-}
-
-const handleImageKeyDetailDialogClosed = () => {
-  imageKeyDetail.value = {}
-  imageKeyDetailImageStats.value = {}
-  imageKeyDetailTasks.value = []
-  imageKeyDetailTasksTotal.value = 0
-  imageKeyDetailTasksPage.value = 1
-  imageKeyDetailTasksPageSize.value = 10
-  imageKeyDetailBalance.value = null
 }
 
 const imageSizeText = (item) => {

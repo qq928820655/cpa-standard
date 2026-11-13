@@ -195,7 +195,7 @@
           </div>
         </div>
       </template>
-      <el-tabs v-model="activeTab" class="logs-tabs">
+      <el-tabs v-model="activeTab" class="logs-tabs" @tab-change="handleTabChange">
         <el-tab-pane label="文本模型调用" name="text">
       <!-- 窄屏：15 列表格改为卡片流，详细字段折叠在「详情」里 -->
       <div v-if="isMobile" class="log-card-list" v-loading="loadingLogs">
@@ -392,7 +392,70 @@
       <el-tab-pane label="图片模型调用" name="image">
         <div v-loading="imageLoading">
           <div v-if="!imageTasks.length" class="log-card-empty">暂无图片调用记录（外部 API 调用与面板生成的图片任务均在此显示）</div>
-          <el-table v-else :data="imageTasks" stripe border size="small" height="600">
+          <template v-else>
+            <!-- 窄屏：表格改为卡片流，与文本 tab 同款交互 -->
+            <div v-if="isMobile" class="log-card-list">
+              <div v-for="row in imageTasks" :key="row.id" class="log-card">
+                <div class="log-card__head">
+                  <span class="log-card__model">{{ row.model || '-' }}</span>
+                  <span class="log-card__time">{{ formatTableTime(row.created_at) }}</span>
+                </div>
+                <div class="log-card__meta">
+                  <el-tag :type="row.source === 'api' ? 'warning' : 'success'" size="small">
+                    {{ row.source === 'api' ? 'API' : '面板' }}
+                  </el-tag>
+                  <el-tag :type="row.status === 'success' ? 'success' : 'danger'" size="small">
+                    {{ row.status === 'success' ? '成功' : '失败' }}
+                  </el-tag>
+                  <el-button
+                    v-if="showUserFilter && row.api_key_id"
+                    link
+                    type="primary"
+                    class="log-card__key"
+                    @click="openImageKeyDetail(row.api_key_id)"
+                  >
+                    {{ row.api_key_name || `#${row.api_key_id}` }}
+                  </el-button>
+                  <span v-else class="log-card__key log-card__key--static">{{ row.api_key_name || '-' }}</span>
+                </div>
+                <div class="log-card__foot">
+                  <span class="log-card__latency">{{ row.duration_ms ? row.duration_ms + 'ms' : '-' }}</span>
+                  <span class="log-card__tokens">{{ (row.results || []).filter((r) => r.image_url).length }} 张图片</span>
+                  <button type="button" class="log-card__toggle" @click="toggleLogExpand(`img-${row.id}`)">
+                    <span>{{ isLogExpanded(`img-${row.id}`) ? '收起' : '详情' }}</span>
+                    <el-icon :class="{ 'is-open': isLogExpanded(`img-${row.id}`) }"><ArrowDown /></el-icon>
+                  </button>
+                </div>
+                <div v-show="isLogExpanded(`img-${row.id}`)" class="log-card__rows">
+                  <div class="log-card__row">
+                    <span class="log-card__label">ID</span>
+                    <span class="log-card__value">{{ row.id }}</span>
+                  </div>
+                  <div class="log-card__row">
+                    <span class="log-card__label">提示词</span>
+                    <span class="log-card__value">{{ row.prompt || '-' }}</span>
+                  </div>
+                  <div v-if="(row.results || []).some((r) => r.image_url)" class="log-card__row">
+                    <span class="log-card__label">生成图片</span>
+                    <span class="log-card__value">
+                      <a
+                        v-for="(result, index) in (row.results || []).filter((r) => r.image_url)"
+                        :key="index"
+                        :href="result.image_url"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style="color: var(--el-color-primary); margin-right: 10px; white-space: nowrap;"
+                      >查看图片{{ (row.results || []).filter((r) => r.image_url).length > 1 ? index + 1 : '' }}</a>
+                    </span>
+                  </div>
+                  <div v-if="row.error_summary" class="log-card__row">
+                    <span class="log-card__label">错误</span>
+                    <span class="log-card__value log-card__value--error">{{ row.error_summary }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <el-table v-else :data="imageTasks" stripe border size="small" height="600">
             <el-table-column prop="id" label="ID" width="64" />
             <el-table-column prop="created_at" label="时间" width="108">
               <template #default="{ row }">
@@ -407,7 +470,17 @@
               </template>
             </el-table-column>
             <el-table-column prop="api_key_name" label="命中 Key" width="110" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.api_key_name || '-' }}</template>
+              <template #default="{ row }">
+                <el-button
+                  v-if="showUserFilter && row.api_key_id"
+                  link
+                  type="primary"
+                  @click="openImageKeyDetail(row.api_key_id)"
+                >
+                  {{ row.api_key_name || `Key #${row.api_key_id}` }}
+                </el-button>
+                <span v-else>{{ row.api_key_name || '-' }}</span>
+              </template>
             </el-table-column>
             <el-table-column prop="model" label="模型" width="150" show-overflow-tooltip>
               <template #default="{ row }">{{ row.model || '-' }}</template>
@@ -457,6 +530,7 @@
               </template>
             </el-table-column>
           </el-table>
+          </template>
           <div class="pagination">
             <el-pagination
               v-model:current-page="imagePage"
@@ -620,6 +694,7 @@
         <el-button @click="closeKeyDetailDialog">关闭</el-button>
       </template>
     </el-dialog>
+    <ImageKeyDetailDialog ref="imageKeyDetailDialogRef" :show-view-action="false" />
   </div>
 </template>
 
@@ -635,6 +710,7 @@ import { ElMessage } from 'element-plus'
 import { View, ArrowDown } from '@element-plus/icons-vue'
 import { statsApi, adminApi, authApi, copyText } from '../api'
 import { useDisplaySettings } from '../stores/displaySettings'
+import ImageKeyDetailDialog from '../components/ImageKeyDetailDialog.vue'
 
 const { formatToken, formatTokenCompact } = useDisplaySettings()
 
@@ -671,12 +747,11 @@ const chartCollapsed = ref(false)
 
 // 请求记录卡片的详细信息按需展开，避免每条都铺开十几个字段
 const expandedLogIds = ref(new Set())
-const isLogExpanded = (id) => expandedLogIds.value.has(Number(id))
+const isLogExpanded = (id) => expandedLogIds.value.has(id)
 const toggleLogExpand = (id) => {
   const next = new Set(expandedLogIds.value)
-  const key = Number(id)
-  if (next.has(key)) next.delete(key)
-  else next.add(key)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
   expandedLogIds.value = next
 }
 
@@ -704,6 +779,12 @@ const getLogModelName = (row) => row?.actual_model || row?.model || ''
 const userIdFilter = ref(null)
 const userOptions = ref([])
 const showUserFilter = computed(() => authApi.isAdmin() && authApi.isLoggedIn())
+
+// 图片 tab 命中 Key -> 光影世界同款 Key 详情卡片
+const imageKeyDetailDialogRef = ref(null)
+const openImageKeyDetail = (apiKeyId) => {
+  imageKeyDetailDialogRef.value?.open?.(apiKeyId)
+}
 const modelTooltipPopperOptions = {
   modifiers: [
     {
